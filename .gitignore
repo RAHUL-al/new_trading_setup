@@ -1,0 +1,26 @@
+# Python cache
+__pycache__/
+
+# Log files
+*.log
+nohup.out
+output.log
+
+# Temporary/backup shell script files
+*.save
+*.save.*
+
+# CSV and data outputs
+*.csv
+
+# Python test/output scripts
+test*.py
+
+# Virtual environments (already included: stocks_env/)
+# Source archives
+*.tar.gz
+
+# Logs or generated folders
+logs/
+docker_test/
+trading_venv/
