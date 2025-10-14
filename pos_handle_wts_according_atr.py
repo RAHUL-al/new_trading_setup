@@ -143,7 +143,7 @@ class TradingBot:
         self.atr_value: float = 0.0
         
         now = datetime.now()
-        self.market_open_time = now.replace(hour=9, minute=17, second=0, microsecond=0)
+        self.market_open_time = now.replace(hour=9, minute=17, second=1, microsecond=0)
         self.market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
         self.market_denied_position = now.replace(hour=15, minute=5, second=0, microsecond=0)
         self.square_off_time = now.replace(hour=15, minute=25, second=0, microsecond=0)
@@ -852,14 +852,13 @@ class TradingBot:
         initial_multiplier = self.get_dynamic_atr_multiplier(initial_atr)
         logger.info(f"Initial ATR: {initial_atr:.2f}, Multiplier: {initial_multiplier:.2f}")
         
-        # Create tasks - add ATR monitor
         tasks = [
             asyncio.create_task(self.task_pubsub_listener()),
             asyncio.create_task(self.task_key_fallback_poller()),
             asyncio.create_task(self.task_square_off_scheduler()),
             asyncio.create_task(self.task_candle_cache_refresh()),
             asyncio.create_task(self.task_continuous_trailing_stop_loss()),
-            asyncio.create_task(self.task_atr_monitor()),  # New ATR monitoring task
+            asyncio.create_task(self.task_atr_monitor()),
         ]
         
         try:
@@ -886,7 +885,7 @@ if __name__ == "__main__":
                 break
             except Exception as e:
                 logger.exception(f"Unexpected error: {e}")
-                time.sleep(5)  # prevent tight retry loop
+                time.sleep(5)
         else:
             print("⏳ Market closed. Waiting for market hours...")
             time.sleep(1)

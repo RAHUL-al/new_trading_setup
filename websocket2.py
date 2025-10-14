@@ -17,18 +17,18 @@ import os
 import asyncio
 
 # Your credentials and configuration
-api_key = 'SsUDlNA9 '
-clientId = 'A1079871'
-pwd = '0465'
-token = "OIN6QBZAYV4I26Q55OYASIEQVY"
-correlation_id = "Anil"
+# api_key = 'SsUDlNA9 '
+# clientId = 'A1079871'
+# pwd = '0465'
+# token = "OIN6QBZAYV4I26Q55OYASIEQVY"
+# correlation_id = "Anil"
 
 
-# token = "33OUTDUE57WS3TUPHPLFUCGHFM"
-# api_key = "Ytt1NkKD"
-# clientId = "R865920"
-# pwd = '7355'
-# correlation_id = "Rahul_7355"
+token = "33OUTDUE57WS3TUPHPLFUCGHFM"
+api_key = "Ytt1NkKD"
+clientId = "R865920"
+pwd = '7355'
+correlation_id = "Rahul_7355"
 
 ltp_data = {}
 tokens = []
