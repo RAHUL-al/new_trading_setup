@@ -1,30 +1,17 @@
-from SmartApi.smartWebSocketV2 import SmartWebSocketV2
-from SmartApi import SmartConnect
-from logzero import logger
-import pyotp
 import pandas as pd
 import redis
 import threading
-import time
 import ujson as json
-import pytz
 from multiprocessing import Process
-import ta
-import numpy as np  
 from neo_api_client import NeoAPI
-import pandas as pd
-import json
-import threading
-import time
 import datetime
 from kotak_login import get_kotak_client
 from urllib.parse import quote_plus
 import sqlalchemy as sa
-from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime,text
-from neo_api_client import NeoAPI
+from sqlalchemy import create_engine, text
 from dateutil.relativedelta import relativedelta
-import pandas as pd
-import threading
+from symbol_ltp import TestCases
+from concurrent.futures import ThreadPoolExecutor
 import time
 
 response_data = None
@@ -61,8 +48,6 @@ if login_handle_exists:
         sid = result[1]
         secretkey = result[2]
         neo_fin_key = result[3]
-
-
 
 
 mpin = "735596"
@@ -105,7 +90,7 @@ def get_weekly_df(index):
 
 def select_trading_symbol(index, ltp, CE_or_PE):
     df = get_weekly_df(index)
-    minus_part = ltp % 100
+    minus_part = ltp % 50
     ltp = ltp - minus_part
     
     data = df[(df["dStrikePrice;"] == ltp) & (df["pOptionType"] == f"{CE_or_PE}")]
@@ -114,31 +99,52 @@ def select_trading_symbol(index, ltp, CE_or_PE):
     
     pTrdSymbol = data["pTrdSymbol"].values[0]
     pSymbol = data["pSymbol"].values[0]
-    return pTrdSymbol, pSymbol
+
+    suite = TestCases()
+    ltp_data = suite.test_ltpdata(pSymbol)
+    print(ltp_data)
+    if ltp_data["data"]["ltp"] is None:
+        return None, None
+    elif ltp_data["data"]["ltp"] < 150:
+        return pTrdSymbol, pSymbol
+    elif CE_or_PE == "CE":
+        return select_trading_symbol("NIFTY", ltp + 50, CE_or_PE)
+
+    elif CE_or_PE == "PE":
+        return select_trading_symbol("NIFTY", ltp - 50, CE_or_PE)
 
 
 def trading_symbol():
-    market_open_time = datetime.datetime.now().replace(hour=9, minute=15, second=0, microsecond=0)
-    current_time = datetime.datetime.now()
-    market_close_time = datetime.datetime.now().replace(hour=15, minute=30, second=0, microsecond=0)
+    try:
+        data = r.get("99926000")
+        output = int(float(data))
 
-    while market_open_time < current_time < market_close_time:
-        try:
-            data = r.get("99926000")
-            output = int(float(data))
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_CE = executor.submit(select_trading_symbol, "NIFTY", output - 100, "CE")
+            future_PE = executor.submit(select_trading_symbol, "NIFTY", output + 100, "PE")
+            CE = future_CE.result()
+            PE = future_PE.result()
 
-            CE = select_trading_symbol("NIFTY",output - 100,"CE")
-            PE = select_trading_symbol("NIFTY",output + 100,"PE")
-            data_dict = {
-                "CE":CE,
-                "PE":PE
-            }
-            r.set("Trading_symbol", json.dumps(data_dict, default=str))
-            print("coming inside the trading symbol")
-        except Exception as e:
-            print(f"Error in trading symbol function is : {e}")         
+        data_dict = {
+            "CE":CE,
+            "PE":PE
+        }
+        r.set("Trading_symbol", json.dumps(data_dict, default=str))
+        print("coming inside the trading symbol")
+    except Exception as e:
+        print(f"Error in trading symbol function is : {e}")         
 
 if __name__ == "__main__":
-    P2 = Process(target=trading_symbol)
-    P2.start()
-    P2.join()
+    market_open_time = datetime.datetime.now().replace(hour=9, minute=15, second=5, microsecond=0)
+    current_time = datetime.datetime.now()
+    market_close_time = datetime.datetime.now().replace(hour=15, minute=25, second=0, microsecond=0)
+    while current_time < market_open_time or current_time > market_close_time:
+        if market_open_time < current_time < market_close_time:
+            P2 = Process(target=trading_symbol)
+            P2.start()
+            P2.join()
+        else:
+            print("Market is closed now")
+
+        time.sleep(1)
+        current_time = datetime.datetime.now()
