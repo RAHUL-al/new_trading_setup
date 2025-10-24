@@ -996,7 +996,7 @@ class TradingBot:
                     r.delete(key)
                 
                 # Calculate daily P&L
-                data = await self.r.get(f"trade_history_atr_{datetime.now().date()}")
+                data = await self.r.get(f"trade_history_points_{datetime.now().date()}")
                 total_profit_or_loss = 0
 
                 if data:
