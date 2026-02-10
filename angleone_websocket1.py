@@ -25,17 +25,48 @@ ltp_data = {}
 
 tokens = []
 symbol_map = {}
+nfo_tokens = []
 
 
 def load_tokens_from_csv():
     today_date_str = datetime.datetime.now().strftime("%Y%m%d")
-    global tokens, symbol_map
+    global tokens, symbol_map, nfo_tokens
     df = pd.read_csv("stocks_csv_1.csv")
     df["pSymbolName"] = df["pSymbolName"].astype(str)
     df["pSymbol"] = df["pSymbol"].astype(str)
     tokens = df["pSymbol"].tolist()
     symbol_map = dict(zip(df["pSymbol"], df["pSymbolName"]))
     logger.info(f"Loaded {len(tokens)} tokens with symbol names.")
+
+    # --- Load Nifty Futures token from scrip master for volume data ---
+    try:
+        scrip_file = f"data_{today_date_str}.csv"
+        scrip_df = pd.read_csv(scrip_file, low_memory=False)
+        # Filter for NIFTY FUTIDX on NFO exchange (current month futures)
+        nifty_fut = scrip_df[
+            (scrip_df["pSymbolName"].astype(str).str.strip() == "NIFTY") &
+            (scrip_df["pInstType"].astype(str).str.strip() == "FUTIDX") &
+            (scrip_df["pExchSeg"].astype(str).str.strip() == "NFO")
+        ].copy()
+        if not nifty_fut.empty:
+            # Parse expiry and pick nearest expiry
+            nifty_fut["expiry_parsed"] = pd.to_datetime(
+                nifty_fut["lExpiryDate"].astype(str).str.strip(),
+                format="%d%b%Y", errors="coerce"
+            )
+            nifty_fut = nifty_fut.dropna(subset=["expiry_parsed"])
+            nifty_fut = nifty_fut.sort_values("expiry_parsed")
+            # Pick the nearest (current month) expiry
+            nearest = nifty_fut.iloc[0]
+            fut_token = str(nearest["pSymbol"]).strip()
+            fut_symbol = str(nearest["pTrdSymbol"]).strip()
+            nfo_tokens.append(fut_token)
+            symbol_map[fut_token] = "NIFTY_FUT"
+            logger.info(f"Loaded Nifty Futures token: {fut_token} ({fut_symbol})")
+        else:
+            logger.warning("No Nifty Futures found in scrip master")
+    except Exception as e:
+        logger.error(f"Error loading Nifty Futures token: {e}")
 
 def connect_api():
     totp = pyotp.TOTP(token).now()
@@ -61,7 +92,7 @@ def run_websocket():
                     price = ltp / 100
                     india_timezone = pytz.timezone("Asia/Kolkata")
                     now = datetime.datetime.now(india_timezone)
-                    minute = (now.minute // 5) * 5
+                    minute = now.minute  # 1-minute candles
                     candle_time_obj = now.replace(minute=minute, second=0, microsecond=0)
                     candle_time = candle_time_obj.strftime('%Y-%m-%d %H:%M')
                     date_key = now.strftime('%Y-%m-%d')
@@ -111,11 +142,17 @@ def run_websocket():
 
     def on_open(wsapp):
         logger.info("WebSocket Opened")
+        # Subscribe NSE Cash Market tokens (exchangeType 1)
         batch_size = 50
         for i in range(0, len(tokens), batch_size):
             batch_tokens = tokens[i:i + batch_size]
             token_list = [{"exchangeType": 1, "tokens": batch_tokens}]
             sws.subscribe(correlation_id, 3, token_list)
+        # Subscribe NFO tokens - Nifty Futures for volume data (exchangeType 2)
+        if nfo_tokens:
+            nfo_token_list = [{"exchangeType": 2, "tokens": nfo_tokens}]
+            sws.subscribe(correlation_id, 3, nfo_token_list)
+            logger.info(f"Subscribed to NFO tokens for volume: {nfo_tokens}")
 
     def on_error(wsapp, error):
         logger.error(f"WebSocket Error: {error}")
@@ -128,7 +165,6 @@ def run_websocket():
         logger.info("Reconnecting in 3 seconds...")
         time.sleep(3)
         threading.Thread(target=run_websocket).start()
-        
     
 
     FEED_TOKEN = connect_api()

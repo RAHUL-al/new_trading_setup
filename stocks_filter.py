@@ -1,84 +1,98 @@
 import pandas as pd
 from datetime import datetime
 import datetime as dt
-from dateutil.relativedelta import relativedelta
 import math
+from logzero import logger
 
 
 def stocks_filter():
     today_date_str = datetime.now().strftime("%Y%m%d")
 
-    # Load and clean symbol list
+    # Load and clean symbol list (from NSE F&O quantity freeze CSV)
     symbols_df = pd.read_csv("stocks_name.csv")
     symbols_df.columns = symbols_df.columns.str.strip()
     symbols_list = symbols_df["SYMBOL"].astype(str).str.strip().unique().tolist()
 
-    # Load data
-    df1 = pd.read_csv(f"data_{today_date_str}.csv")
-    df2 = pd.read_csv(f"stocks_data_{today_date_str}.csv", low_memory=False)
+    # Load the AngelOne scrip master data (single file has all exchanges)
+    data_file = f"data_{today_date_str}.csv"
+    df = pd.read_csv(data_file, low_memory=False)
+    df.columns = df.columns.str.strip()
 
-    # Clean columns
-    df1.columns = df1.columns.str.strip()
-    df2.columns = df2.columns.str.strip()
+    logger.info(f"Loaded {len(df)} instruments from {data_file}")
 
-    # Filter symbol match
-    filtered_df1 = df1[df1["pSymbolName"].astype(str).str.strip().isin(symbols_list)]
-    filtered_df2 = df2[df2["pSymbolName"].astype(str).str.strip().isin(symbols_list)]
+    # Filter by symbol names from stocks_name.csv
+    filtered_df = df[df["pSymbolName"].astype(str).str.strip().isin(symbols_list)]
 
-    # Merge
-    final_df = pd.concat([filtered_df1, filtered_df2], ignore_index=True)
+    logger.info(f"Filtered to {len(filtered_df)} instruments matching stocks_name.csv")
 
-    # Filters
-    final_df = final_df[final_df['pGroup'] != 'BL']
-    final_df = final_df[final_df['pInstType'] != 'FUTSTK']
-    final_df = final_df[final_df['pExchSeg'] != 'bse_cm']
+    # Remove Futures on Stocks (keep options and equity)
+    filtered_df = filtered_df[filtered_df['pInstType'] != 'FUTSTK']
 
-    # Clean strike price
-    if 'dStrikePrice;' in final_df.columns:
-        final_df['dStrikePrice;'] = (final_df['dStrikePrice;'] / 100).astype(int)
+    # Remove BSE instruments (AngelOne uses "BSE" not "bse_cm")
+    filtered_df = filtered_df[filtered_df['pExchSeg'] != 'BSE']
 
-    # # Clean expiry date
-    final_df = final_df[pd.to_numeric(final_df["lExpiryDate"], errors="coerce").notnull()]
-    final_df["lExpiryDate"] = final_df["lExpiryDate"].astype(float)
+    # Clean strike price — AngelOne gives it as float like "17500.000000"
+    if 'dStrikePrice;' in filtered_df.columns:
+        filtered_df['dStrikePrice;'] = pd.to_numeric(
+            filtered_df['dStrikePrice;'], errors='coerce'
+        ).fillna(0).astype(int)
 
-    def safe_convert_expiry(ts):
+    # Clean expiry date — AngelOne gives it as string like "02MAR2026" or ""
+    def parse_expiry(expiry_str):
         try:
-            return dt.datetime.fromtimestamp(ts).date() + relativedelta(years=10)
-        except (OSError, OverflowError, ValueError):
+            expiry_str = str(expiry_str).strip()
+            if not expiry_str or expiry_str in ("-1", "", "nan"):
+                return None
+            return datetime.strptime(expiry_str, "%d%b%Y").date()
+        except (ValueError, TypeError):
             return None
 
-    final_df["lExpiryDate"] = final_df["lExpiryDate"].apply(safe_convert_expiry)
-    final_df = final_df.dropna(subset=["lExpiryDate"])
-    
-    final_df = final_df[[
+    filtered_df["lExpiryDate"] = filtered_df["lExpiryDate"].apply(parse_expiry)
+    filtered_df = filtered_df.dropna(subset=["lExpiryDate"])
+
+    # Select only required columns
+    final_df = filtered_df[[
         "pSymbol", "pExchSeg", "pSymbolName", "pTrdSymbol",
         "lLotSize", "dStrikePrice;", "pOptionType", "pInstType", "lExpiryDate"
-    ]]
-    
-    df = final_df[final_df["pExchSeg"]=="nse_cm"]
-    df.to_csv(f"stocks_csv_{today_date_str}.csv",index=False)
-    num_parts = 3
+    ]].copy()
 
-    rows_per_file = math.ceil(len(df) / num_parts)
+    # --- NSE Cash Market stocks (for equity websocket) ---
+    # AngelOne uses "NSE" for cash market
+    df_nse_cm = final_df[final_df["pExchSeg"] == "NSE"]
+    df_nse_cm.to_csv(f"stocks_csv_{today_date_str}.csv", index=False)
+
+    # Split into 3 parts for parallel websocket subscriptions
+    num_parts = 3
+    rows_per_file = math.ceil(len(df_nse_cm) / num_parts) if len(df_nse_cm) > 0 else 1
 
     for i in range(num_parts):
         start_idx = i * rows_per_file
         end_idx = start_idx + rows_per_file
-        df_part = df.iloc[start_idx:end_idx]
+        df_part = df_nse_cm.iloc[start_idx:end_idx]
         df_part.to_csv(f"stocks_csv_{i+1}.csv", index=False)
-    
+
+    logger.info(f"Created stocks_csv_1/2/3.csv with {len(df_nse_cm)} NSE stocks")
+
+    # --- F&O instruments expiring this month (for options trading) ---
     today = dt.datetime.today()
     current_month = today.month
     current_year = today.year
 
-    final_df = final_df[
+    df_fo_current_month = final_df[
         (final_df["lExpiryDate"].apply(lambda x: x.month) == current_month) &
         (final_df["lExpiryDate"].apply(lambda x: x.year) == current_year)
-    ]    
-    
-    final_df["Position"] = 0
-    final_df.to_csv(f"final_stock_csv_{today_date_str}.csv", index=False)
+    ].copy()
 
-    print(f"Filtered final_stock_csv_{today_date_str}.csv created successfully.")
+    df_fo_current_month["Position"] = 0
+    df_fo_current_month.to_csv(f"final_stock_csv_{today_date_str}.csv", index=False)
 
-stocks_filter()
+    logger.info(
+        f"Created final_stock_csv_{today_date_str}.csv with "
+        f"{len(df_fo_current_month)} current-month F&O instruments"
+    )
+
+    print(f"Filtered CSVs created successfully for {today_date_str}.")
+
+
+if __name__ == "__main__":
+    stocks_filter()
