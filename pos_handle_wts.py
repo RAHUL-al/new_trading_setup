@@ -230,7 +230,7 @@ class TradingBot:
         except Exception as e:
             logger.warning(f"Error getting cached candle: {e}")
         
-        return await load_last_candle_from_csv()
+        return await load_last_candle_from_redis(self.r)
 
     async def save_position(self, pos: Position):
         try:
@@ -362,20 +362,14 @@ class TradingBot:
                     logger.info(f"ℹ️ CE: New SL {new_stop_loss:.2f} not higher than current SL {pos.stop_loss:.2f}")
 
         elif pos.option_type == "PE":
-            # For PUT options (short position)
-            print("coming inside the PE position")
-
-            print("this is current close inside the PE : ",current_close)
-            print("this is pos.lowest_close inside the PE : ",pos.lowest_close)
-            
+            # For PE: NIFTY drops = PE profits. SL is the candle high (NIFTY high).
+            # Trail SL DOWN as NIFTY makes new lows.
             if current_close < pos.lowest_close or pos.lowest_close == 0:
                 pos.lowest_close = current_close
                 new_stop_loss = candle.high
                 
                 logger.info(f"PE: New low {current_close:.2f}, candle high: {candle.high:.2f}, proposed SL: {new_stop_loss:.2f}, current SL: {pos.stop_loss:.2f}")
                 
-                print("this is new stop loss : ",new_stop_loss)
-                print("this isi pos.stop_loss : ",pos.stop_loss)
                 if new_stop_loss < pos.stop_loss or pos.stop_loss == 0:
                     pos.stop_loss = new_stop_loss
                     logger.info(f"✅ Trailing SL updated for PE: {pos.stop_loss:.2f}")
@@ -494,11 +488,8 @@ class TradingBot:
                 logger.error(f"No valid price for token {token}: {cur_price}")
                 return False
             
-            # Correct P&L calculation
-            if pos.position_type == "BUY":
-                pnl = (cur_price - pos.entry_price) * pos.quantity
-            else:
-                pnl = (cur_price - pos.entry_price) * pos.quantity
+            # P&L: Both CE and PE are BOUGHT options, so P&L = exit - entry
+            pnl = (cur_price - pos.entry_price) * pos.quantity
 
             tr = Trade(
                 token=token,
