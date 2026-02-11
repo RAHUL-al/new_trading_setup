@@ -295,8 +295,11 @@ def market_close_cleanup():
             time.sleep(10)
 
 
-# ─────────── UT Bot Alerts Signal Engine ───────────
+# ─────────── UT Bot Alerts Signal Engine (Async, Low Latency) ───────────
 # Matches user's exact UT Bot indicator code (a=2, c=100)
+
+import asyncio
+from redis.asyncio import Redis as AsyncRedis
 
 NIFTY_SYMBOL = "NIFTY"
 SIGNAL_COOLDOWN = 60  # Min seconds between same-direction signals
@@ -346,22 +349,21 @@ def calculate_ut_bot(data, a=2, c=100, h=False):
     return signals, xATR
 
 
-def nifty_signal_engine():
+async def nifty_signal_engine():
     """
-    Signal engine — runs UT Bot on NIFTY 1-min candles.
-    Publishes buy/sell signals on Redis channels that pos_handle_wts.py listens to:
-      - signal:buy / signal:sell (pub/sub)
-      - buy_signal / sell_signal (key-value fallback)
-      - candle:close (for trailing SL updates)
-    Also stores ATR value and writes last candle to main_csv.csv.
+    Async signal engine — polls at 50ms, only recalculates when new candles arrive.
+    Uses async Redis for non-blocking I/O.
     """
+    ar = AsyncRedis(host='localhost', port=6379, password='Rahul@7355', db=0, decode_responses=True)
+
     last_signal_time = 0
     last_signal = "NONE"
     prev_buy = False
     prev_sell = False
-    last_published_candle_time = None  # Track to avoid candle:close spam
+    last_candle_count = 0
+    last_published_candle_time = None
 
-    logger.info("Starting NIFTY signal engine (UT Bot a=2, c=100)...")
+    logger.info("⚡ Starting async NIFTY signal engine (UT Bot a=2, c=100, 50ms poll)...")
 
     while True:
         try:
@@ -371,19 +373,27 @@ def nifty_signal_engine():
                 break
 
             if now_time < datetime.time(9, 16):
-                time.sleep(5)
+                await asyncio.sleep(0.5)
                 continue
 
-            # Read NIFTY candle history from Redis
+            # Read candle count first — skip if unchanged
             date_key = datetime.date.today().strftime('%Y-%m-%d')
             history_key = f"HISTORY:{NIFTY_SYMBOL}:{date_key}"
-            history_data = r.lrange(history_key, 0, -1)
+            candle_count = await ar.llen(history_key)
 
-            if len(history_data) < 5:
-                time.sleep(3)
+            if candle_count < 5:
+                await asyncio.sleep(0.05)
                 continue
 
-            # Build DataFrame with column names matching UT Bot code
+            # Skip recalculation if no new candles
+            if candle_count == last_candle_count:
+                await asyncio.sleep(0.05)  # 50ms poll
+                continue
+
+            last_candle_count = candle_count
+
+            # New candle detected — recalculate
+            history_data = await ar.lrange(history_key, 0, -1)
             candles = [json.loads(x) for x in history_data]
             df = pd.DataFrame(candles)
             df = df.rename(columns={
@@ -391,20 +401,20 @@ def nifty_signal_engine():
                 "low": "Low", "close": "Close",
                 "volume": "Volume",
             })
-            df = df.astype({
-                "Open": float, "High": float, "Low": float,
-                "Close": float, "Volume": float,
-            })
+            for col in ["Open", "High", "Low", "Close"]:
+                df[col] = df[col].astype(float)
+            if "Volume" in df.columns:
+                df["Volume"] = df["Volume"].astype(float)
 
             # Run UT Bot
             signals, xATR = calculate_ut_bot(df, a=2, c=100)
 
-            # Store ATR in Redis
+            # Store ATR in Redis (non-blocking)
             current_atr = xATR.iloc[-1]
             if pd.notna(current_atr):
-                r.set("ATR_value", str(round(current_atr, 2)))
+                await ar.set("ATR_value", str(round(current_atr, 2)))
 
-            # Write last candle to main_csv.csv for trailing SL
+            # Write last candle to main_csv.csv
             last_row = df.iloc[-1]
             csv_data = pd.DataFrame([{
                 "timestamp": last_row.get("timestamp", ""),
@@ -415,28 +425,25 @@ def nifty_signal_engine():
             }])
             csv_data.to_csv("main_csv.csv", index=False)
 
-            # Check for NEW signal transitions (edge detection)
+            # Edge detection for signals
             curr_buy = bool(signals['buy'].iloc[-1])
             curr_sell = bool(signals['sell'].iloc[-1])
-
             now_ts = time.time()
 
-            # BUY signal: transition from not-buy to buy
             if curr_buy and not prev_buy:
                 if now_ts - last_signal_time > SIGNAL_COOLDOWN:
-                    r.publish("signal:buy", "true")
-                    r.set("buy_signal", "true")
-                    r.set("sell_signal", "false")
+                    await ar.publish("signal:buy", "true")
+                    await ar.set("buy_signal", "true")
+                    await ar.set("sell_signal", "false")
                     last_signal = "BUY"
                     last_signal_time = now_ts
                     logger.info(f"🟢 BUY SIGNAL — UT Bot | NIFTY Close={last_row['Close']} ATR={current_atr:.2f}")
 
-            # SELL signal: transition from not-sell to sell
             elif curr_sell and not prev_sell:
                 if now_ts - last_signal_time > SIGNAL_COOLDOWN:
-                    r.publish("signal:sell", "true")
-                    r.set("sell_signal", "true")
-                    r.set("buy_signal", "false")
+                    await ar.publish("signal:sell", "true")
+                    await ar.set("sell_signal", "true")
+                    await ar.set("buy_signal", "false")
                     last_signal = "SELL"
                     last_signal_time = now_ts
                     logger.info(f"🔴 SELL SIGNAL — UT Bot | NIFTY Close={last_row['Close']} ATR={current_atr:.2f}")
@@ -444,11 +451,11 @@ def nifty_signal_engine():
             prev_buy = curr_buy
             prev_sell = curr_sell
 
-            # Publish candle close ONLY when a new minute candle forms
+            # Publish candle close only on new candles
             candle_ts = str(last_row.get("timestamp", ""))
             if candle_ts != last_published_candle_time:
                 last_published_candle_time = candle_ts
-                r.publish("candle:close", json.dumps({
+                await ar.publish("candle:close", json.dumps({
                     "timestamp": candle_ts,
                     "open": float(last_row["Open"]),
                     "high": float(last_row["High"]),
@@ -456,11 +463,14 @@ def nifty_signal_engine():
                     "close": float(last_row["Close"]),
                 }))
 
-            time.sleep(0.1)  # 100ms — low latency signal checking
-
         except Exception as e:
             logger.error(f"Signal engine error: {e}")
-            time.sleep(1)
+            await asyncio.sleep(1)
+
+
+def run_signal_engine():
+    """Wrapper to run async signal engine in a new event loop (for multiprocessing)."""
+    asyncio.run(nifty_signal_engine())
 
 
 # ─────────── Entry Point ───────────
@@ -469,7 +479,7 @@ if __name__ == "__main__":
     load_tokens_from_csv()
 
     P0 = Process(target=run_websocket)
-    P1 = Process(target=nifty_signal_engine)
+    P1 = Process(target=run_signal_engine)
     P2 = Process(target=market_close_cleanup)
 
     P0.start()
