@@ -198,7 +198,7 @@ class TradingBot:
                     await self.update_trailing_stop_loss(candle_data)
             except Exception as e:
                 logger.error(f"Trailing SL pub/sub error: {e}")
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.1)
         
 
 
@@ -305,11 +305,11 @@ class TradingBot:
                     if self.ce_token and self.pe_token:
                         logger.info(f"Symbols loaded: CE={self.ce_symbol}/{self.ce_token} PE={self.pe_symbol}/{self.pe_token}")
                         return True
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.1)
                 attempts += 1
             except Exception as e:
                 logger.error(f"load_symbols error: {e}")
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.1)
                 attempts += 1
         logger.error("Failed to load trading symbols after multiple attempts")
         return False
@@ -560,11 +560,11 @@ class TradingBot:
                             f"Waiting for signal"
                         )
                 
-                await asyncio.sleep(30)
+                await asyncio.sleep(0.1)
                 
             except Exception as e:
                 logger.error(f"ATR monitor error: {e}")
-                await asyncio.sleep(10)
+                await asyncio.sleep(0.1)
 
     # ---------- market hours check ----------
     def is_market_hours(self) -> bool:
@@ -694,7 +694,7 @@ class TradingBot:
         
         while True:
             if not self.is_market_hours():
-                await asyncio.sleep(5)
+                await asyncio.sleep(1)
                 continue
 
             try:
@@ -756,7 +756,7 @@ class TradingBot:
                 await asyncio.sleep(sleep_seconds)
             
             else:
-                await asyncio.sleep(5)
+                await asyncio.sleep(1)
 
     async def task_candle_cache_refresh(self):
         while True:
@@ -778,7 +778,7 @@ class TradingBot:
                         logger.info(f"Symbols refreshed: CE={self.ce_symbol}/{self.ce_token} PE={self.pe_symbol}/{self.pe_token}")
             except Exception as e:
                 logger.error(f"Symbol refresh error: {e}")
-            await asyncio.sleep(15)
+            await asyncio.sleep(2)
 
     # ---------- main ----------
     async def run(self):
@@ -840,7 +840,7 @@ if __name__ == "__main__":
                 break
             except Exception as e:
                 logger.exception(f"Unexpected error: {e}")
-                time.sleep(5)  # prevent tight retry loop
+                time.sleep(1)  # prevent tight retry loop
         else:
             print("⏳ Market closed. Waiting for market hours...")
             time.sleep(1)
