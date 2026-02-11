@@ -777,6 +777,20 @@ class TradingBot:
                     await self.cache_candle(high, low)
             await asyncio.sleep(1)
 
+    async def task_symbol_refresh(self):
+        """Periodically reload CE/PE tokens from Redis when no position is open."""
+        while True:
+            try:
+                if self.is_market_hours() and not self.open_pos:
+                    old_ce = self.ce_token
+                    old_pe = self.pe_token
+                    await self.load_symbols()
+                    if self.ce_token != old_ce or self.pe_token != old_pe:
+                        logger.info(f"Symbols refreshed: CE={self.ce_symbol}/{self.ce_token} PE={self.pe_symbol}/{self.pe_token}")
+            except Exception as e:
+                logger.error(f"Symbol refresh error: {e}")
+            await asyncio.sleep(15)
+
     # ---------- main ----------
     async def run(self):
         if self.is_market_hours():
@@ -793,7 +807,7 @@ class TradingBot:
             initial_atr = await self.get_current_atr()
             logger.info(f"Initial ATR: {initial_atr:.2f}")
             
-            # Create tasks - add ATR monitor
+            # Create tasks
             tasks = [
                 asyncio.create_task(self.task_pubsub_listener()),
                 asyncio.create_task(self.task_key_fallback_poller()),
@@ -801,6 +815,7 @@ class TradingBot:
                 asyncio.create_task(self.task_candle_cache_refresh()),
                 asyncio.create_task(self.task_continuous_trailing_stop_loss()),
                 asyncio.create_task(self.task_atr_monitor()),
+                asyncio.create_task(self.task_symbol_refresh()),
             ]
             
             try:
