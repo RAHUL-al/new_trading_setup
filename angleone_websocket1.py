@@ -414,16 +414,16 @@ async def nifty_signal_engine():
             if pd.notna(current_atr):
                 await ar.set("ATR_value", str(round(current_atr, 2)))
 
-            # Write last candle to main_csv.csv
+            # Store last candle in Redis (NO CSV — pure Redis for low latency)
             last_row = df.iloc[-1]
-            csv_data = pd.DataFrame([{
-                "timestamp": last_row.get("timestamp", ""),
-                "open": last_row["Open"],
-                "high": last_row["High"],
-                "low": last_row["Low"],
-                "close": last_row["Close"],
-            }])
-            csv_data.to_csv("main_csv.csv", index=False)
+            last_candle_data = json.dumps({
+                "timestamp": str(last_row.get("timestamp", "")),
+                "open": float(last_row["Open"]),
+                "high": float(last_row["High"]),
+                "low": float(last_row["Low"]),
+                "close": float(last_row["Close"]),
+            })
+            await ar.set("last_candle", last_candle_data)
 
             # Edge detection for signals
             curr_buy = bool(signals['buy'].iloc[-1])

@@ -96,21 +96,18 @@ class TrailingData:
     last_updated: str
 
 # --------------------------- helper utils ---------------------------
-async def load_last_candle_from_csv(csv_path: str = "main_csv.csv") -> Tuple[Optional[float], Optional[float]]:
-    """Load only high and low from last candle (for backward compatibility)"""
-    if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
-        return None, None
+LAST_CANDLE_KEY = "last_candle"
+
+async def load_last_candle_from_redis(redis_conn) -> Tuple[Optional[float], Optional[float]]:
+    """Load high and low from Redis last_candle key (zero disk I/O)."""
     try:
-        df = pd.read_csv(csv_path)
-        if df.empty:
-            return None, None
-        row = df.tail(1).to_dict(orient='records')[0]
-        high = row.get('high')
-        low = row.get('low')
-        return float(high) if high is not None else None, float(low) if low is not None else None
+        raw = await redis_conn.get(LAST_CANDLE_KEY)
+        if raw:
+            candle = json.loads(raw)
+            return float(candle['high']), float(candle['low'])
     except Exception as e:
-        logger.warning(f"CSV load failed: {e}")
-        return None, None
+        logger.warning(f"Redis candle load failed: {e}")
+    return None, None
 
 # --------------------------- core bot ---------------------------
 
@@ -164,64 +161,43 @@ class TradingBot:
         return self.atr_value > ATR_THRESHOLD
     
 
-    async def load_last_complete_candle_from_csv(self, csv_path: str = "main_csv.csv") -> Optional[CandleData]:
-        if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
-            return None
-        
+    async def load_last_complete_candle(self) -> Optional[CandleData]:
+        """Load last candle from Redis (zero disk I/O)."""
         try:
-            df = pd.read_csv(csv_path).tail(5)
-            if df.empty:
+            raw = await self.r.get(LAST_CANDLE_KEY)
+            if not raw:
                 return None
-            last_row = df.tail(1).to_dict(orient='records')[0]
-            
-            required_fields = ['timestamp', 'open', 'high', 'low', 'close']
-            for field in required_fields:
-                if field not in last_row or pd.isna(last_row[field]):
-                    return None
-            
+            c = json.loads(raw)
             return CandleData(
-                open=float(last_row['open']),
-                high=float(last_row['high']),
-                low=float(last_row['low']),
-                close=float(last_row['close']),
-                timestamp=str(last_row['timestamp'])
+                open=float(c['open']),
+                high=float(c['high']),
+                low=float(c['low']),
+                close=float(c['close']),
+                timestamp=str(c['timestamp'])
             )
-            
         except Exception as e:
-            logger.warning(f"Failed to load complete candle from CSV: {e}")
+            logger.warning(f"Failed to load candle from Redis: {e}")
             return None
 
 
     async def task_continuous_trailing_stop_loss(self):
-        last_processed_timestamp = None
-        last_file_mod_time = 0
+        """Subscribe to candle:close pub/sub for instant trailing SL updates (no disk polling)."""
+        psub = self.r.pubsub()
+        await psub.subscribe(CHAN_CANDLE_CLOSE)
+        logger.info("⚡ Trailing SL subscribed to candle:close pub/sub")
         
-        while True:
+        async for msg in psub.listen():
             try:
+                if msg is None or msg.get("type") != "message":
+                    continue
                 if not self.is_market_hours() or not self.open_pos:
-                    await asyncio.sleep(1)
-                    continue
-                
-                # Check if file has been modified
-                current_mod_time = os.path.getmtime("main_csv.csv") if os.path.exists("main_csv.csv") else 0
-                if current_mod_time <= last_file_mod_time:
-                    await asyncio.sleep(0.5)
                     continue
                     
-                last_file_mod_time = current_mod_time
-                
-                candle_data = await self.load_last_complete_candle_from_csv()
-                
-                if candle_data and candle_data.timestamp != last_processed_timestamp:
-                    last_processed_timestamp = candle_data.timestamp
-                    
+                candle_data = await self.load_last_complete_candle()
+                if candle_data:
                     await self.update_trailing_stop_loss(candle_data)
-                    logger.info(f"Processed new candle for trailing SL: {candle_data.timestamp}")
-                
-                await asyncio.sleep(0.5)
-                
             except Exception as e:
-                logger.error(f"Continuous trailing stop loss error: {e}")
+                logger.error(f"Trailing SL pub/sub error: {e}")
                 await asyncio.sleep(1)
         
 
@@ -619,7 +595,7 @@ class TradingBot:
             logger.info(f"⚠️ BUY signal received but ATR={current_atr:.2f} < threshold={ATR_THRESHOLD}. Skipping.")
             return
             
-        signal_candle = await self.load_last_complete_candle_from_csv()
+        signal_candle = await self.load_last_complete_candle()
         if signal_candle is None:
             logger.warning("No candle data for buy signal")
             return
@@ -641,7 +617,7 @@ class TradingBot:
             logger.info(f"⚠️ SELL signal received but ATR={current_atr:.2f} < threshold={ATR_THRESHOLD}. Skipping.")
             return
             
-        signal_candle = await self.load_last_complete_candle_from_csv()
+        signal_candle = await self.load_last_complete_candle()
         if signal_candle is None:
             logger.warning("No candle data for sell signal")
             return
@@ -684,19 +660,19 @@ class TradingBot:
                         await self.handle_index_tick(price)
                     
                     elif channel == CHAN_SIGNAL_BUY:
-                        signal_candle = await self.load_last_complete_candle_from_csv()
+                        signal_candle = await self.load_last_complete_candle()
                         if signal_candle is None:
                             continue
                         await self.on_buy_signal(signal_candle)
                     
                     elif channel == CHAN_SIGNAL_SELL:
-                        signal_candle = await self.load_last_complete_candle_from_csv()
+                        signal_candle = await self.load_last_complete_candle()
                         if signal_candle is None:
                             continue
                         await self.on_sell_signal(signal_candle)
                     
                     elif channel == CHAN_CANDLE_CLOSE:
-                        candle_data = await self.load_last_complete_candle_from_csv()
+                        candle_data = await self.load_last_complete_candle()
                         if candle_data is None:
                             continue
                         await self.handle_candle_close(asdict(candle_data))
@@ -785,7 +761,7 @@ class TradingBot:
     async def task_candle_cache_refresh(self):
         while True:
             if self.is_market_hours():
-                high, low = await load_last_candle_from_csv()
+                high, low = await load_last_candle_from_redis(self.r)
                 if high is not None and low is not None:
                     await self.cache_candle(high, low)
             await asyncio.sleep(1)
