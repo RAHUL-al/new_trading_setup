@@ -359,6 +359,7 @@ def nifty_signal_engine():
     last_signal = "NONE"
     prev_buy = False
     prev_sell = False
+    last_published_candle_time = None  # Track to avoid candle:close spam
 
     logger.info("Starting NIFTY signal engine (UT Bot a=2, c=100)...")
 
@@ -443,20 +444,17 @@ def nifty_signal_engine():
             prev_buy = curr_buy
             prev_sell = curr_sell
 
-            # Publish candle close for trailing SL updates
-            r.publish("candle:close", json.dumps({
-                "timestamp": str(last_row.get("timestamp", "")),
-                "open": float(last_row["Open"]),
-                "high": float(last_row["High"]),
-                "low": float(last_row["Low"]),
-                "close": float(last_row["Close"]),
-            }))
-
-            # Log current state every cycle
-            logger.info(
-                f"[UT Bot] NIFTY Close={last_row['Close']:.2f} ATR={current_atr:.2f} "
-                f"Buy={curr_buy} Sell={curr_sell} LastSignal={last_signal}"
-            )
+            # Publish candle close ONLY when a new minute candle forms
+            candle_ts = str(last_row.get("timestamp", ""))
+            if candle_ts != last_published_candle_time:
+                last_published_candle_time = candle_ts
+                r.publish("candle:close", json.dumps({
+                    "timestamp": candle_ts,
+                    "open": float(last_row["Open"]),
+                    "high": float(last_row["High"]),
+                    "low": float(last_row["Low"]),
+                    "close": float(last_row["Close"]),
+                }))
 
             time.sleep(3)
 

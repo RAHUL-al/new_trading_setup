@@ -285,7 +285,7 @@ class TradingBot:
             if len(history) > 100:
                 history = history[-100:]
             await self.r.set(TRADE_HISTORY_KEY, json.dumps(history))
-            logger.info(f"Saved trade: {trade.token} pnl={trade.pnl}")
+            logger.info(f"📝 Trade #{len(history)} saved: {trade.option_type} {trade.position_type} Entry=₹{trade.entry_price:.2f} Exit=₹{trade.exit_price:.2f} P&L=₹{trade.pnl:.2f} [{trade.close_reason}]")
         except Exception as e:
             logger.error(f"save_trade error: {e}")
 
@@ -460,7 +460,7 @@ class TradingBot:
         )
         self.open_pos = pos
         await self.save_position(pos)
-        logger.info(f"BUY CE @ {price} Initial SL {initial_sl} (ATR: {self.atr_value:.2f})")
+        logger.info(f"✅ POSITION OPENED: BUY CE {self.ce_symbol} @ ₹{price:.2f} | Stop Loss=₹{initial_sl:.2f} | ATR={self.atr_value:.2f}")
         return True
 
     async def take_sell(self, quantity: int = 1, signal_candle: Optional[CandleData] = None) -> bool:
@@ -500,7 +500,7 @@ class TradingBot:
         )
         self.open_pos = pos
         await self.save_position(pos)
-        logger.info(f"SELL PE @ {price} Initial SL {initial_sl} (ATR: {self.atr_value:.2f})")
+        logger.info(f"✅ POSITION OPENED: SELL PE {self.pe_symbol} @ ₹{price:.2f} | Stop Loss=₹{initial_sl:.2f} | ATR={self.atr_value:.2f}")
         return True
 
     async def close_position(self, reason: str) -> bool:
@@ -539,20 +539,37 @@ class TradingBot:
             self.open_pos = None
             await self.save_trade(tr)
             await self.remove_position(token)
-            logger.info(f"Closed {token} reason={reason} pnl={tr.pnl}")
+            pnl_emoji = "💰" if tr.pnl >= 0 else "💸"
+            logger.info(
+                f"{pnl_emoji} POSITION CLOSED: {pos.option_type} {pos.trading_symbol} | "
+                f"Entry=₹{pos.entry_price:.2f} Exit=₹{cur_price:.2f} | "
+                f"P&L=₹{tr.pnl:.2f} | Reason={reason}"
+            )
+            logger.info(f"⏳ Waiting for next signal...")
             return True
 
 
     async def task_atr_monitor(self):
-        """Continuously monitor ATR values (for logging only)"""
+        """Log ATR + position status every 30s."""
         while True:
             try:
                 if self.is_market_hours():
                     current_atr = await self.get_current_atr()
-                    # Log ATR value periodically (every 30 seconds)
-                    # logger.info(f"Current ATR: {current_atr:.2f}")
+                    atr_ok = "✅" if current_atr >= ATR_THRESHOLD else "❌"
+                    if self.open_pos:
+                        pos = self.open_pos
+                        cur_price = await self.get_current_price(pos.token)
+                        pnl = (cur_price - pos.entry_price) * pos.quantity
+                        logger.info(
+                            f"📊 ATR={current_atr:.2f} {atr_ok} | "
+                            f"POSITION: {pos.option_type} {pos.trading_symbol} "
+                            f"Entry=₹{pos.entry_price:.2f} Current=₹{cur_price:.2f} "
+                            f"SL=₹{pos.stop_loss:.2f} P&L=₹{pnl:.2f}"
+                        )
+                    else:
+                        logger.info(f"📊 ATR={current_atr:.2f} {atr_ok} (need ≥{ATR_THRESHOLD}) | No position — waiting for signal")
                 
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(30)
                 
             except Exception as e:
                 logger.error(f"ATR monitor error: {e}")
@@ -566,63 +583,66 @@ class TradingBot:
 
     # ---------- event handlers ----------
     async def handle_index_tick(self, price: float):
-
         if not self.open_pos or not self.is_market_hours():
             return
         
         pos = self.open_pos
-        # logger.info(f"Current price: {price}, Stop loss: {pos.stop_loss}")
         
         # Check if stop loss is hit
         if pos.option_type == "CE" and price <= pos.stop_loss:
+            logger.info(f"🛑 STOP LOSS HIT! NIFTY={price:.2f} ≤ SL={pos.stop_loss:.2f} | Closing {pos.option_type} position")
             await self.close_position("STOP_LOSS")
         elif pos.option_type == "PE" and price >= pos.stop_loss:
+            logger.info(f"🛑 STOP LOSS HIT! NIFTY={price:.2f} ≥ SL={pos.stop_loss:.2f} | Closing {pos.option_type} position")
             await self.close_position("STOP_LOSS")
 
     
 
     async def on_buy_signal(self, signal_candle: Optional[CandleData] = None):
-        # Check ATR first - only for entry, not for exit
+        current_atr = await self.get_current_atr()
         if not await self.is_atr_above_threshold():
-            logger.info(f"ATR below threshold, ignoring BUY signal")
+            logger.info(f"⚠️ BUY signal received but ATR={current_atr:.2f} < threshold={ATR_THRESHOLD}. Skipping.")
             return
             
         signal_candle = await self.load_last_complete_candle_from_csv()
         if signal_candle is None:
-            logger.warning("No complete candle data available for buy signal")
+            logger.warning("No candle data for buy signal")
             return
             
         if not self.is_market_hours():
             return
             
         if self.open_pos and self.open_pos.option_type == "PE":
+            logger.info(f"🔄 Closing PE position (opposite BUY signal received)")
             await self.close_position("OPPOSITE_SIGNAL")
         
         if not self.open_pos:
+            logger.info(f"🟢 BUY SIGNAL received | ATR={current_atr:.2f} ✅ | Taking CE position...")
             await self.take_buy(quantity=1, signal_candle=signal_candle)
 
     async def on_sell_signal(self, signal_candle: Optional[CandleData] = None):
-        # Check ATR first - only for entry, not for exit
+        current_atr = await self.get_current_atr()
         if not await self.is_atr_above_threshold():
-            logger.info(f"ATR below threshold, ignoring SELL signal")
+            logger.info(f"⚠️ SELL signal received but ATR={current_atr:.2f} < threshold={ATR_THRESHOLD}. Skipping.")
             return
             
         signal_candle = await self.load_last_complete_candle_from_csv()
         if signal_candle is None:
-            logger.warning("No complete candle data available for sell signal")
+            logger.warning("No candle data for sell signal")
             return
 
         if not self.is_market_hours():
             return
             
         if self.open_pos and self.open_pos.option_type == "CE":
+            logger.info(f"🔄 Closing CE position (opposite SELL signal received)")
             await self.close_position("OPPOSITE_SIGNAL")
         
         if not self.open_pos:
+            logger.info(f"🔴 SELL SIGNAL received | ATR={current_atr:.2f} ✅ | Taking PE position...")
             await self.take_sell(quantity=1, signal_candle=signal_candle)
 
     async def task_pubsub_listener(self):
-        logging.info("coming inside the task pubsub listener function")
         """Listens for Pub/Sub messages for prices, signals, and candle closes."""
         try:
             psub = self.r.pubsub()
@@ -632,64 +652,42 @@ class TradingBot:
                 CHAN_SIGNAL_SELL,
                 CHAN_CANDLE_CLOSE
             )
-            logger.info("Subscribed to Pub/Sub channels")
+            logger.info("✅ Subscribed to Pub/Sub channels: price, buy, sell, candle_close")
             
             async for msg in psub.listen():
-                
                 if not self.is_market_hours():
-                    logger.debug("Outside market hours, skipping message")
                     continue
-                    
                 if msg is None or msg.get("type") != "message":
-                    logger.debug(f"Skipping non-message: {msg}")
                     continue
                     
                 channel = msg.get("channel")
-                logging.info(f"channel is : {channel}") 
                 data = msg.get("data")
-                print(data)
-                
-                logger.info(f"Processing channel: {channel}, data: {data}")
                 
                 try:
                     if channel == f"{CHAN_PRICE_PREFIX}{INDEX_TOKEN}":
-                        logging.info("coming inside the channel price buy --------------->")
                         price = float(data)
                         await self.handle_index_tick(price)
                     
                     elif channel == CHAN_SIGNAL_BUY:
-                        logging.info("coming inside the channel signal buy --------------->")
-                        # ALWAYS get the latest complete candle from CSV for signals
                         signal_candle = await self.load_last_complete_candle_from_csv()
                         if signal_candle is None:
-                            logger.warning("No complete candle data available for buy signal")
                             continue
                         await self.on_buy_signal(signal_candle)
                     
                     elif channel == CHAN_SIGNAL_SELL:
-                        logging.info("coming inside the channel signal sell --------------->")
-                        # ALWAYS get the latest complete candle from CSV for signals
                         signal_candle = await self.load_last_complete_candle_from_csv()
-                        print("inside the task scheduler and signal candle is : ",signal_candle)
                         if signal_candle is None:
-                            logger.warning("No complete candle data available for sell signal")
                             continue
                         await self.on_sell_signal(signal_candle)
                     
                     elif channel == CHAN_CANDLE_CLOSE:
-                        logging.info("coming inside the channel candle close --------------->")
-                        # For candle close events, also use CSV data for consistency
                         candle_data = await self.load_last_complete_candle_from_csv()
                         if candle_data is None:
-                            logger.warning("No complete candle data available for candle close")
                             continue
                         await self.handle_candle_close(asdict(candle_data))
-                    
-                    else:
-                        logger.warning(f"Unknown channel: {channel}")
 
                 except (ValueError, TypeError, json.JSONDecodeError) as e:
-                    logger.warning(f"Invalid message data: {data}, error: {e}")
+                    logger.warning(f"Invalid data: {e}")
                 except Exception as e:
                     logger.error(f"Error processing message: {e}")
                     
