@@ -24,3 +24,4 @@ test*.py
 logs/
 docker_test/
 trading_venv/
+venv/
