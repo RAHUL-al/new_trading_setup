@@ -137,6 +137,8 @@ class TradingBot:
         self._close_lock = asyncio.Lock()
         self.last_candle: Optional[CandleData] = None
         self.atr_value: float = 0.0
+        self.daily_pnl: float = 0.0
+        self.trade_count: int = 0
         
         now = datetime.now()
         self.market_open_time = now.replace(hour=9, minute=17, second=0, microsecond=0)
@@ -539,13 +541,19 @@ class TradingBot:
             self.open_pos = None
             await self.save_trade(tr)
             await self.remove_position(token)
+            self.daily_pnl += tr.pnl
+            self.trade_count += 1
             pnl_emoji = "💰" if tr.pnl >= 0 else "💸"
+            daily_emoji = "📈" if self.daily_pnl >= 0 else "📉"
             logger.info(
                 f"{pnl_emoji} POSITION CLOSED: {pos.option_type} {pos.trading_symbol} | "
                 f"Entry=₹{pos.entry_price:.2f} Exit=₹{cur_price:.2f} | "
                 f"P&L=₹{tr.pnl:.2f} | Reason={reason}"
             )
-            logger.info(f"⏳ Waiting for next signal...")
+            logger.info(
+                f"{daily_emoji} DAILY P&L: ₹{self.daily_pnl:.2f} | Trades: {self.trade_count} | "
+                f"⏳ Waiting for next signal..."
+            )
             return True
 
 
@@ -560,14 +568,21 @@ class TradingBot:
                         pos = self.open_pos
                         cur_price = await self.get_current_price(pos.token)
                         pnl = (cur_price - pos.entry_price) * pos.quantity
+                        daily_emoji = "📈" if self.daily_pnl >= 0 else "📉"
                         logger.info(
                             f"📊 ATR={current_atr:.2f} {atr_ok} | "
                             f"POSITION: {pos.option_type} {pos.trading_symbol} "
                             f"Entry=₹{pos.entry_price:.2f} Current=₹{cur_price:.2f} "
-                            f"SL=₹{pos.stop_loss:.2f} P&L=₹{pnl:.2f}"
+                            f"SL=₹{pos.stop_loss:.2f} P&L=₹{pnl:.2f} | "
+                            f"{daily_emoji} Day=₹{self.daily_pnl:.2f} ({self.trade_count} trades)"
                         )
                     else:
-                        logger.info(f"📊 ATR={current_atr:.2f} {atr_ok} (need ≥{ATR_THRESHOLD}) | No position — waiting for signal")
+                        daily_emoji = "📈" if self.daily_pnl >= 0 else "📉"
+                        logger.info(
+                            f"📊 ATR={current_atr:.2f} {atr_ok} (need ≥{ATR_THRESHOLD}) | "
+                            f"{daily_emoji} Day=₹{self.daily_pnl:.2f} ({self.trade_count} trades) | "
+                            f"Waiting for signal"
+                        )
                 
                 await asyncio.sleep(30)
                 
@@ -800,6 +815,16 @@ class TradingBot:
             
             # Recover any existing positions
             await self.recover_open_position()
+            
+            # Recover daily P&L from trade history
+            try:
+                if await self.r.exists(TRADE_HISTORY_KEY):
+                    history = json.loads(await self.r.get(TRADE_HISTORY_KEY))
+                    self.daily_pnl = sum(t.get("pnl", 0) for t in history)
+                    self.trade_count = len(history)
+                    logger.info(f"📈 Recovered daily P&L: ₹{self.daily_pnl:.2f} from {self.trade_count} trades")
+            except Exception as e:
+                logger.error(f"Error recovering daily P&L: {e}")
             
             # Initial ATR check
             initial_atr = await self.get_current_atr()
