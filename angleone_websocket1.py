@@ -2,6 +2,7 @@
 angleone_websocket1.py — WebSocket feeder with:
 - 1-minute candle aggregation for NIFTY index + stocks
 - Dynamic NFO option token subscription (CE/PE from symbol_found.py)
+- UT Bot Alerts signal engine on NIFTY candles
 - Market close cleanup at 3:30 PM (archive candles, clear Redis)
 """
 
@@ -10,6 +11,7 @@ from SmartApi import SmartConnect
 from logzero import logger
 import pyotp
 import pandas as pd
+import numpy as np
 import redis
 import threading
 import time
@@ -17,7 +19,6 @@ import ujson as json
 import datetime
 import pytz
 from multiprocessing import Process
-import ta
 
 
 # ─────────── Config ───────────
@@ -63,6 +64,8 @@ def connect_api():
 last_candle_time_map = {}
 last_candle_map = {}
 
+
+# ─────────── WebSocket ───────────
 
 def run_websocket():
     """Main WebSocket process — handles index/stock ticks + option ticks."""
@@ -153,7 +156,7 @@ def run_websocket():
                 if ce_info and ce_info[1]:
                     ce_token = str(ce_info[1])
                     nfo_tokens.append(ce_token)
-                    symbol_map[ce_token] = ce_info[0]  # trading symbol as name
+                    symbol_map[ce_token] = ce_info[0]
                     current_option_tokens["CE"] = ce_token
 
                 if pe_info and pe_info[1]:
@@ -178,12 +181,10 @@ def run_websocket():
         for msg in pubsub.listen():
             if msg["type"] != "message":
                 continue
-
             try:
                 new_data = json.loads(msg["data"])
                 logger.info(f"Option tokens updated: {new_data}")
 
-                # Unsubscribe old tokens
                 old_tokens = []
                 if current_option_tokens["CE"]:
                     old_tokens.append(current_option_tokens["CE"])
@@ -198,7 +199,6 @@ def run_websocket():
                     except Exception as e:
                         logger.warning(f"Error unsubscribing old tokens: {e}")
 
-                # Subscribe new tokens
                 _subscribe_option_tokens()
 
             except Exception as e:
@@ -223,7 +223,6 @@ def run_websocket():
     sws.on_error = on_error
     sws.on_close = on_close
 
-    # Start token update listener in background thread
     token_update_thread = threading.Thread(target=_handle_token_update, daemon=True)
     token_update_thread.start()
 
@@ -234,12 +233,7 @@ def run_websocket():
 # ─────────── Market Close Cleanup ───────────
 
 def market_close_cleanup():
-    """
-    At 3:30 PM:
-    1. Archive all NIFTY candle history to NIFTY_CANDLES:{date}
-    2. Clear all CANDLE:* and HISTORY:* keys
-    3. Clear Trading_symbol
-    """
+    """At 3:30 PM: archive candle history, then clear Redis keys."""
     while True:
         now = datetime.datetime.now(INDIA_TZ)
         market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
@@ -249,7 +243,7 @@ def market_close_cleanup():
             archive_key = f"NIFTY_CANDLES:{date_key}"
 
             try:
-                # Archive NIFTY index candle history
+                # Archive NIFTY candle history
                 nifty_history_key = f"HISTORY:NIFTY:{date_key}"
                 nifty_candles = r.lrange(nifty_history_key, 0, -1)
                 if nifty_candles:
@@ -257,43 +251,34 @@ def market_close_cleanup():
                         r.rpush(archive_key, candle)
                     logger.info(f"Archived {len(nifty_candles)} NIFTY candles to {archive_key}")
 
-                # Also archive all other symbols' candles
+                # Archive option candles
                 try:
-                    df = pd.read_csv("stocks_csv_1.csv")
-                    symbols = list(df["pSymbolName"].str.strip())
-                    for sym in symbols:
-                        hist_key = f"HISTORY:{sym}:{date_key}"
-                        sym_candles = r.lrange(hist_key, 0, -1)
-                        if sym_candles:
-                            sym_archive = f"{sym}_CANDLES:{date_key}"
-                            for c in sym_candles:
-                                r.rpush(sym_archive, c)
-                            logger.info(f"Archived {len(sym_candles)} candles for {sym}")
+                    ts_data = r.get(TRADING_SYMBOLS_KEY)
+                    if ts_data:
+                        ts = json.loads(ts_data)
+                        for opt_type in ["CE", "PE"]:
+                            info = ts.get(opt_type, [None, None])
+                            if info and info[0]:
+                                sym = info[0]
+                                hist_key = f"HISTORY:{sym}:{date_key}"
+                                sym_candles = r.lrange(hist_key, 0, -1)
+                                if sym_candles:
+                                    sym_archive = f"{sym}_CANDLES:{date_key}"
+                                    for c in sym_candles:
+                                        r.rpush(sym_archive, c)
+                                    logger.info(f"Archived {len(sym_candles)} candles for {sym}")
                 except Exception as e:
-                    logger.error(f"Error archiving symbol candles: {e}")
+                    logger.error(f"Error archiving option candles: {e}")
 
-                # Delete all CANDLE:* keys
-                candle_keys = r.keys("CANDLE:*")
-                if candle_keys:
-                    r.delete(*candle_keys)
-                    logger.info(f"Deleted {len(candle_keys)} CANDLE keys")
+                # Clean up Redis keys
+                for pattern in ["CANDLE:*", "HISTORY:*", "SIGNAL:*"]:
+                    keys = r.keys(pattern)
+                    if keys:
+                        r.delete(*keys)
+                        logger.info(f"Deleted {len(keys)} {pattern} keys")
 
-                # Delete all HISTORY:* keys
-                history_keys = r.keys("HISTORY:*")
-                if history_keys:
-                    r.delete(*history_keys)
-                    logger.info(f"Deleted {len(history_keys)} HISTORY keys")
-
-                # Delete Trading_symbol
                 r.delete(TRADING_SYMBOLS_KEY)
-                logger.info("Deleted Trading_symbol key")
-
-                # Delete signal keys for today
-                signal_keys = r.keys(f"SIGNAL:*")
-                if signal_keys:
-                    r.delete(*signal_keys)
-                    logger.info(f"Deleted {len(signal_keys)} SIGNAL keys")
-
+                r.delete("buy_signal", "sell_signal", "ATR_value")
                 logger.info("✅ Market close cleanup completed.")
 
             except Exception as e:
@@ -307,83 +292,177 @@ def market_close_cleanup():
             logger.info(f"Sleeping until next market open ({sleep_seconds/3600:.1f} hrs)")
             time.sleep(sleep_seconds)
         else:
-            # Check every 10 seconds near market close
             time.sleep(10)
 
 
-# ─────────── Indicators & Signals ───────────
+# ─────────── UT Bot Alerts Signal Engine ───────────
+# Matches user's exact UT Bot indicator code (a=2, c=100)
 
-def calculate_indicators(df):
-    df["ema9"] = ta.trend.ema_indicator(df["close"], window=9)
-    df["ema21"] = ta.trend.ema_indicator(df["close"], window=21)
-    df["rsi"] = ta.momentum.RSIIndicator(df["close"], window=14).rsi()
-    macd = ta.trend.MACD(df["close"])
-    df["macd"] = macd.macd()
-    df["macd_signal"] = macd.macd_signal()
-    adx = ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=14)
-    df["adx"] = adx.adx()
-    return df
+NIFTY_SYMBOL = "NIFTY"
+SIGNAL_COOLDOWN = 60  # Min seconds between same-direction signals
 
 
-def generate_signal(df):
-    latest = df.iloc[-1]
-    if df.shape[0] < 2:
-        return "NO_SIGNAL", latest.to_dict()
-    if (
-        latest["ema9"] > latest["ema21"] and
-        latest["macd"] > latest["macd_signal"] and
-        latest["rsi"] > 60 and
-        latest["adx"] > 25
-    ):
-        return "STRONG_BUY", latest.to_dict()
-    elif (
-        latest["ema9"] < latest["ema21"] and
-        latest["macd"] < latest["macd_signal"] and
-        latest["rsi"] < 40 and
-        latest["adx"] > 25
-    ):
-        return "STRONG_SELL", latest.to_dict()
-    return "NO_SIGNAL", latest.to_dict()
+def calculate_ut_bot(data, a=2, c=100, h=False):
+    """
+    UT Bot Alert indicator — exact user implementation.
+    a = ATR multiplier (key value), c = ATR period (sensitivity).
+    """
+    xATR = data['Close'].diff().abs().ewm(span=c, adjust=False).mean()
+    nLoss = a * xATR
+    src = data['Close']
+    xATRTrailingStop = pd.Series(index=data.index, dtype=float)
+
+    for i in range(len(data)):
+        if i == 0:
+            xATRTrailingStop.iloc[i] = src.iloc[i]
+        elif src.iloc[i] > xATRTrailingStop.iloc[i - 1] and src.iloc[i - 1] > xATRTrailingStop.iloc[i - 1]:
+            xATRTrailingStop.iloc[i] = max(xATRTrailingStop.iloc[i - 1], src.iloc[i] - nLoss.iloc[i])
+        elif src.iloc[i] < xATRTrailingStop.iloc[i - 1] and src.iloc[i - 1] < xATRTrailingStop.iloc[i - 1]:
+            xATRTrailingStop.iloc[i] = min(xATRTrailingStop.iloc[i - 1], src.iloc[i] + nLoss.iloc[i])
+        elif src.iloc[i] > xATRTrailingStop.iloc[i - 1]:
+            xATRTrailingStop.iloc[i] = src.iloc[i] - nLoss.iloc[i]
+        else:
+            xATRTrailingStop.iloc[i] = src.iloc[i] + nLoss.iloc[i]
+
+    pos = np.zeros(len(data))
+
+    for i in range(len(data)):
+        if i == 0:
+            pos[i] = 0
+        elif src.iloc[i - 1] < xATRTrailingStop.iloc[i - 1] and src.iloc[i] > xATRTrailingStop.iloc[i - 1]:
+            pos[i] = 1
+        elif src.iloc[i - 1] > xATRTrailingStop.iloc[i - 1] and src.iloc[i] < xATRTrailingStop.iloc[i - 1]:
+            pos[i] = -1
+        else:
+            pos[i] = pos[i - 1]
+
+    buy = (pos == 1)
+    sell = (pos == -1)
+
+    signals = pd.DataFrame(index=data.index)
+    signals['buy'] = buy
+    signals['sell'] = sell
+
+    return signals, xATR
 
 
-def update_indicators_and_signal():
-    today_date = datetime.datetime.now().strftime("%Y%m%d")
+def nifty_signal_engine():
+    """
+    Signal engine — runs UT Bot on NIFTY 1-min candles.
+    Publishes buy/sell signals on Redis channels that pos_handle_wts.py listens to:
+      - signal:buy / signal:sell (pub/sub)
+      - buy_signal / sell_signal (key-value fallback)
+      - candle:close (for trailing SL updates)
+    Also stores ATR value and writes last candle to main_csv.csv.
+    """
+    last_signal_time = 0
+    last_signal = "NONE"
+    prev_buy = False
+    prev_sell = False
+
+    logger.info("Starting NIFTY signal engine (UT Bot a=2, c=100)...")
+
     while True:
         try:
             now_time = datetime.datetime.now(INDIA_TZ).time()
-            market_close = datetime.time(15, 30)
-
-            if now_time >= market_close:
-                print("Market closed. Stopping indicator process.")
+            if now_time >= datetime.time(15, 30):
+                logger.info("Market closed. Stopping signal engine.")
                 break
-            else:
-                now = datetime.date.today()
-                df = pd.read_csv("stocks_csv_1.csv")
-                list_data = list(df["pSymbolName"].str.strip())
-                for data in list_data:
-                    history_key = f"HISTORY:{data}:{now}"
-                    history_data = r.lrange(history_key, 0, -1)
-                    if len(history_data) < 30:
-                        return
-                    df = pd.DataFrame([json.loads(x) for x in history_data])
-                    df = df.astype({
-                        "open": float, "high": float, "low": float,
-                        "close": float, "volume": float,
-                        "total_buy_quantity": float, "total_sell_quantity": float
-                    })
-                    df = calculate_indicators(df)
-                    signal, data_dict = generate_signal(df)
-                    data_to_store = {
-                        "Signal": signal,
-                        "dat": data_dict,
-                    }
-                    if signal != "NO_SIGNAL":
-                        if not r.exists(f"SIGNAL:{data}:{today_date}"):
-                            r.set(f"SIGNAL:{data}:{today_date}", json.dumps(data_to_store))
-                            logger.info(f"[SIGNAL] {data}: {signal}")
+
+            if now_time < datetime.time(9, 16):
+                time.sleep(5)
+                continue
+
+            # Read NIFTY candle history from Redis
+            date_key = datetime.date.today().strftime('%Y-%m-%d')
+            history_key = f"HISTORY:{NIFTY_SYMBOL}:{date_key}"
+            history_data = r.lrange(history_key, 0, -1)
+
+            if len(history_data) < 5:
+                time.sleep(3)
+                continue
+
+            # Build DataFrame with column names matching UT Bot code
+            candles = [json.loads(x) for x in history_data]
+            df = pd.DataFrame(candles)
+            df = df.rename(columns={
+                "open": "Open", "high": "High",
+                "low": "Low", "close": "Close",
+                "volume": "Volume",
+            })
+            df = df.astype({
+                "Open": float, "High": float, "Low": float,
+                "Close": float, "Volume": float,
+            })
+
+            # Run UT Bot
+            signals, xATR = calculate_ut_bot(df, a=2, c=100)
+
+            # Store ATR in Redis
+            current_atr = xATR.iloc[-1]
+            if pd.notna(current_atr):
+                r.set("ATR_value", str(round(current_atr, 2)))
+
+            # Write last candle to main_csv.csv for trailing SL
+            last_row = df.iloc[-1]
+            csv_data = pd.DataFrame([{
+                "timestamp": last_row.get("timestamp", ""),
+                "open": last_row["Open"],
+                "high": last_row["High"],
+                "low": last_row["Low"],
+                "close": last_row["Close"],
+            }])
+            csv_data.to_csv("main_csv.csv", index=False)
+
+            # Check for NEW signal transitions (edge detection)
+            curr_buy = bool(signals['buy'].iloc[-1])
+            curr_sell = bool(signals['sell'].iloc[-1])
+
+            now_ts = time.time()
+
+            # BUY signal: transition from not-buy to buy
+            if curr_buy and not prev_buy:
+                if now_ts - last_signal_time > SIGNAL_COOLDOWN:
+                    r.publish("signal:buy", "true")
+                    r.set("buy_signal", "true")
+                    r.set("sell_signal", "false")
+                    last_signal = "BUY"
+                    last_signal_time = now_ts
+                    logger.info(f"🟢 BUY SIGNAL — UT Bot | NIFTY Close={last_row['Close']} ATR={current_atr:.2f}")
+
+            # SELL signal: transition from not-sell to sell
+            elif curr_sell and not prev_sell:
+                if now_ts - last_signal_time > SIGNAL_COOLDOWN:
+                    r.publish("signal:sell", "true")
+                    r.set("sell_signal", "true")
+                    r.set("buy_signal", "false")
+                    last_signal = "SELL"
+                    last_signal_time = now_ts
+                    logger.info(f"🔴 SELL SIGNAL — UT Bot | NIFTY Close={last_row['Close']} ATR={current_atr:.2f}")
+
+            prev_buy = curr_buy
+            prev_sell = curr_sell
+
+            # Publish candle close for trailing SL updates
+            r.publish("candle:close", json.dumps({
+                "timestamp": str(last_row.get("timestamp", "")),
+                "open": float(last_row["Open"]),
+                "high": float(last_row["High"]),
+                "low": float(last_row["Low"]),
+                "close": float(last_row["Close"]),
+            }))
+
+            # Log current state every cycle
+            logger.info(
+                f"[UT Bot] NIFTY Close={last_row['Close']:.2f} ATR={current_atr:.2f} "
+                f"Buy={curr_buy} Sell={curr_sell} LastSignal={last_signal}"
+            )
+
+            time.sleep(3)
 
         except Exception as e:
-            logger.error(f"Error in update_indicators_and_signal: {e}")
+            logger.error(f"Signal engine error: {e}")
+            time.sleep(5)
 
 
 # ─────────── Entry Point ───────────
@@ -392,7 +471,7 @@ if __name__ == "__main__":
     load_tokens_from_csv()
 
     P0 = Process(target=run_websocket)
-    P1 = Process(target=update_indicators_and_signal)
+    P1 = Process(target=nifty_signal_engine)
     P2 = Process(target=market_close_cleanup)
 
     P0.start()
