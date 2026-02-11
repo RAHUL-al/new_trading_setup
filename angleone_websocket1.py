@@ -456,11 +456,11 @@ def nifty_signal_engine():
                     "close": float(last_row["Close"]),
                 }))
 
-            time.sleep(3)
+            time.sleep(0.1)  # 100ms — low latency signal checking
 
         except Exception as e:
             logger.error(f"Signal engine error: {e}")
-            time.sleep(5)
+            time.sleep(1)
 
 
 # ─────────── Entry Point ───────────

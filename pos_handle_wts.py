@@ -114,7 +114,7 @@ async def load_last_candle_from_csv(csv_path: str = "main_csv.csv") -> Tuple[Opt
 
 # --------------------------- core bot ---------------------------
 
-ATR_THRESHOLD = 12
+ATR_THRESHOLD = 9
 ATR_REDIS_KEY = "ATR_value"
 
 
