@@ -124,12 +124,11 @@ def find_option_in_price_range(smart_api, options_df, expiry, nifty_ltp, option_
     """
     Find a CE or PE option with LTP between PRICE_MIN and PRICE_MAX.
 
-    Smart strategy:
-    - Get ATM strike from NIFTY LTP
-    - For CE: go OTM (higher strikes), option price decreases
-    - For PE: go OTM (lower strikes), option price decreases
-    - Start from ATM and move outward until LTP falls into ₹110-150
-    - Stop early when price drops below range (further OTM = even cheaper)
+    Smart bidirectional strategy:
+    1. Start at ATM strike
+    2. If LTP > PRICE_MAX → go OTM (CE: higher strikes, PE: lower strikes)
+    3. If LTP < PRICE_MIN → go ITM (CE: lower strikes, PE: higher strikes)
+    4. Stop when price overshoots in the other direction
     """
     atm_strike = round(nifty_ltp / 50) * 50
     logger.info(f"NIFTY LTP={nifty_ltp}, ATM strike={atm_strike}, searching {option_type}...")
@@ -146,13 +145,35 @@ def find_option_in_price_range(smart_api, options_df, expiry, nifty_ltp, option_
 
     available_strikes = sorted(filtered["strike"].unique())
 
-    if option_type == "CE":
-        # OTM CE = higher strikes than ATM. Price decreases as we go further OTM.
-        candidates = [s for s in available_strikes if s >= atm_strike]
+    # Check ATM first to determine search direction
+    atm_ltp = _check_strike(smart_api, filtered, atm_strike, option_type)
+
+    if atm_ltp is not None and PRICE_MIN <= atm_ltp <= PRICE_MAX:
+        # ATM is in range — return it
+        row = filtered[filtered["strike"] == atm_strike].iloc[0]
+        token = str(row["pSymbol"]).strip()
+        trading_symbol = str(row["pTrdSymbol"]).strip()
+        logger.info(f"✅ Selected {option_type}: {trading_symbol} (token={token}) LTP=₹{atm_ltp}")
+        return trading_symbol, token
+
+    if atm_ltp is not None and atm_ltp > PRICE_MAX:
+        # Too expensive at ATM → go OTM (price decreases)
+        if option_type == "CE":
+            candidates = [s for s in available_strikes if s > atm_strike]
+        else:
+            candidates = [s for s in available_strikes if s < atm_strike]
+            candidates = list(reversed(candidates))
+        search_direction = "OTM"
     else:
-        # OTM PE = lower strikes than ATM. Price decreases as we go further OTM.
-        candidates = [s for s in available_strikes if s <= atm_strike]
-        candidates = list(reversed(candidates))  # Start from ATM going down
+        # Too cheap at ATM (or ATM not found) → go ITM (price increases)
+        if option_type == "CE":
+            candidates = [s for s in available_strikes if s < atm_strike]
+            candidates = list(reversed(candidates))  # Start closest to ATM
+        else:
+            candidates = [s for s in available_strikes if s > atm_strike]
+        search_direction = "ITM"
+
+    logger.info(f"  ATM LTP={atm_ltp}, searching {search_direction}...")
 
     for strike in candidates:
         row = filtered[filtered["strike"] == strike].iloc[0]
@@ -169,15 +190,32 @@ def find_option_in_price_range(smart_api, options_df, expiry, nifty_ltp, option_
             logger.info(f"✅ Selected {option_type}: {trading_symbol} (token={token}) LTP=₹{ltp}")
             return trading_symbol, token
 
-        # Going further OTM = cheaper. If already below range, stop.
-        if ltp < PRICE_MIN:
-            logger.info(f"  {option_type} LTP {ltp} below ₹{PRICE_MIN}, stopping search.")
+        # If going OTM (prices decreasing) and price drops below range → stop
+        if search_direction == "OTM" and ltp < PRICE_MIN:
+            logger.info(f"  {option_type} LTP {ltp} below ₹{PRICE_MIN}, stopping OTM search.")
             break
 
-        # If above range, continue going OTM (price will decrease)
+        # If going ITM (prices increasing) and price goes above range → stop
+        if search_direction == "ITM" and ltp > PRICE_MAX:
+            logger.info(f"  {option_type} LTP {ltp} above ₹{PRICE_MAX}, stopping ITM search.")
+            break
 
     logger.warning(f"No {option_type} option found in ₹{PRICE_MIN}-{PRICE_MAX} range")
     return None, None
+
+
+def _check_strike(smart_api, filtered_df, strike, option_type):
+    """Check LTP for a specific strike. Returns LTP or None."""
+    rows = filtered_df[filtered_df["strike"] == strike]
+    if rows.empty:
+        return None
+    row = rows.iloc[0]
+    token = str(row["pSymbol"]).strip()
+    trading_symbol = str(row["pTrdSymbol"]).strip()
+    ltp = get_ltp(smart_api, "NFO", trading_symbol, token)
+    if ltp is not None:
+        logger.info(f"  {option_type} Strike {strike:.0f}: {trading_symbol} LTP={ltp}")
+    return ltp
 
 
 # ─────────── Main Loop ───────────
