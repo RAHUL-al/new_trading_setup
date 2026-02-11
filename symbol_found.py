@@ -97,9 +97,10 @@ def load_nifty_options():
 
     # Parse strike price — handle "dStrikePrice;" column
     strike_col = "dStrikePrice;" if "dStrikePrice;" in nifty_opts.columns else "dStrikePrice"
-    nifty_opts["strike"] = pd.to_numeric(nifty_opts[strike_col], errors="coerce")
-    nifty_opts = nifty_opts.dropna(subset=["strike"])
-    nifty_opts["strike"] = nifty_opts["strike"].astype(float)
+    nifty_opts["strike_raw"] = pd.to_numeric(nifty_opts[strike_col], errors="coerce")
+    nifty_opts = nifty_opts.dropna(subset=["strike_raw"])
+    # AngelOne scrip master stores strikes as 100x actual (e.g., 2515000 = ₹25150)
+    nifty_opts["strike"] = nifty_opts["strike_raw"] / 100.0
 
     logger.info(f"Loaded {len(nifty_opts)} NIFTY options from scrip master.")
     return nifty_opts
@@ -122,13 +123,16 @@ def get_nearest_expiry(options_df):
 def find_option_in_price_range(smart_api, options_df, expiry, nifty_ltp, option_type):
     """
     Find a CE or PE option with LTP between PRICE_MIN and PRICE_MAX.
-    
-    Strategy:
-    - For CE: start at ATM, go OTM (higher strikes) until price is in range
-    - For PE: start at ATM, go OTM (lower strikes) until price is in range
+
+    Smart strategy:
+    - Get ATM strike from NIFTY LTP
+    - For CE: go OTM (higher strikes), option price decreases
+    - For PE: go OTM (lower strikes), option price decreases
+    - Start from ATM and move outward until LTP falls into ₹110-150
+    - Stop early when price drops below range (further OTM = even cheaper)
     """
-    # Round to nearest 50
     atm_strike = round(nifty_ltp / 50) * 50
+    logger.info(f"NIFTY LTP={nifty_ltp}, ATM strike={atm_strike}, searching {option_type}...")
 
     # Filter for this expiry and option type
     filtered = options_df[
@@ -140,17 +144,15 @@ def find_option_in_price_range(smart_api, options_df, expiry, nifty_ltp, option_
         logger.error(f"No {option_type} options found for expiry {expiry}")
         return None, None
 
-    # Sort strikes
-    filtered = filtered.sort_values("strike")
     available_strikes = sorted(filtered["strike"].unique())
 
     if option_type == "CE":
-        # Go OTM: start from ATM, move to higher strikes
+        # OTM CE = higher strikes than ATM. Price decreases as we go further OTM.
         candidates = [s for s in available_strikes if s >= atm_strike]
     else:
-        # Go OTM: start from ATM, move to lower strikes
+        # OTM PE = lower strikes than ATM. Price decreases as we go further OTM.
         candidates = [s for s in available_strikes if s <= atm_strike]
-        candidates = list(reversed(candidates))
+        candidates = list(reversed(candidates))  # Start from ATM going down
 
     for strike in candidates:
         row = filtered[filtered["strike"] == strike].iloc[0]
@@ -161,23 +163,18 @@ def find_option_in_price_range(smart_api, options_df, expiry, nifty_ltp, option_
         if ltp is None:
             continue
 
-        logger.info(f"  {option_type} Strike {strike}: {trading_symbol} LTP={ltp}")
+        logger.info(f"  {option_type} Strike {strike:.0f}: {trading_symbol} LTP={ltp}")
 
         if PRICE_MIN <= ltp <= PRICE_MAX:
             logger.info(f"✅ Selected {option_type}: {trading_symbol} (token={token}) LTP=₹{ltp}")
             return trading_symbol, token
 
-        # If price is below range, we've gone too far OTM — stop
+        # Going further OTM = cheaper. If already below range, stop.
         if ltp < PRICE_MIN:
-            if option_type == "CE":
-                break  # Further OTM CE will be even cheaper
-            # For PE, going further OTM (lower strikes) = higher PE price, continue
-        
-        # If price is above range, need to go more OTM
-        if ltp > PRICE_MAX:
-            if option_type == "PE":
-                break  # Further OTM PE will be even cheaper
-            # For CE, going further OTM (higher strikes) = lower CE price, continue
+            logger.info(f"  {option_type} LTP {ltp} below ₹{PRICE_MIN}, stopping search.")
+            break
+
+        # If above range, continue going OTM (price will decrease)
 
     logger.warning(f"No {option_type} option found in ₹{PRICE_MIN}-{PRICE_MAX} range")
     return None, None
