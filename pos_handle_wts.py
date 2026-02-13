@@ -563,11 +563,11 @@ class TradingBot:
                             f"Waiting for signal"
                         )
                 
-                await asyncio.sleep(30)
+                await asyncio.sleep(2)
                 
             except Exception as e:
                 logger.error(f"Status monitor error: {e}")
-                await asyncio.sleep(10)
+                await asyncio.sleep(2)
 
     # ---------- market hours / trading window ----------
     def is_market_hours(self) -> bool:
@@ -746,7 +746,7 @@ class TradingBot:
         
         while True:
             if not self.is_market_hours():
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.1)
                 continue
 
             try:
@@ -818,7 +818,7 @@ class TradingBot:
                 squared_off_today = False  # Reset for next day
             
             else:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.1)
 
     async def task_candle_cache_refresh(self):
         while True:
@@ -826,7 +826,7 @@ class TradingBot:
                 high, low = await load_last_candle_from_redis(self.r)
                 if high is not None and low is not None:
                     await self.cache_candle(high, low)
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.1)
 
     async def task_symbol_refresh(self):
         """Periodically reload CE/PE tokens from Redis when no position is open."""
