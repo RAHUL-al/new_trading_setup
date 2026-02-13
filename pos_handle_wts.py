@@ -111,9 +111,6 @@ async def load_last_candle_from_redis(redis_conn) -> Tuple[Optional[float], Opti
 
 # --------------------------- core bot ---------------------------
 
-ATR_THRESHOLD = 2
-ATR_REDIS_KEY = "ATR_value"
-
 
 class TradingBot:
     def __init__(self):
@@ -133,32 +130,15 @@ class TradingBot:
         self.open_pos: Optional[Position] = None
         self._close_lock = asyncio.Lock()
         self.last_candle: Optional[CandleData] = None
-        self.atr_value: float = 0.0
         self.daily_pnl: float = 0.0
         self.trade_count: int = 0
         
         now = datetime.now()
-        self.market_open_time = now.replace(hour=9, minute=17, second=0, microsecond=0)
+        self.market_open_time = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        self.trading_start_time = now.replace(hour=12, minute=30, second=0, microsecond=0)
+        self.trading_end_time = now.replace(hour=15, minute=10, second=0, microsecond=0)
+        self.square_off_time = now.replace(hour=15, minute=24, second=0, microsecond=0)
         self.market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
-        self.square_off_time = now.replace(hour=15, minute=25, second=0, microsecond=0)
-        self._is_market_hours = False
-
-    async def get_current_atr(self) -> float:
-        """Get current ATR value from Redis"""
-        try:
-            atr_str = await self.r.get(ATR_REDIS_KEY)
-            if atr_str:
-                return float(atr_str)
-        except (ValueError, TypeError) as e:
-            logger.error(f"Error parsing ATR value from Redis: {e}")
-        except Exception as e:
-            logger.error(f"Error getting ATR from Redis: {e}")
-        return 0.0
-
-    async def is_atr_above_threshold(self) -> bool:
-        """Check if ATR is above the threshold for trading"""
-        self.atr_value = await self.get_current_atr()
-        return self.atr_value > ATR_THRESHOLD
     
 
     async def load_last_complete_candle(self) -> Optional[CandleData]:
@@ -397,10 +377,6 @@ class TradingBot:
 
 
     async def take_buy(self, quantity: int = 1, signal_candle: Optional[CandleData] = None) -> bool:
-        if not await self.is_atr_above_threshold():
-            logger.info(f"ATR {self.atr_value:.2f} below threshold {ATR_THRESHOLD}, skipping BUY")
-            return False
-            
         if not self.ce_token:
             logger.error("CE token not loaded")
             return False
@@ -432,15 +408,10 @@ class TradingBot:
         )
         self.open_pos = pos
         await self.save_position(pos)
-        logger.info(f"✅ POSITION OPENED: BUY CE {self.ce_symbol} @ ₹{price:.2f} | Stop Loss=₹{initial_sl:.2f} | ATR={self.atr_value:.2f}")
+        logger.info(f"✅ POSITION OPENED: BUY CE {self.ce_symbol} @ ₹{price:.2f} | Stop Loss=₹{initial_sl:.2f}")
         return True
 
     async def take_sell(self, quantity: int = 1, signal_candle: Optional[CandleData] = None) -> bool:
-        # Check ATR before entering
-        if not await self.is_atr_above_threshold():
-            logger.info(f"ATR {self.atr_value:.2f} below threshold {ATR_THRESHOLD}, skipping SELL")
-            return False
-            
         if not self.pe_token:
             logger.error("PE token not loaded")
             return False
@@ -472,7 +443,7 @@ class TradingBot:
         )
         self.open_pos = pos
         await self.save_position(pos)
-        logger.info(f"✅ POSITION OPENED: SELL PE {self.pe_symbol} @ ₹{price:.2f} | Stop Loss=₹{initial_sl:.2f} | ATR={self.atr_value:.2f}")
+        logger.info(f"✅ POSITION OPENED: SELL PE {self.pe_symbol} @ ₹{price:.2f} | Stop Loss=₹{initial_sl:.2f}")
         return True
 
     async def close_position(self, reason: str) -> bool:
@@ -524,20 +495,22 @@ class TradingBot:
             return True
 
 
-    async def task_atr_monitor(self):
-        """Log ATR + position status every 30s."""
+    async def task_status_monitor(self):
+        """Log position + daily P&L status every 30s."""
         while True:
             try:
                 if self.is_market_hours():
-                    current_atr = await self.get_current_atr()
-                    atr_ok = "✅" if current_atr >= ATR_THRESHOLD else "❌"
+                    now = datetime.now()
+                    trading_active = self.is_trading_window()
+                    window_status = "🟢 TRADING" if trading_active else "🔴 NO NEW TRADES"
+                    
                     if self.open_pos:
                         pos = self.open_pos
                         cur_price = await self.get_current_price(pos.token)
                         pnl = (cur_price - pos.entry_price) * pos.quantity
                         daily_emoji = "📈" if self.daily_pnl >= 0 else "📉"
                         logger.info(
-                            f"📊 ATR={current_atr:.2f} {atr_ok} | "
+                            f"📊 {window_status} | "
                             f"POSITION: {pos.option_type} {pos.trading_symbol} "
                             f"Entry=₹{pos.entry_price:.2f} Current=₹{cur_price:.2f} "
                             f"SL=₹{pos.stop_loss:.2f} P&L=₹{pnl:.2f} | "
@@ -546,22 +519,27 @@ class TradingBot:
                     else:
                         daily_emoji = "📈" if self.daily_pnl >= 0 else "📉"
                         logger.info(
-                            f"📊 ATR={current_atr:.2f} {atr_ok} (need ≥{ATR_THRESHOLD}) | "
+                            f"📊 {window_status} | "
                             f"{daily_emoji} Day=₹{self.daily_pnl:.2f} ({self.trade_count} trades) | "
                             f"Waiting for signal"
                         )
                 
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(30)
                 
             except Exception as e:
-                logger.error(f"ATR monitor error: {e}")
-                await asyncio.sleep(0.1)
+                logger.error(f"Status monitor error: {e}")
+                await asyncio.sleep(10)
 
-    # ---------- market hours check ----------
+    # ---------- market hours / trading window ----------
     def is_market_hours(self) -> bool:
+        """True from 9:15 to 15:30 — candle building, WebSocket, position management."""
         now = datetime.now()
-        current_time = now.time()
-        return (self.market_open_time.time() <= current_time <= self.market_close_time.time())
+        return self.market_open_time.time() <= now.time() <= self.market_close_time.time()
+
+    def is_trading_window(self) -> bool:
+        """True from 12:30 to 15:10 — new positions only in this window."""
+        now = datetime.now()
+        return self.trading_start_time.time() <= now.time() <= self.trading_end_time.time()
 
     # ---------- event handlers ----------
     async def handle_index_tick(self, price: float):
@@ -581,33 +559,28 @@ class TradingBot:
     
 
     async def on_buy_signal(self, signal_candle: Optional[CandleData] = None):
-        current_atr = await self.get_current_atr()
-        if not await self.is_atr_above_threshold():
-            logger.info(f"⚠️ BUY signal received but ATR={current_atr:.2f} < threshold={ATR_THRESHOLD}. Skipping.")
-            return
-            
         signal_candle = await self.load_last_complete_candle()
         if signal_candle is None:
             logger.warning("No candle data for buy signal")
             return
-            
+        
         if not self.is_market_hours():
             return
-            
+        
+        # Close opposite PE position if open (works anytime during market hours)
         if self.open_pos and self.open_pos.option_type == "PE":
             logger.info(f"🔄 Closing PE position (opposite BUY signal received)")
             await self.close_position("OPPOSITE_SIGNAL")
         
+        # Only take NEW positions inside trading window (12:30 - 3:10)
         if not self.open_pos:
-            logger.info(f"🟢 BUY SIGNAL received | ATR={current_atr:.2f} ✅ | Taking CE position...")
+            if not self.is_trading_window():
+                logger.info(f"⚠️ BUY signal received but outside trading window (12:30-15:10). Skipping.")
+                return
+            logger.info(f"🟢 BUY SIGNAL | Taking CE position...")
             await self.take_buy(quantity=1, signal_candle=signal_candle)
 
     async def on_sell_signal(self, signal_candle: Optional[CandleData] = None):
-        current_atr = await self.get_current_atr()
-        if not await self.is_atr_above_threshold():
-            logger.info(f"⚠️ SELL signal received but ATR={current_atr:.2f} < threshold={ATR_THRESHOLD}. Skipping.")
-            return
-            
         signal_candle = await self.load_last_complete_candle()
         if signal_candle is None:
             logger.warning("No candle data for sell signal")
@@ -615,13 +588,18 @@ class TradingBot:
 
         if not self.is_market_hours():
             return
-            
+        
+        # Close opposite CE position if open (works anytime during market hours)
         if self.open_pos and self.open_pos.option_type == "CE":
             logger.info(f"🔄 Closing CE position (opposite SELL signal received)")
             await self.close_position("OPPOSITE_SIGNAL")
         
+        # Only take NEW positions inside trading window (12:30 - 3:10)
         if not self.open_pos:
-            logger.info(f"🔴 SELL SIGNAL received | ATR={current_atr:.2f} ✅ | Taking PE position...")
+            if not self.is_trading_window():
+                logger.info(f"⚠️ SELL signal received but outside trading window (12:30-15:10). Skipping.")
+                return
+            logger.info(f"🔴 SELL SIGNAL | Taking PE position...")
             await self.take_sell(quantity=1, signal_candle=signal_candle)
 
     async def task_pubsub_listener(self):
@@ -711,33 +689,37 @@ class TradingBot:
             await asyncio.sleep(0.1)
 
     async def task_square_off_scheduler(self):
+        squared_off_today = False
         while True:
             now = datetime.now()
             
-            if now.time() >= self.square_off_time.time() and self.is_market_hours():
+            # Square off at 3:24 PM
+            if now.time() >= self.square_off_time.time() and self.is_market_hours() and not squared_off_today:
                 if self.open_pos:
-                    await self.close_position("SQUARE_OFF")
-                logger.info("Square-off completed")
+                    logger.info(f"⏰ 3:24 PM — Auto square off")
+                    await self.close_position("SQUARE_OFF_3:24")
                 
-                # Calculate daily P&L
-                data = await self.r.get(f"trade_history_{datetime.now().date()}")
-                total_profit_or_loss = 0
-
-                if data:
-                    try:
-                        trade_history = json.loads(data)
-                        for trade in trade_history:
-                            entry_time = datetime.fromisoformat(trade["entry_time"])
-                            if entry_time.date() == datetime.today().date():
-                                total_profit_or_loss += float(trade["pnl"])
-                    except (json.JSONDecodeError, KeyError, ValueError) as e:
-                        logger.error(f"Error calculating P&L: {e}")
-
-                logger.info(f"Total P&L for the day: {total_profit_or_loss}")
+                # Log final daily P&L
+                daily_emoji = "📈" if self.daily_pnl >= 0 else "📉"
+                logger.info(f"{daily_emoji} FINAL DAY P&L: ₹{self.daily_pnl:.2f} | Trades: {self.trade_count}")
                 
-                await asyncio.sleep((self.market_close_time - now).total_seconds())
+                # Delete ALL Redis keys EXCEPT trade_history_*
+                logger.info("🧹 Cleaning up Redis (keeping trade_history only)...")
+                all_keys = await self.r.keys("*")
+                keys_to_delete = [k for k in all_keys if not k.startswith("trade_history_")]
+                if keys_to_delete:
+                    await self.r.delete(*keys_to_delete)
+                    logger.info(f"🗑️ Deleted {len(keys_to_delete)} Redis keys")
+                
+                logger.info("✅ Market day complete. All cleaned up.")
+                squared_off_today = True
+                
+                # Wait until market close
+                remaining = (self.market_close_time - now).total_seconds()
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
             
-            # Check if market is closed and wait for next open
+            # After market close — wait for next day
             elif not self.is_market_hours() and now.time() > self.market_close_time.time():
                 tomorrow = (now + timedelta(days=1)).replace(
                     hour=9, minute=15, second=0, microsecond=0
@@ -745,6 +727,7 @@ class TradingBot:
                 sleep_seconds = (tomorrow - now).total_seconds()
                 logger.info(f"Market closed. Sleeping for {sleep_seconds/3600:.2f} hours")
                 await asyncio.sleep(sleep_seconds)
+                squared_off_today = False  # Reset for next day
             
             else:
                 await asyncio.sleep(1)
@@ -793,9 +776,7 @@ class TradingBot:
             except Exception as e:
                 logger.error(f"Error recovering daily P&L: {e}")
             
-            # Initial ATR check
-            initial_atr = await self.get_current_atr()
-            logger.info(f"Initial ATR: {initial_atr:.2f}")
+            logger.info(f"⏰ Trading window: 12:30 PM - 3:10 PM | Square off: 3:24 PM")
             
             # Create tasks
             tasks = [
@@ -804,7 +785,7 @@ class TradingBot:
                 asyncio.create_task(self.task_square_off_scheduler()),
                 asyncio.create_task(self.task_candle_cache_refresh()),
                 asyncio.create_task(self.task_continuous_trailing_stop_loss()),
-                asyncio.create_task(self.task_atr_monitor()),
+                asyncio.create_task(self.task_status_monitor()),
                 asyncio.create_task(self.task_symbol_refresh()),
             ]
             

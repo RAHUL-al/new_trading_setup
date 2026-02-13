@@ -233,52 +233,19 @@ def run_websocket():
 # ─────────── Market Close Cleanup ───────────
 
 def market_close_cleanup():
-    """At 3:30 PM: archive candle history, then clear Redis keys."""
+    """At 3:30 PM: delete all Redis keys except trade_history_*."""
     while True:
         now = datetime.datetime.now(INDIA_TZ)
         market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
 
         if now >= market_close:
-            date_key = now.strftime('%Y-%m-%d')
-            archive_key = f"NIFTY_CANDLES:{date_key}"
-
             try:
-                # Archive NIFTY candle history
-                nifty_history_key = f"HISTORY:NIFTY:{date_key}"
-                nifty_candles = r.lrange(nifty_history_key, 0, -1)
-                if nifty_candles:
-                    for candle in nifty_candles:
-                        r.rpush(archive_key, candle)
-                    logger.info(f"Archived {len(nifty_candles)} NIFTY candles to {archive_key}")
-
-                # Archive option candles
-                try:
-                    ts_data = r.get(TRADING_SYMBOLS_KEY)
-                    if ts_data:
-                        ts = json.loads(ts_data)
-                        for opt_type in ["CE", "PE"]:
-                            info = ts.get(opt_type, [None, None])
-                            if info and info[0]:
-                                sym = info[0]
-                                hist_key = f"HISTORY:{sym}:{date_key}"
-                                sym_candles = r.lrange(hist_key, 0, -1)
-                                if sym_candles:
-                                    sym_archive = f"{sym}_CANDLES:{date_key}"
-                                    for c in sym_candles:
-                                        r.rpush(sym_archive, c)
-                                    logger.info(f"Archived {len(sym_candles)} candles for {sym}")
-                except Exception as e:
-                    logger.error(f"Error archiving option candles: {e}")
-
-                # Clean up Redis keys
-                for pattern in ["CANDLE:*", "HISTORY:*", "SIGNAL:*"]:
-                    keys = r.keys(pattern)
-                    if keys:
-                        r.delete(*keys)
-                        logger.info(f"Deleted {len(keys)} {pattern} keys")
-
-                r.delete(TRADING_SYMBOLS_KEY)
-                r.delete("buy_signal", "sell_signal", "ATR_value")
+                # Delete ALL Redis keys except trade_history_*
+                all_keys = r.keys("*")
+                keys_to_delete = [k for k in all_keys if not k.startswith("trade_history_")]
+                if keys_to_delete:
+                    r.delete(*keys_to_delete)
+                    logger.info(f"🗑️ Deleted {len(keys_to_delete)} Redis keys (kept trade_history)")
                 logger.info("✅ Market close cleanup completed.")
 
             except Exception as e:
