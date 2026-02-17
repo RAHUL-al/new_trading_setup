@@ -32,7 +32,7 @@ OPTION_TOKENS_CHANNEL = "option_tokens_updated"
 
 PRICE_MIN = 110
 PRICE_MAX = 150
-REFRESH_INTERVAL = 30  # seconds
+REFRESH_INTERVAL = 2  # seconds
 
 INDIA_TZ = pytz.timezone("Asia/Kolkata")
 
@@ -305,7 +305,7 @@ def trading_symbol_loop():
 
         if now < market_open or now >= market_close:
             logger.info("Outside market hours. Waiting...")
-            time.sleep(30)
+            time.sleep(2)
             continue
 
         try:

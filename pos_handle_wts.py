@@ -71,8 +71,8 @@ class Position:
     entry_time: str
     stop_loss: float
     status: str = "OPEN"
-    highest_close: float = 0.0  # For CE positions
-    lowest_close: float = 0.0   # For PE positions
+    highest_high: float = 0.0  # For CE: high of the SL candle
+    lowest_low: float = 0.0   # For PE: low of the SL candle
 
 @dataclass
 class Trade:
@@ -111,9 +111,6 @@ async def load_last_candle_from_redis(redis_conn) -> Tuple[Optional[float], Opti
 
 # --------------------------- core bot ---------------------------
 
-LOSS_THRESHOLD = 20  # Points of cumulative loss per lot level to trigger lot increase
-MAX_LOTS = 10  # Safety cap on max lot count
-
 class TradingBot:
     def __init__(self):
         self.r: Redis = Redis(
@@ -135,34 +132,12 @@ class TradingBot:
         self.daily_pnl: float = 0.0
         self.trade_count: int = 0
         
-        # Martingale lot scaling
-        self.current_lots: int = 1
-        self.cycle_pnl: float = 0.0  # Cumulative P&L for current martingale cycle
-        
         now = datetime.now()
         self.market_open_time = now.replace(hour=9, minute=15, second=0, microsecond=0)
         self.trading_start_time = now.replace(hour=12, minute=30, second=0, microsecond=0)
         self.trading_end_time = now.replace(hour=15, minute=10, second=0, microsecond=0)
         self.square_off_time = now.replace(hour=15, minute=24, second=0, microsecond=0)
         self.market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
-
-    def _calculate_lots(self) -> int:
-        """Calculate lot count from cumulative cycle loss.
-        Thresholds: 20 -> 2 lots, 60 -> 3 lots, 120 -> 4 lots, ...
-        Formula: threshold for N lots = LOSS_THRESHOLD * N * (N-1) / 2
-        """
-        if self.cycle_pnl >= 0:
-            return 1
-        loss = abs(self.cycle_pnl)
-        lots = 1
-        threshold = 0
-        while True:
-            threshold += LOSS_THRESHOLD * lots
-            if loss <= threshold:
-                return lots
-            lots += 1
-            if lots > MAX_LOTS:
-                return MAX_LOTS
     
 
     async def load_last_complete_candle(self) -> Optional[CandleData]:
@@ -334,8 +309,8 @@ class TradingBot:
                         entry_time=pdata.get("entry_time", datetime.now().isoformat()),
                         stop_loss=float(pdata["stop_loss"]),
                         status=pdata.get("status", "OPEN"),
-                        highest_close=float(pdata.get("highest_close", 0.0)),
-                        lowest_close=float(pdata.get("lowest_close", 0.0)),
+                        highest_high=float(pdata.get("highest_high", pdata.get("highest_close", 0.0))),
+                        lowest_low=float(pdata.get("lowest_low", pdata.get("lowest_close", 0.0))),
                     )
                     logger.info(f"Recovered open position: {self.open_pos}")
                     return True
@@ -352,11 +327,12 @@ class TradingBot:
         current_close = candle.close
 
         if pos.option_type == "CE":
-            if current_close > pos.highest_close:
-                pos.highest_close = current_close
+            # Trail when close exceeds the HIGH of the previous SL candle
+            if current_close > pos.highest_high:
+                pos.highest_high = candle.high
                 new_stop_loss = candle.low
                 
-                logger.info(f"CE: New high {current_close:.2f}, candle low: {candle.low:.2f}, proposed SL: {new_stop_loss:.2f}, current SL: {pos.stop_loss:.2f}")
+                logger.info(f"CE: Close {current_close:.2f} > prev high {pos.highest_high:.2f}, proposed SL: {new_stop_loss:.2f}, current SL: {pos.stop_loss:.2f}")
                 
                 if new_stop_loss > pos.stop_loss:
                     pos.stop_loss = new_stop_loss
@@ -366,13 +342,12 @@ class TradingBot:
                     logger.info(f"ℹ️ CE: New SL {new_stop_loss:.2f} not higher than current SL {pos.stop_loss:.2f}")
 
         elif pos.option_type == "PE":
-            # For PE: NIFTY drops = PE profits. SL is the candle high (NIFTY high).
-            # Trail SL DOWN as NIFTY makes new lows.
-            if current_close < pos.lowest_close or pos.lowest_close == 0:
-                pos.lowest_close = current_close
+            # Trail when close drops below the LOW of the previous SL candle
+            if current_close < pos.lowest_low or pos.lowest_low == 0:
+                pos.lowest_low = candle.low
                 new_stop_loss = candle.high
                 
-                logger.info(f"PE: New low {current_close:.2f}, candle high: {candle.high:.2f}, proposed SL: {new_stop_loss:.2f}, current SL: {pos.stop_loss:.2f}")
+                logger.info(f"PE: Close {current_close:.2f} < prev low {pos.lowest_low:.2f}, proposed SL: {new_stop_loss:.2f}, current SL: {pos.stop_loss:.2f}")
                 
                 if new_stop_loss < pos.stop_loss or pos.stop_loss == 0:
                     pos.stop_loss = new_stop_loss
@@ -428,7 +403,7 @@ class TradingBot:
             quantity=quantity,
             entry_time=datetime.now().isoformat(),
             stop_loss=initial_sl,
-            highest_close=signal_candle.close if signal_candle else price,
+            highest_high=signal_candle.high if signal_candle else price,
         )
         self.open_pos = pos
         await self.save_position(pos)
@@ -463,7 +438,7 @@ class TradingBot:
             quantity=quantity,
             entry_time=datetime.now().isoformat(),
             stop_loss=initial_sl,
-            lowest_close=signal_candle.close if signal_candle else price,
+            lowest_low=signal_candle.low if signal_candle else price,
         )
         self.open_pos = pos
         await self.save_position(pos)
@@ -506,42 +481,28 @@ class TradingBot:
             self.daily_pnl += tr.pnl
             self.trade_count += 1
             
-            # Martingale cycle tracking
-            self.cycle_pnl += tr.pnl
-            if self.cycle_pnl >= 0:
-                if self.current_lots > 1:
-                    logger.info(f"🎯 CYCLE RECOVERED! Resetting to 1 lot.")
-                self.current_lots = 1
-                self.cycle_pnl = 0.0
-            else:
-                new_lots = self._calculate_lots()
-                if new_lots != self.current_lots:
-                    logger.info(f"📊 LOT CHANGE: {self.current_lots} → {new_lots} lots (cycle loss: ₹{abs(self.cycle_pnl):.2f})")
-                    self.current_lots = new_lots
-            
             pnl_emoji = "💰" if tr.pnl >= 0 else "💸"
             daily_emoji = "📈" if self.daily_pnl >= 0 else "📉"
             logger.info(
                 f"{pnl_emoji} POSITION CLOSED: {pos.option_type} {pos.trading_symbol} | "
                 f"Entry=₹{pos.entry_price:.2f} Exit=₹{cur_price:.2f} | "
-                f"P&L=₹{tr.pnl:.2f} | Reason={reason} | Lots={self.current_lots}"
+                f"P&L=₹{tr.pnl:.2f} | Reason={reason}"
             )
             logger.info(
                 f"{daily_emoji} DAILY P&L: ₹{self.daily_pnl:.2f} | Trades: {self.trade_count} | "
-                f"Cycle P&L: ₹{self.cycle_pnl:.2f} | Next qty: {self.current_lots}"
+                f"⏳ Waiting for next signal..."
             )
             return True
 
 
     async def task_status_monitor(self):
-        """Log position + daily P&L + lot info every 30s."""
+        """Log position + daily P&L every 30s."""
         while True:
             try:
                 if self.is_market_hours():
                     now = datetime.now()
                     trading_active = self.is_trading_window()
                     window_status = "🟢 TRADING" if trading_active else "🔴 NO NEW TRADES"
-                    lot_info = f"Lots={self.current_lots} Cycle=₹{self.cycle_pnl:.2f}"
                     
                     if self.open_pos:
                         pos = self.open_pos
@@ -549,8 +510,8 @@ class TradingBot:
                         pnl = (cur_price - pos.entry_price) * pos.quantity
                         daily_emoji = "📈" if self.daily_pnl >= 0 else "📉"
                         logger.info(
-                            f"📊 {window_status} | {lot_info} | "
-                            f"POSITION: {pos.option_type} qty={pos.quantity} "
+                            f"📊 {window_status} | "
+                            f"POSITION: {pos.option_type} {pos.trading_symbol} "
                             f"Entry=₹{pos.entry_price:.2f} Current=₹{cur_price:.2f} "
                             f"SL=₹{pos.stop_loss:.2f} P&L=₹{pnl:.2f} | "
                             f"{daily_emoji} Day=₹{self.daily_pnl:.2f} ({self.trade_count} trades)"
@@ -558,12 +519,12 @@ class TradingBot:
                     else:
                         daily_emoji = "📈" if self.daily_pnl >= 0 else "📉"
                         logger.info(
-                            f"📊 {window_status} | {lot_info} | "
+                            f"📊 {window_status} | "
                             f"{daily_emoji} Day=₹{self.daily_pnl:.2f} ({self.trade_count} trades) | "
                             f"Waiting for signal"
                         )
                 
-                await asyncio.sleep(2)
+                await asyncio.sleep(0.1)
                 
             except Exception as e:
                 logger.error(f"Status monitor error: {e}")
@@ -594,50 +555,6 @@ class TradingBot:
         elif pos.option_type == "PE" and price >= pos.stop_loss:
             logger.info(f"🛑 STOP LOSS HIT! NIFTY={price:.2f} ≥ SL={pos.stop_loss:.2f} | Closing {pos.option_type} position")
             await self.close_position("STOP_LOSS")
-        
-        # Recovery check: reduce lots to 1 if cycle loss is recovered
-        elif self.cycle_pnl < 0 and self.current_lots > 1:
-            cur_option_price = await self.get_current_price(pos.token)
-            if cur_option_price > 0:
-                live_pnl = (cur_option_price - pos.entry_price) * pos.quantity
-                total_pnl = self.cycle_pnl + live_pnl
-                if total_pnl >= 0:
-                    # Recovery! Reduce to 1 lot, keep position running
-                    lots_to_close = pos.quantity - 1
-                    partial_pnl = (cur_option_price - pos.entry_price) * lots_to_close
-                    
-                    logger.info(
-                        f"🎯 RECOVERY! Live P&L=₹{live_pnl:.2f} covers cycle loss=₹{abs(self.cycle_pnl):.2f} | "
-                        f"Reducing {pos.quantity} → 1 lot (closing {lots_to_close} lots)"
-                    )
-                    
-                    # Book partial P&L for the lots being closed
-                    partial_trade = Trade(
-                        token=pos.token,
-                        option_type=pos.option_type,
-                        position_type=pos.position_type,
-                        entry_price=pos.entry_price,
-                        exit_price=cur_option_price,
-                        quantity=lots_to_close,
-                        entry_time=pos.entry_time,
-                        exit_time=datetime.now().isoformat(),
-                        stop_loss=pos.stop_loss,
-                        pnl=round(float(partial_pnl), 2),
-                        close_reason="RECOVERY_PARTIAL",
-                    )
-                    await self.save_trade(partial_trade)
-                    self.daily_pnl += partial_trade.pnl
-                    self.trade_count += 1
-                    
-                    # Reduce position to 1 lot
-                    pos.quantity = 1
-                    await self.save_position(pos)
-                    
-                    # Reset martingale cycle
-                    self.current_lots = 1
-                    self.cycle_pnl = 0.0
-                    
-                    logger.info(f"✅ Reset to 1 lot. Position continues: {pos.option_type} @ ₹{pos.entry_price:.2f}")
 
     
 
@@ -660,8 +577,8 @@ class TradingBot:
             if not self.is_trading_window():
                 logger.info(f"⚠️ BUY signal received but outside trading window (12:30-15:10). Skipping.")
                 return
-            logger.info(f"🟢 BUY SIGNAL | Lots={self.current_lots} | Taking CE position...")
-            await self.take_buy(quantity=self.current_lots, signal_candle=signal_candle)
+            logger.info(f"🟢 BUY SIGNAL | Taking CE position...")
+            await self.take_buy(quantity=1, signal_candle=signal_candle)
 
     async def on_sell_signal(self, signal_candle: Optional[CandleData] = None):
         signal_candle = await self.load_last_complete_candle()
@@ -682,8 +599,8 @@ class TradingBot:
             if not self.is_trading_window():
                 logger.info(f"⚠️ SELL signal received but outside trading window (12:30-15:10). Skipping.")
                 return
-            logger.info(f"🔴 SELL SIGNAL | Lots={self.current_lots} | Taking PE position...")
-            await self.take_sell(quantity=self.current_lots, signal_candle=signal_candle)
+            logger.info(f"🔴 SELL SIGNAL | Taking PE position...")
+            await self.take_sell(quantity=1, signal_candle=signal_candle)
 
     async def task_pubsub_listener(self):
         """Listens for Pub/Sub messages for prices, signals, and candle closes."""
@@ -786,11 +703,6 @@ class TradingBot:
                 daily_emoji = "📈" if self.daily_pnl >= 0 else "📉"
                 logger.info(f"{daily_emoji} FINAL DAY P&L: ₹{self.daily_pnl:.2f} | Trades: {self.trade_count}")
                 
-                # Reset martingale cycle for next day
-                self.current_lots = 1
-                self.cycle_pnl = 0.0
-                logger.info("🔄 Martingale cycle reset to 1 lot")
-                
                 # Delete ALL Redis keys EXCEPT trade_history_*
                 logger.info("🧹 Cleaning up Redis (keeping trade_history only)...")
                 all_keys = await self.r.keys("*")
@@ -840,7 +752,7 @@ class TradingBot:
                         logger.info(f"Symbols refreshed: CE={self.ce_symbol}/{self.ce_token} PE={self.pe_symbol}/{self.pe_token}")
             except Exception as e:
                 logger.error(f"Symbol refresh error: {e}")
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
 
     # ---------- main ----------
     async def run(self):
@@ -854,26 +766,13 @@ class TradingBot:
             # Recover any existing positions
             await self.recover_open_position()
             
-            # Recover daily P&L and martingale cycle from trade history
+            # Recover daily P&L from trade history
             try:
                 if await self.r.exists(TRADE_HISTORY_KEY):
                     history = json.loads(await self.r.get(TRADE_HISTORY_KEY))
                     self.daily_pnl = sum(t.get("pnl", 0) for t in history)
                     self.trade_count = len(history)
-                    
-                    # Recover cycle_pnl: sum from last RECOVERY trade onwards
-                    self.cycle_pnl = 0.0
-                    for t in reversed(history):
-                        reason = t.get("close_reason", "")
-                        if reason in ("RECOVERY_PARTIAL", "SQUARE_OFF_3:24"):
-                            break  # Cycle was reset here
-                        self.cycle_pnl += t.get("pnl", 0)
-                    
-                    self.current_lots = self._calculate_lots()
-                    logger.info(
-                        f"📈 Recovered: Day P&L=₹{self.daily_pnl:.2f} ({self.trade_count} trades) | "
-                        f"Cycle P&L=₹{self.cycle_pnl:.2f} | Lots={self.current_lots}"
-                    )
+                    logger.info(f"📈 Recovered daily P&L: ₹{self.daily_pnl:.2f} from {self.trade_count} trades")
             except Exception as e:
                 logger.error(f"Error recovering state: {e}")
             
@@ -913,7 +812,7 @@ if __name__ == "__main__":
                 break
             except Exception as e:
                 logger.exception(f"Unexpected error: {e}")
-                time.sleep(1)  # prevent tight retry loop
+                time.sleep(0.1)  # prevent tight retry loop
         else:
             print("⏳ Market closed. Waiting for market hours...")
             time.sleep(1)

@@ -259,7 +259,7 @@ def market_close_cleanup():
             logger.info(f"Sleeping until next market open ({sleep_seconds/3600:.1f} hrs)")
             time.sleep(sleep_seconds)
         else:
-            time.sleep(10)
+            time.sleep(1)
 
 
 # ─────────── UT Bot Alerts Signal Engine (Async, Low Latency) ───────────
