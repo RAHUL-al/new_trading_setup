@@ -28,8 +28,14 @@ export default function DashboardPage() {
 
     const loadData = useCallback(async () => {
         try {
-            const [u, p, t, s] = await Promise.all([
-                api.getMe(), api.getPortfolio(), api.getTrades(), api.getSettings(),
+            const u = await api.getMe();
+            // Redirect unverified users to setup
+            if (!u.is_verified || !u.has_angelone) {
+                router.push('/setup');
+                return;
+            }
+            const [p, t, s] = await Promise.all([
+                api.getPortfolio(), api.getTrades(), api.getSettings(),
             ]);
             setUser(u); setPortfolio(p); setTrades(t); setSettings(s);
             setQty(s.default_quantity); setPriceMin(s.price_min); setPriceMax(s.price_max);

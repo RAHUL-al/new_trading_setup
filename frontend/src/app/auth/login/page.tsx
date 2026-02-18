@@ -18,7 +18,13 @@ export default function LoginPage() {
         try {
             const res = await api.login({ email, password });
             setTokens(res.access_token, res.refresh_token);
-            router.push('/dashboard');
+
+            // Redirect based on verification status
+            if (!res.user.is_verified || !res.user.has_angelone) {
+                router.push('/setup');
+            } else {
+                router.push('/dashboard');
+            }
         } catch (e: any) { setError(e.message); }
         setLoading(false);
     };
