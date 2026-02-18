@@ -25,3 +25,15 @@ logs/
 docker_test/
 trading_venv/
 venv/
+smartapi_venv/
+token_venv/
+
+# Frontend (Next.js)
+frontend/.next/
+frontend/node_modules/
+frontend/out/
+
+# Backend
+backend/trading_platform.db
+backend/.encryption_key
+backend/__pycache__/
