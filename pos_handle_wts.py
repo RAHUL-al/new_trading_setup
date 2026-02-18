@@ -135,7 +135,7 @@ class TradingBot:
         
         now = datetime.now()
         self.market_open_time = now.replace(hour=9, minute=15, second=0, microsecond=0)
-        self.trading_start_time = now.replace(hour=12, minute=30, second=0, microsecond=0)
+        self.trading_start_time = now.replace(hour=12, minute=57, second=0, microsecond=0)
         self.trading_end_time = now.replace(hour=15, minute=10, second=0, microsecond=0)
         self.square_off_time = now.replace(hour=15, minute=24, second=0, microsecond=0)
         self.market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)

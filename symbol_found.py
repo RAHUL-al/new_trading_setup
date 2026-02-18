@@ -34,7 +34,7 @@ OPTION_TOKENS_CHANNEL = f"{REDIS_PREFIX}option_tokens_updated"
 
 PRICE_MIN = float(os.environ.get("PRICE_MIN", "110"))
 PRICE_MAX = float(os.environ.get("PRICE_MAX", "150"))
-REFRESH_INTERVAL = 2  # seconds
+REFRESH_INTERVAL = 38  # seconds
 
 INDIA_TZ = pytz.timezone("Asia/Kolkata")
 
