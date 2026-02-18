@@ -13,25 +13,27 @@ import ujson as json
 import datetime
 import pytz
 import time
+import os
 from multiprocessing import Process
 
-# ─────────── Config ───────────
-TOTP_TOKEN = "33OUTDUE57WS3TUPHPLFUCGHFM"
-API_KEY = "Ytt1NkKD"
-CLIENT_ID = "R865920"
-PWD = "7355"
+# ─────────── Config (read from environment, set by BotManager) ───────────
+TOTP_TOKEN = os.environ.get("ANGELONE_TOTP_SECRET", "")
+API_KEY = os.environ.get("ANGELONE_API_KEY", "")
+CLIENT_ID = os.environ.get("ANGELONE_CLIENT_ID", "")
+PWD = os.environ.get("ANGELONE_PASSWORD", "")
 
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
-REDIS_PASSWORD = "Rahul@7355"
+REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "Rahul@7355")
+REDIS_PREFIX = os.environ.get("REDIS_PREFIX", "")
 
 INDEX_TOKEN = "99926000"         # NIFTY 50 index
-TRADING_SYMBOLS_KEY = "Trading_symbol"
-POSITIONS_KEY = "active_positions"
-OPTION_TOKENS_CHANNEL = "option_tokens_updated"
+TRADING_SYMBOLS_KEY = f"{REDIS_PREFIX}Trading_symbol"
+POSITIONS_KEY = f"{REDIS_PREFIX}active_positions"
+OPTION_TOKENS_CHANNEL = f"{REDIS_PREFIX}option_tokens_updated"
 
-PRICE_MIN = 110
-PRICE_MAX = 150
+PRICE_MIN = float(os.environ.get("PRICE_MIN", "110"))
+PRICE_MAX = float(os.environ.get("PRICE_MAX", "150"))
 REFRESH_INTERVAL = 2  # seconds
 
 INDIA_TZ = pytz.timezone("Asia/Kolkata")

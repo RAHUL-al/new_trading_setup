@@ -18,35 +18,36 @@ import time
 from redis.asyncio import Redis
 
 # --------------------------- config ---------------------------
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
-REDIS_PASSWORD = "Rahul@7355"
+REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "Rahul@7355")
 REDIS_DB = 0
+REDIS_PREFIX = os.environ.get("REDIS_PREFIX", "")
 
-POSITIONS_KEY = "active_positions"
-TRADE_HISTORY_KEY = f"trade_history_{datetime.now().date()}"
-TRADING_SYMBOLS_KEY = "Trading_symbol"
-CANDLE_CACHE_KEY = "candle:last"
-TRAILING_DATA_KEY = "trailing_data"
+POSITIONS_KEY = f"{REDIS_PREFIX}active_positions"
+TRADE_HISTORY_KEY = f"{REDIS_PREFIX}trade_history_{datetime.now().date()}"
+TRADING_SYMBOLS_KEY = f"{REDIS_PREFIX}Trading_symbol"
+CANDLE_CACHE_KEY = f"{REDIS_PREFIX}candle:last"
+TRAILING_DATA_KEY = f"{REDIS_PREFIX}trailing_data"
 
-CHAN_PRICE_PREFIX = "price:"
-CHAN_SIGNAL_BUY = "signal:buy"
-CHAN_SIGNAL_SELL = "signal:sell"
-CHAN_CANDLE_CLOSE = "candle:close"  # New channel for candle close events
+CHAN_PRICE_PREFIX = f"{REDIS_PREFIX}price:"
+CHAN_SIGNAL_BUY = f"{REDIS_PREFIX}signal:buy"
+CHAN_SIGNAL_SELL = f"{REDIS_PREFIX}signal:sell"
+CHAN_CANDLE_CLOSE = f"{REDIS_PREFIX}candle:close"
 
-KEY_BUY_SIGNAL = "buy_signal"
-KEY_SELL_SIGNAL = "sell_signal"
+KEY_BUY_SIGNAL = f"{REDIS_PREFIX}buy_signal"
+KEY_SELL_SIGNAL = f"{REDIS_PREFIX}sell_signal"
 
 INDEX_TOKEN = "99926000"
-TRAILING_OFFSET = 0  # Offset for trailing stop loss
+TRAILING_OFFSET = 0
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("TradingBot")
 
 r = redis.StrictRedis(
-    host='localhost',
-    port=6379,
-    password='Rahul@7355',
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    password=REDIS_PASSWORD,
     db=0,
     decode_responses=True
 )

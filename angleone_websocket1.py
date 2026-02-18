@@ -18,20 +18,26 @@ import time
 import ujson as json
 import datetime
 import pytz
+import os
 from multiprocessing import Process
 
 
-# ─────────── Config ───────────
-r = redis.StrictRedis(host='localhost', port=6379, password='Rahul@7355', db=0, decode_responses=True)
+# ─────────── Config (read from environment, set by BotManager) ───────────
+REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "Rahul@7355")
+REDIS_PREFIX = os.environ.get("REDIS_PREFIX", "")
 
-TOTP_TOKEN = "33OUTDUE57WS3TUPHPLFUCGHFM"
-API_KEY = "Ytt1NkKD"
-CLIENT_ID = "R865920"
-PWD = '7355'
-CORRELATION_ID = "Rahul_7355"
+r = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, db=0, decode_responses=True)
 
-TRADING_SYMBOLS_KEY = "Trading_symbol"
-OPTION_TOKENS_CHANNEL = "option_tokens_updated"
+TOTP_TOKEN = os.environ.get("ANGELONE_TOTP_SECRET", "")
+API_KEY = os.environ.get("ANGELONE_API_KEY", "")
+CLIENT_ID = os.environ.get("ANGELONE_CLIENT_ID", "")
+PWD = os.environ.get("ANGELONE_PASSWORD", "")
+CORRELATION_ID = f"user_{CLIENT_ID}"
+
+TRADING_SYMBOLS_KEY = f"{REDIS_PREFIX}Trading_symbol"
+OPTION_TOKENS_CHANNEL = f"{REDIS_PREFIX}option_tokens_updated"
 
 INDIA_TZ = pytz.timezone("Asia/Kolkata")
 
@@ -86,8 +92,8 @@ def run_websocket():
                     candle_time = candle_time_obj.strftime('%Y-%m-%d %H:%M')
                     date_key = now.strftime('%Y-%m-%d')
 
-                    redis_key = f"CANDLE:{pSymbolName}:{candle_time}"
-                    list_key = f"HISTORY:{pSymbolName}:{date_key}"
+                    redis_key = f"{REDIS_PREFIX}CANDLE:{pSymbolName}:{candle_time}"
+                    list_key = f"{REDIS_PREFIX}HISTORY:{pSymbolName}:{date_key}"
 
                     last_candle_time = last_candle_time_map.get(pSymbolName)
                     if last_candle_time and last_candle_time != candle_time:
@@ -117,9 +123,9 @@ def run_websocket():
                         }
 
                     # Store LTP by token (for pos_handle_wts.py price lookups)
-                    r.set(token, price)
+                    r.set(f"{REDIS_PREFIX}{token}", price)
                     # Also store by symbol name
-                    r.set(pSymbolName, price)
+                    r.set(f"{REDIS_PREFIX}{pSymbolName}", price)
                     r.set(redis_key, json.dumps(candle))
 
                     last_candle_time_map[pSymbolName] = candle_time
@@ -321,7 +327,7 @@ async def nifty_signal_engine():
     Async signal engine — polls at 50ms, only recalculates when new candles arrive.
     Uses async Redis for non-blocking I/O.
     """
-    ar = AsyncRedis(host='localhost', port=6379, password='Rahul@7355', db=0, decode_responses=True)
+    ar = AsyncRedis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, db=0, decode_responses=True)
 
     last_signal_time = 0
     last_signal = "NONE"
@@ -345,7 +351,7 @@ async def nifty_signal_engine():
 
             # Read candle count first — skip if unchanged
             date_key = datetime.date.today().strftime('%Y-%m-%d')
-            history_key = f"HISTORY:{NIFTY_SYMBOL}:{date_key}"
+            history_key = f"{REDIS_PREFIX}HISTORY:{NIFTY_SYMBOL}:{date_key}"
             candle_count = await ar.llen(history_key)
 
             if candle_count < 5:
@@ -379,7 +385,7 @@ async def nifty_signal_engine():
             # Store ATR in Redis (non-blocking)
             current_atr = xATR.iloc[-1]
             if pd.notna(current_atr):
-                await ar.set("ATR_value", str(round(current_atr, 2)))
+                await ar.set(f"{REDIS_PREFIX}ATR_value", str(round(current_atr, 2)))
 
             # Store last candle in Redis (NO CSV — pure Redis for low latency)
             last_row = df.iloc[-1]
@@ -390,7 +396,7 @@ async def nifty_signal_engine():
                 "low": float(last_row["Low"]),
                 "close": float(last_row["Close"]),
             })
-            await ar.set("last_candle", last_candle_data)
+            await ar.set(f"{REDIS_PREFIX}last_candle", last_candle_data)
 
             # Edge detection for signals
             curr_buy = bool(signals['buy'].iloc[-1])
@@ -399,18 +405,18 @@ async def nifty_signal_engine():
 
             if curr_buy and not prev_buy:
                 if now_ts - last_signal_time > SIGNAL_COOLDOWN:
-                    await ar.publish("signal:buy", "true")
-                    await ar.set("buy_signal", "true")
-                    await ar.set("sell_signal", "false")
+                    await ar.publish(f"{REDIS_PREFIX}signal:buy", "true")
+                    await ar.set(f"{REDIS_PREFIX}buy_signal", "true")
+                    await ar.set(f"{REDIS_PREFIX}sell_signal", "false")
                     last_signal = "BUY"
                     last_signal_time = now_ts
                     logger.info(f"🟢 BUY SIGNAL — UT Bot | NIFTY Close={last_row['Close']} ATR={current_atr:.2f}")
 
             elif curr_sell and not prev_sell:
                 if now_ts - last_signal_time > SIGNAL_COOLDOWN:
-                    await ar.publish("signal:sell", "true")
-                    await ar.set("sell_signal", "true")
-                    await ar.set("buy_signal", "false")
+                    await ar.publish(f"{REDIS_PREFIX}signal:sell", "true")
+                    await ar.set(f"{REDIS_PREFIX}sell_signal", "true")
+                    await ar.set(f"{REDIS_PREFIX}buy_signal", "false")
                     last_signal = "SELL"
                     last_signal_time = now_ts
                     logger.info(f"🔴 SELL SIGNAL — UT Bot | NIFTY Close={last_row['Close']} ATR={current_atr:.2f}")
@@ -422,7 +428,7 @@ async def nifty_signal_engine():
             candle_ts = str(last_row.get("timestamp", ""))
             if candle_ts != last_published_candle_time:
                 last_published_candle_time = candle_ts
-                await ar.publish("candle:close", json.dumps({
+                await ar.publish(f"{REDIS_PREFIX}candle:close", json.dumps({
                     "timestamp": candle_ts,
                     "open": float(last_row["Open"]),
                     "high": float(last_row["High"]),

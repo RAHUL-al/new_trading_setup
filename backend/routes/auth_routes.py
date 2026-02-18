@@ -179,6 +179,32 @@ def save_angelone_creds(
     if not user.is_verified:
         raise HTTPException(status_code=403, detail="Verify your email first before connecting AngelOne.")
 
+    # ─── Validate credentials by testing real login ───
+    try:
+        import pyotp
+        from SmartApi import SmartConnect
+        totp = pyotp.TOTP(data.totp_secret).now()
+        smart_api = SmartConnect(data.api_key)
+        login_resp = smart_api.generateSession(data.client_id, data.password, totp)
+
+        if login_resp is None or (isinstance(login_resp, dict) and login_resp.get("status") is False):
+            error_msg = "Login failed"
+            if isinstance(login_resp, dict):
+                error_msg = login_resp.get("message", error_msg)
+            raise HTTPException(status_code=400, detail=f"AngelOne login failed: {error_msg}")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_str = str(e)
+        if "Invalid" in error_str or "invalid" in error_str:
+            raise HTTPException(status_code=400, detail=f"Invalid credentials: {error_str}")
+        elif "TOTP" in error_str or "totp" in error_str:
+            raise HTTPException(status_code=400, detail=f"TOTP secret error: {error_str}")
+        else:
+            raise HTTPException(status_code=400, detail=f"AngelOne connection failed: {error_str}")
+
+    # ─── Credentials validated — save encrypted ───
     creds = db.query(models.AngelOneCredential).filter_by(user_id=user.id).first()
     if creds:
         creds.api_key_enc = encrypt(data.api_key)
@@ -197,7 +223,7 @@ def save_angelone_creds(
         db.add(creds)
 
     db.commit()
-    return {"message": "AngelOne credentials saved successfully", "is_configured": True}
+    return {"message": "AngelOne credentials verified and saved successfully!", "is_configured": True}
 
 
 @router.get("/angelone/status", response_model=schemas.AngelOneCredsStatus)
