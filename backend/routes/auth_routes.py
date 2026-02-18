@@ -108,7 +108,7 @@ def send_aadhaar_otp(
 ):
     aadhaar_hash = hashlib.sha256(data.aadhaar_number.encode()).hexdigest()
     otp = f"{random.randint(100000, 999999)}"
-    expires = datetime.now(timezone.utc) + timedelta(minutes=5)
+    expires = datetime.utcnow() + timedelta(minutes=5)
 
     aadhaar = db.query(models.AadhaarVerification).filter_by(user_id=user.id).first()
     if aadhaar:
@@ -145,14 +145,14 @@ def verify_aadhaar_otp(
     if not aadhaar:
         raise HTTPException(status_code=400, detail="No OTP request found. Send OTP first.")
 
-    if aadhaar.otp_expires and datetime.now(timezone.utc) > aadhaar.otp_expires:
+    if aadhaar.otp_expires and datetime.utcnow() > aadhaar.otp_expires:
         raise HTTPException(status_code=400, detail="OTP expired. Request a new one.")
 
     if aadhaar.otp_code != data.otp:
         raise HTTPException(status_code=400, detail="Invalid OTP")
 
     aadhaar.is_verified = True
-    aadhaar.verified_at = datetime.now(timezone.utc)
+    aadhaar.verified_at = datetime.utcnow()
     aadhaar.otp_code = None
     user.is_verified = True
     db.commit()
@@ -186,7 +186,7 @@ def save_angelone_creds(
         creds.client_id_enc = encrypt(data.client_id)
         creds.password_enc = encrypt(data.password)
         creds.totp_secret_enc = encrypt(data.totp_secret)
-        creds.updated_at = datetime.now(timezone.utc)
+        creds.updated_at = datetime.utcnow()
     else:
         creds = models.AngelOneCredential(
             user_id=user.id,
