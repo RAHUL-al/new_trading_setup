@@ -1,5 +1,8 @@
 """FastAPI main application — Trading Platform Backend."""
 
+from dotenv import load_dotenv
+load_dotenv(dotenv_path="../.env")  # Load from project root
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import logging
