@@ -1,10 +1,9 @@
-"""Auth routes: signup, login, refresh, Aadhaar verification, AngelOne credentials."""
+"""Auth routes: signup, login, refresh, Email OTP verification, AngelOne credentials."""
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import random
-import hashlib
 
 from database import get_db
 from auth import (
@@ -13,6 +12,7 @@ from auth import (
     get_current_user
 )
 from encryption import encrypt, decrypt
+from email_utils import generate_otp, send_otp_email
 import models
 import schemas
 
@@ -98,78 +98,74 @@ def get_me(user: models.User = Depends(get_current_user)):
     )
 
 
-# ─────────── Aadhaar Verification ───────────
+# ─────────── Email OTP Verification ───────────
 
-@router.post("/aadhaar/send-otp")
-def send_aadhaar_otp(
-    data: schemas.AadhaarSendOTP,
+@router.post("/email/send-otp")
+def send_email_otp(
     user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    aadhaar_hash = hashlib.sha256(data.aadhaar_number.encode()).hexdigest()
-    otp = f"{random.randint(100000, 999999)}"
-    expires = datetime.utcnow() + timedelta(minutes=5)
+    """Send a 6-digit OTP to the user's registered email."""
+    if user.is_verified:
+        return {"message": "Email already verified", "already_verified": True}
 
-    aadhaar = db.query(models.AadhaarVerification).filter_by(user_id=user.id).first()
-    if aadhaar:
-        aadhaar.aadhaar_number_hash = aadhaar_hash
-        aadhaar.aadhaar_last4 = data.aadhaar_number[-4:]
-        aadhaar.otp_code = otp
-        aadhaar.otp_expires = expires
-        aadhaar.is_verified = False
-    else:
-        aadhaar = models.AadhaarVerification(
-            user_id=user.id,
-            aadhaar_number_hash=aadhaar_hash,
-            aadhaar_last4=data.aadhaar_number[-4:],
-            otp_code=otp,
-            otp_expires=expires,
-        )
-        db.add(aadhaar)
-
+    otp = generate_otp()
+    user.email_otp_code = otp
+    user.email_otp_expires = datetime.utcnow() + timedelta(minutes=5)
     db.commit()
-    return {
-        "message": "OTP sent to Aadhaar-linked mobile number",
-        "otp_hint": otp,
+
+    email_sent = send_otp_email(user.email, otp, user.full_name)
+
+    response = {
+        "message": f"OTP sent to {user.email}",
         "expires_in_seconds": 300,
+        "email_sent": email_sent,
     }
 
+    # If SMTP not configured, return OTP for testing (remove in production)
+    if not email_sent:
+        response["fallback_otp"] = otp
+        response["note"] = "SMTP not configured — showing OTP for testing"
 
-@router.post("/aadhaar/verify-otp", response_model=schemas.AadhaarStatus)
-def verify_aadhaar_otp(
-    data: schemas.AadhaarVerifyOTP,
+    return response
+
+
+@router.post("/email/verify-otp")
+def verify_email_otp(
+    data: schemas.EmailVerifyOTP,
     user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    aadhaar = db.query(models.AadhaarVerification).filter_by(user_id=user.id).first()
-    if not aadhaar:
-        raise HTTPException(status_code=400, detail="No OTP request found. Send OTP first.")
+    """Verify the OTP sent to user's email."""
+    if user.is_verified:
+        return {"message": "Email already verified", "is_verified": True}
 
-    if aadhaar.otp_expires and datetime.utcnow() > aadhaar.otp_expires:
+    if not user.email_otp_code:
+        raise HTTPException(status_code=400, detail="No OTP requested. Send OTP first.")
+
+    if user.email_otp_expires and datetime.utcnow() > user.email_otp_expires:
         raise HTTPException(status_code=400, detail="OTP expired. Request a new one.")
 
-    if aadhaar.otp_code != data.otp:
-        raise HTTPException(status_code=400, detail="Invalid OTP")
+    if user.email_otp_code != data.otp:
+        raise HTTPException(status_code=400, detail="Invalid OTP. Please try again.")
 
-    aadhaar.is_verified = True
-    aadhaar.verified_at = datetime.utcnow()
-    aadhaar.otp_code = None
     user.is_verified = True
+    user.email_verified_at = datetime.utcnow()
+    user.email_otp_code = None
+    user.email_otp_expires = None
     db.commit()
 
-    return schemas.AadhaarStatus(
-        is_verified=True, last4=aadhaar.aadhaar_last4, verified_at=aadhaar.verified_at,
-    )
+    return {"message": "Email verified successfully!", "is_verified": True}
 
 
-@router.get("/aadhaar/status", response_model=schemas.AadhaarStatus)
-def get_aadhaar_status(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    aadhaar = db.query(models.AadhaarVerification).filter_by(user_id=user.id).first()
-    if not aadhaar:
-        return schemas.AadhaarStatus(is_verified=False)
-    return schemas.AadhaarStatus(
-        is_verified=aadhaar.is_verified, last4=aadhaar.aadhaar_last4, verified_at=aadhaar.verified_at,
-    )
+@router.get("/email/status")
+def get_email_status(user: models.User = Depends(get_current_user)):
+    """Check whether email is verified."""
+    return {
+        "is_verified": user.is_verified,
+        "email": user.email,
+        "verified_at": user.email_verified_at,
+    }
 
 
 # ─────────── AngelOne Credentials ───────────
@@ -180,6 +176,9 @@ def save_angelone_creds(
     user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    if not user.is_verified:
+        raise HTTPException(status_code=403, detail="Verify your email first before connecting AngelOne.")
+
     creds = db.query(models.AngelOneCredential).filter_by(user_id=user.id).first()
     if creds:
         creds.api_key_enc = encrypt(data.api_key)

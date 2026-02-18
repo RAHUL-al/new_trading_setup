@@ -102,13 +102,13 @@ export const api = {
 
     getMe: () => fetchAPI('/auth/me'),
 
-    sendAadhaarOTP: (aadhaar_number: string) =>
-        fetchAPI('/auth/aadhaar/send-otp', { method: 'POST', body: JSON.stringify({ aadhaar_number }) }),
+    sendEmailOTP: () =>
+        fetchAPI('/auth/email/send-otp', { method: 'POST' }),
 
-    verifyAadhaarOTP: (otp: string) =>
-        fetchAPI('/auth/aadhaar/verify-otp', { method: 'POST', body: JSON.stringify({ otp }) }),
+    verifyEmailOTP: (otp: string) =>
+        fetchAPI('/auth/email/verify-otp', { method: 'POST', body: JSON.stringify({ otp }) }),
 
-    getAadhaarStatus: () => fetchAPI('/auth/aadhaar/status'),
+    getEmailStatus: () => fetchAPI('/auth/email/status'),
 
     saveAngelOneCreds: (data: { api_key: string; client_id: string; password: string; totp_secret: string }) =>
         fetchAPI('/auth/angelone/credentials', { method: 'POST', body: JSON.stringify(data) }),

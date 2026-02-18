@@ -2,7 +2,6 @@
 
 import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api, clearTokens, type UserProfile } from '@/lib/api';
 
@@ -13,12 +12,11 @@ export default function SetupPage() {
     const [error, setError] = useState('');
     const [actionLoading, setActionLoading] = useState(false);
 
-    // Aadhaar
-    const [aadhaar, setAadhaar] = useState('');
+    // Email OTP
     const [otp, setOtp] = useState('');
     const [otpSent, setOtpSent] = useState(false);
-    const [otpHint, setOtpHint] = useState('');
-    const [aadhaarVerified, setAadhaarVerified] = useState(false);
+    const [fallbackOtp, setFallbackOtp] = useState('');
+    const [emailVerified, setEmailVerified] = useState(false);
 
     // AngelOne
     const [apiKey, setApiKey] = useState('');
@@ -30,9 +28,8 @@ export default function SetupPage() {
     useEffect(() => {
         api.getMe().then(u => {
             setUser(u);
-            setAadhaarVerified(u.is_verified);
+            setEmailVerified(u.is_verified);
             setAngelOneConfigured(u.has_angelone);
-            // If everything is done, go to dashboard
             if (u.is_verified && u.has_angelone) {
                 router.push('/dashboard');
             }
@@ -46,9 +43,11 @@ export default function SetupPage() {
     const handleSendOTP = async () => {
         setError(''); setActionLoading(true);
         try {
-            const res = await api.sendAadhaarOTP(aadhaar);
+            const res = await api.sendEmailOTP();
             setOtpSent(true);
-            setOtpHint(res.otp_hint);
+            if (res.fallback_otp) {
+                setFallbackOtp(res.fallback_otp);
+            }
         } catch (e: any) { setError(e.message); }
         setActionLoading(false);
     };
@@ -56,8 +55,9 @@ export default function SetupPage() {
     const handleVerifyOTP = async () => {
         setError(''); setActionLoading(true);
         try {
-            await api.verifyAadhaarOTP(otp);
-            setAadhaarVerified(true);
+            await api.verifyEmailOTP(otp);
+            setEmailVerified(true);
+            setFallbackOtp('');
             setError('');
         } catch (e: any) { setError(e.message); }
         setActionLoading(false);
@@ -73,10 +73,6 @@ export default function SetupPage() {
         setActionLoading(false);
     };
 
-    const handleContinue = () => {
-        router.push('/dashboard');
-    };
-
     if (loading) {
         return (
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', gap: '12px' }}>
@@ -85,7 +81,7 @@ export default function SetupPage() {
         );
     }
 
-    const allDone = aadhaarVerified && angelOneConfigured;
+    const allDone = emailVerified && angelOneConfigured;
 
     return (
         <div className="page-container" style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '40px 24px' }}>
@@ -108,64 +104,66 @@ export default function SetupPage() {
 
                 {error && <div className="alert alert-error" style={{ marginBottom: '20px' }}>{error}</div>}
 
-                {/* Step 1: Aadhaar Verification */}
+                {/* Step 1: Email Verification */}
                 <motion.div
-                    className={`glass ${aadhaarVerified ? 'pulse-green' : ''}`}
-                    style={{ padding: '28px', marginBottom: '16px', border: aadhaarVerified ? '1px solid rgba(0,255,136,0.3)' : undefined }}
+                    className="glass"
+                    style={{ padding: '28px', marginBottom: '16px', border: emailVerified ? '1px solid rgba(0,255,136,0.3)' : undefined }}
                     initial={{ opacity: 0, y: 10 }}
                     animate={{ opacity: 1, y: 0 }}
                     transition={{ delay: 0.1 }}
                 >
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: aadhaarVerified ? '0' : '20px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: emailVerified ? '0' : '20px' }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
                             <span style={{
                                 width: '36px', height: '36px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                                background: aadhaarVerified ? 'var(--accent-green-dim)' : 'rgba(255,255,255,0.05)',
-                                fontSize: '18px',
+                                background: emailVerified ? 'var(--accent-green-dim)' : 'rgba(255,255,255,0.05)', fontSize: '18px',
                             }}>
-                                {aadhaarVerified ? '✅' : '1'}
+                                {emailVerified ? '✅' : '1'}
                             </span>
                             <div>
-                                <div style={{ fontWeight: 700, fontSize: '16px' }}>Aadhaar Verification</div>
+                                <div style={{ fontWeight: 700, fontSize: '16px' }}>Email Verification</div>
                                 <div style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
-                                    {aadhaarVerified ? 'Verified successfully' : 'KYC verification required to trade'}
+                                    {emailVerified ? 'Verified successfully' : `We'll send a code to ${user?.email}`}
                                 </div>
                             </div>
                         </div>
-                        {aadhaarVerified && <span style={{ color: 'var(--accent-green)', fontWeight: 700, fontSize: '14px' }}>DONE</span>}
+                        {emailVerified && <span style={{ color: 'var(--accent-green)', fontWeight: 700, fontSize: '14px' }}>DONE</span>}
                     </div>
 
-                    {!aadhaarVerified && (
+                    {!emailVerified && (
                         <div style={{ marginTop: '16px' }}>
                             {!otpSent ? (
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                                    <div className="input-group">
-                                        <label>Aadhaar Number</label>
-                                        <input className="input mono" placeholder="Enter 12-digit Aadhaar" maxLength={14} value={aadhaar}
-                                            onChange={e => setAadhaar(e.target.value.replace(/\D/g, '').slice(0, 12))} />
+                                    <div className="glass" style={{ padding: '16px', textAlign: 'center', background: 'rgba(255,255,255,0.02)' }}>
+                                        <div style={{ fontSize: '13px', color: 'var(--text-secondary)', marginBottom: '4px' }}>Sending OTP to</div>
+                                        <div className="mono" style={{ fontSize: '16px', fontWeight: 600, color: 'var(--accent-blue)' }}>{user?.email}</div>
                                     </div>
-                                    <button className="btn btn-primary" onClick={handleSendOTP} disabled={actionLoading || aadhaar.length !== 12}>
-                                        {actionLoading ? <span className="spinner" /> : '📱 Send OTP'}
+                                    <button className="btn btn-primary" onClick={handleSendOTP} disabled={actionLoading}>
+                                        {actionLoading ? <span className="spinner" /> : '📧 Send Verification Code'}
                                     </button>
                                 </div>
                             ) : (
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                                    {otpHint && (
-                                        <div className="alert alert-success" style={{ marginBottom: '0' }}>
-                                            🔑 Demo OTP: <strong className="mono">{otpHint}</strong>
+                                    <div className="alert alert-success" style={{ marginBottom: '0', textAlign: 'center' }}>
+                                        📧 OTP sent to <strong>{user?.email}</strong>
+                                        <br /><span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>Check your inbox (and spam folder)</span>
+                                    </div>
+                                    {fallbackOtp && (
+                                        <div className="alert" style={{ background: 'rgba(255,165,0,0.1)', border: '1px solid rgba(255,165,0,0.3)', color: '#ffa500', fontSize: '13px', textAlign: 'center', marginBottom: '0' }}>
+                                            ⚠️ SMTP not configured — Test OTP: <strong className="mono">{fallbackOtp}</strong>
                                         </div>
                                     )}
                                     <div className="input-group">
-                                        <label>Enter 6-digit OTP</label>
+                                        <label>Enter 6-digit Code</label>
                                         <input className="input mono" placeholder="000000" maxLength={6} value={otp}
                                             onChange={e => setOtp(e.target.value.replace(/\D/g, '').slice(0, 6))}
                                             style={{ fontSize: '24px', letterSpacing: '8px', textAlign: 'center' }} />
                                     </div>
                                     <button className="btn btn-primary" onClick={handleVerifyOTP} disabled={actionLoading || otp.length !== 6}>
-                                        {actionLoading ? <span className="spinner" /> : '✓ Verify OTP'}
+                                        {actionLoading ? <span className="spinner" /> : '✓ Verify Code'}
                                     </button>
-                                    <button className="btn btn-outline btn-sm" onClick={() => { setOtpSent(false); setOtp(''); }} style={{ alignSelf: 'center' }}>
-                                        ← Resend OTP
+                                    <button className="btn btn-outline btn-sm" onClick={() => { setOtpSent(false); setOtp(''); setFallbackOtp(''); }} style={{ alignSelf: 'center' }}>
+                                        ← Resend Code
                                     </button>
                                 </div>
                             )}
@@ -175,23 +173,22 @@ export default function SetupPage() {
 
                 {/* Step 2: AngelOne Configuration */}
                 <motion.div
-                    className={`glass ${angelOneConfigured ? 'pulse-green' : ''}`}
+                    className="glass"
                     style={{
                         padding: '28px', marginBottom: '24px',
                         border: angelOneConfigured ? '1px solid rgba(0,255,136,0.3)' : undefined,
-                        opacity: aadhaarVerified ? 1 : 0.4,
-                        pointerEvents: aadhaarVerified ? 'auto' : 'none',
+                        opacity: emailVerified ? 1 : 0.4,
+                        pointerEvents: emailVerified ? 'auto' : 'none',
                     }}
                     initial={{ opacity: 0, y: 10 }}
-                    animate={{ opacity: aadhaarVerified ? 1 : 0.4, y: 0 }}
+                    animate={{ opacity: emailVerified ? 1 : 0.4, y: 0 }}
                     transition={{ delay: 0.2 }}
                 >
                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: angelOneConfigured ? '0' : '20px' }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
                             <span style={{
                                 width: '36px', height: '36px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                                background: angelOneConfigured ? 'var(--accent-green-dim)' : 'rgba(255,255,255,0.05)',
-                                fontSize: '18px',
+                                background: angelOneConfigured ? 'var(--accent-green-dim)' : 'rgba(255,255,255,0.05)', fontSize: '18px',
                             }}>
                                 {angelOneConfigured ? '✅' : '2'}
                             </span>
@@ -203,10 +200,10 @@ export default function SetupPage() {
                             </div>
                         </div>
                         {angelOneConfigured && <span style={{ color: 'var(--accent-green)', fontWeight: 700, fontSize: '14px' }}>DONE</span>}
-                        {!aadhaarVerified && <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>🔒 Complete Step 1 first</span>}
+                        {!emailVerified && <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>🔒 Complete Step 1 first</span>}
                     </div>
 
-                    {aadhaarVerified && !angelOneConfigured && (
+                    {emailVerified && !angelOneConfigured && (
                         <div style={{ marginTop: '16px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
                             <div className="alert" style={{ background: 'var(--accent-blue-dim)', border: '1px solid rgba(0,212,255,0.3)', color: 'var(--accent-blue)', fontSize: '13px', marginBottom: '0' }}>
                                 🔒 Your credentials are encrypted with bank-grade Fernet encryption
@@ -235,24 +232,18 @@ export default function SetupPage() {
                     )}
                 </motion.div>
 
-                {/* Continue Button */}
+                {/* Continue */}
                 {allDone && (
-                    <motion.div
-                        initial={{ opacity: 0, scale: 0.95 }}
-                        animate={{ opacity: 1, scale: 1 }}
-                        transition={{ type: 'spring' }}
-                        style={{ textAlign: 'center' }}
-                    >
+                    <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} transition={{ type: 'spring' }} style={{ textAlign: 'center' }}>
                         <div className="alert alert-success" style={{ marginBottom: '16px', textAlign: 'center', fontSize: '16px' }}>
                             🎉 All set! You&apos;re ready to trade.
                         </div>
-                        <button className="btn btn-primary btn-lg" onClick={handleContinue} style={{ width: '100%' }}>
+                        <button className="btn btn-primary btn-lg" onClick={() => router.push('/dashboard')} style={{ width: '100%' }}>
                             🚀 Go to Dashboard
                         </button>
                     </motion.div>
                 )}
 
-                {/* Logout */}
                 <div style={{ textAlign: 'center', marginTop: '24px' }}>
                     <button className="btn btn-outline btn-sm" onClick={() => { clearTokens(); router.push('/auth/login'); }}>
                         ← Logout

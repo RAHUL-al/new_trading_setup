@@ -16,27 +16,16 @@ class User(Base):
     hashed_password = Column(String, nullable=False)
     is_active = Column(Boolean, default=True)
     is_verified = Column(Boolean, default=False)
+    email_otp_code = Column(String, nullable=True)
+    email_otp_expires = Column(DateTime, nullable=True)
+    email_verified_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-    aadhaar = relationship("AadhaarVerification", back_populates="user", uselist=False)
     angelone_creds = relationship("AngelOneCredential", back_populates="user", uselist=False)
     trades = relationship("TradeRecord", back_populates="user", order_by="TradeRecord.exit_time.desc()")
     bot_sessions = relationship("BotSession", back_populates="user")
 
 
-class AadhaarVerification(Base):
-    __tablename__ = "aadhaar_verifications"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
-    aadhaar_number_hash = Column(String, nullable=False)
-    aadhaar_last4 = Column(String(4), nullable=False)
-    is_verified = Column(Boolean, default=False)
-    otp_code = Column(String, nullable=True)
-    otp_expires = Column(DateTime, nullable=True)
-    verified_at = Column(DateTime, nullable=True)
-
-    user = relationship("User", back_populates="aadhaar")
 
 
 class AngelOneCredential(Base):

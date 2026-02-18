@@ -122,7 +122,7 @@ export default function DashboardPage() {
                         </div>
                         <span style={{ fontSize: '14px', color: 'var(--text-secondary)' }}>
                             {user?.full_name}
-                            {user?.is_verified && <span title="Aadhaar Verified" style={{ marginLeft: '6px' }}>✅</span>}
+                            {user?.is_verified && <span title="Email Verified" style={{ marginLeft: '6px' }}>✅</span>}
                         </span>
                         <button className="btn btn-outline btn-sm" onClick={logout}>Logout</button>
                     </div>
@@ -329,7 +329,7 @@ export default function DashboardPage() {
                                             <div className="mono" style={{ fontSize: '14px' }}>{user?.email}</div>
                                         </div>
                                         <div>
-                                            <div style={{ fontSize: '12px', color: 'var(--text-secondary)', textTransform: 'uppercase', marginBottom: '4px' }}>Aadhaar</div>
+                                            <div style={{ fontSize: '12px', color: 'var(--text-secondary)', textTransform: 'uppercase', marginBottom: '4px' }}>Email</div>
                                             {user?.is_verified ? <span style={{ color: 'var(--accent-green)', fontWeight: 600 }}>✅ Verified</span> : <span style={{ color: 'var(--accent-red)' }}>❌ Not verified</span>}
                                         </div>
                                         <div>

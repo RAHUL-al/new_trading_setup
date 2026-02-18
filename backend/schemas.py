@@ -46,19 +46,7 @@ class UserProfile(BaseModel):
         from_attributes = True
 
 
-class AadhaarSendOTP(BaseModel):
-    aadhaar_number: str
-
-    @field_validator("aadhaar_number")
-    @classmethod
-    def validate_aadhaar(cls, v):
-        cleaned = re.sub(r"\s+", "", v)
-        if not re.match(r"^\d{12}$", cleaned):
-            raise ValueError("Aadhaar number must be exactly 12 digits")
-        return cleaned
-
-
-class AadhaarVerifyOTP(BaseModel):
+class EmailVerifyOTP(BaseModel):
     otp: str
 
     @field_validator("otp")
@@ -67,12 +55,6 @@ class AadhaarVerifyOTP(BaseModel):
         if not re.match(r"^\d{6}$", v):
             raise ValueError("OTP must be exactly 6 digits")
         return v
-
-
-class AadhaarStatus(BaseModel):
-    is_verified: bool
-    last4: Optional[str] = None
-    verified_at: Optional[datetime] = None
 
 
 class AngelOneCredsInput(BaseModel):
