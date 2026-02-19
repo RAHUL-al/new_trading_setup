@@ -86,10 +86,11 @@ function calcBollinger(data: number[], period = 20, mult = 2) {
 }
 
 /* ─── Timestamp parser ─── */
-function parseTime(ts: string): number {
-    if (!ts) return 0;
+function parseTime(ts: number | string): number {
+    if (!ts && ts !== 0) return 0;
+    if (typeof ts === 'number') return ts; // Already Unix timestamp
     const d = new Date(ts);
-    return Math.floor(d.getTime() / 1000);
+    return isNaN(d.getTime()) ? 0 : Math.floor(d.getTime() / 1000);
 }
 
 export default function DashboardPage() {

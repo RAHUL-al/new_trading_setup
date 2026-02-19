@@ -313,23 +313,49 @@ def get_candles(
 ):
     """
     Get candle history from Redis for charting.
-    symbol_key can be 'NIFTY' or an option token like '43212'.
-    Returns array of {timestamp, open, high, low, close, volume}.
+    symbol_key can be 'NIFTY' or an option trading symbol like 'NIFTY19FEB25C23500'.
+    Returns array of {time (unix), open, high, low, close, volume} for lightweight-charts.
     """
     try:
         r = redis.StrictRedis(host="localhost", port=6379, password="Rahul@7355", db=0, decode_responses=True)
         prefix = f"user:{user.id}:"
         date_key = datetime.now().strftime("%Y-%m-%d")
 
+        # IST timezone for timestamp conversion
+        import pytz
+        ist = pytz.timezone("Asia/Kolkata")
+
         history_key = f"{prefix}HISTORY:{symbol_key}:{date_key}"
         raw_candles = r.lrange(history_key, 0, -1)
 
         candles = []
+        seen_times = set()
         for raw in raw_candles:
             try:
                 c = json.loads(raw)
+                ts_str = c.get("timestamp", "")
+                if not ts_str:
+                    continue
+
+                # Parse "2025-02-19 10:30:00" as IST → Unix epoch
+                try:
+                    dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                    dt_ist = ist.localize(dt)
+                    unix_ts = int(dt_ist.timestamp())
+                except ValueError:
+                    try:
+                        dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M")
+                        dt_ist = ist.localize(dt)
+                        unix_ts = int(dt_ist.timestamp())
+                    except ValueError:
+                        continue
+
+                if unix_ts in seen_times:
+                    continue
+                seen_times.add(unix_ts)
+
                 candles.append({
-                    "time": c.get("timestamp", ""),
+                    "time": unix_ts,
                     "open": float(c.get("open", 0)),
                     "high": float(c.get("high", 0)),
                     "low": float(c.get("low", 0)),
@@ -339,6 +365,37 @@ def get_candles(
             except (json.JSONDecodeError, ValueError):
                 continue
 
+        # Also include the current forming candle
+        now = datetime.now(ist)
+        candle_time = now.strftime("%Y-%m-%d %H:%M")
+        current_key = f"{prefix}CANDLE:{symbol_key}:{candle_time}"
+        current_raw = r.get(current_key)
+        if current_raw:
+            try:
+                cc = json.loads(current_raw)
+                ts_str = cc.get("timestamp", candle_time + ":00")
+                try:
+                    dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M")
+                dt_ist = ist.localize(dt)
+                unix_ts = int(dt_ist.timestamp())
+                if unix_ts not in seen_times:
+                    candles.append({
+                        "time": unix_ts,
+                        "open": float(cc.get("open", 0)),
+                        "high": float(cc.get("high", 0)),
+                        "low": float(cc.get("low", 0)),
+                        "close": float(cc.get("close", 0)),
+                        "volume": float(cc.get("volume", 0)),
+                    })
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # Sort by time
+        candles.sort(key=lambda x: x["time"])
+
         return {"symbol": symbol_key, "date": date_key, "candles": candles}
     except Exception as e:
         return {"symbol": symbol_key, "date": "", "candles": [], "error": str(e)}
+

@@ -3,6 +3,7 @@
 import subprocess
 import sys
 import os
+import signal
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -17,13 +18,71 @@ SCRIPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PYTHON_EXE = sys.executable
 
 
+def _kill_pid(pid: int):
+    """Kill a process by PID (cross-platform)."""
+    if pid is None:
+        return
+    try:
+        if os.name == 'nt':
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           capture_output=True, timeout=5)
+        else:
+            os.kill(pid, signal.SIGTERM)
+            import time
+            time.sleep(0.5)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass  # already dead
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    """Check if a process with given PID is still running."""
+    if pid is None:
+        return False
+    try:
+        if os.name == 'nt':
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}"],
+                capture_output=True, text=True, timeout=5
+            )
+            return str(pid) in result.stdout
+        else:
+            os.kill(pid, 0)  # signal 0 = check if process exists
+            return True
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 class BotManager:
     def __init__(self):
         self._bots: dict[int, dict] = {}
 
     def start_bot(self, user_id: int, db: Session) -> dict:
+        # Check in-memory first
         if user_id in self._bots and self._bots[user_id].get("status") == "running":
-            return {"status": "running", "started_at": self._bots[user_id].get("started_at")}
+            # Verify processes are actually still alive
+            if self.is_alive(user_id):
+                return {"status": "running", "started_at": self._bots[user_id].get("started_at")}
+            else:
+                # Processes died, clean up
+                del self._bots[user_id]
+
+        # Check DB for existing running session (handles server restarts)
+        session = db.query(models.BotSession).filter_by(
+            user_id=user_id, status="running"
+        ).order_by(models.BotSession.id.desc()).first()
+        if session:
+            pids = [session.pid_symbol, session.pid_websocket, session.pid_poshandle]
+            if any(_pid_alive(p) for p in pids if p):
+                return {"status": "running", "started_at": session.started_at}
+            else:
+                # Mark dead session as stopped
+                session.status = "stopped"
+                session.stopped_at = datetime.now(timezone.utc)
+                db.commit()
 
         user = db.query(models.User).filter_by(id=user_id).first()
         if not user or not user.angelone_creds:
@@ -101,7 +160,7 @@ class BotManager:
             self._save_session(db, user_id, "running", started_at, None,
                                symbol_proc.pid, ws_proc.pid, pos_proc.pid)
 
-            logger.info(f"[User {user_id}] All processes started successfully")
+            logger.info(f"[User {user_id}] All processes started (PIDs: {symbol_proc.pid}, {ws_proc.pid}, {pos_proc.pid})")
             return {"status": "running", "started_at": started_at}
 
         except Exception as e:
@@ -111,31 +170,51 @@ class BotManager:
             return {"status": "error", "error_message": error_msg}
 
     def stop_bot(self, user_id: int, db: Session) -> dict:
-        if user_id not in self._bots:
-            return {"status": "stopped"}
+        stopped_any = False
 
-        bot = self._bots[user_id]
-        for proc in bot.get("processes", []):
-            try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except Exception:
+        # 1. Kill from in-memory refs
+        if user_id in self._bots:
+            bot = self._bots[user_id]
+            for proc in bot.get("processes", []):
                 try:
-                    proc.kill()
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                    stopped_any = True
                 except Exception:
-                    pass
+                    try:
+                        proc.kill()
+                        stopped_any = True
+                    except Exception:
+                        pass
+            del self._bots[user_id]
 
-        del self._bots[user_id]
-
+        # 2. Kill from DB PIDs (handles server restart case)
         session = db.query(models.BotSession).filter_by(
-            user_id=user_id
+            user_id=user_id, status="running"
         ).order_by(models.BotSession.id.desc()).first()
+
         if session:
+            for pid in [session.pid_symbol, session.pid_websocket, session.pid_poshandle]:
+                if pid and _pid_alive(pid):
+                    _kill_pid(pid)
+                    stopped_any = True
+                    logger.info(f"[User {user_id}] Killed process PID={pid}")
+
             session.status = "stopped"
             session.stopped_at = datetime.now(timezone.utc)
             db.commit()
+        elif not stopped_any:
+            # No in-memory refs AND no running session in DB
+            # Mark any remaining sessions as stopped just in case
+            all_sessions = db.query(models.BotSession).filter_by(
+                user_id=user_id, status="running"
+            ).all()
+            for s in all_sessions:
+                s.status = "stopped"
+                s.stopped_at = datetime.now(timezone.utc)
+            db.commit()
 
-        logger.info(f"[User {user_id}] All processes stopped")
+        logger.info(f"[User {user_id}] Bot stopped")
         return {"status": "stopped"}
 
     def is_alive(self, user_id: int) -> bool:
