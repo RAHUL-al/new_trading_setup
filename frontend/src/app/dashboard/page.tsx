@@ -172,18 +172,16 @@ export default function DashboardPage() {
         return () => clearInterval(iv);
     }, [tab, chartTarget, market?.symbols?.CE?.symbol, market?.symbols?.PE?.symbol]);
 
-    /* ─── Render chart (dynamic import to avoid SSR crash) ─── */
+    /* ─── Create chart (only on tab/indicator/target change) ─── */
     useEffect(() => {
-        if (tab !== 'charts' || !chartContainerRef.current || candles.length === 0) return;
+        if (tab !== 'charts' || !chartContainerRef.current) return;
         let cancelled = false;
 
         // Clean up old chart
-        try {
-            if (chartRef.current) { chartRef.current.remove(); chartRef.current = null; }
-        } catch { chartRef.current = null; }
-        try {
-            if (rsiChartApiRef.current) { rsiChartApiRef.current.remove(); rsiChartApiRef.current = null; }
-        } catch { rsiChartApiRef.current = null; }
+        try { if (chartRef.current) { chartRef.current.remove(); chartRef.current = null; } } catch { chartRef.current = null; }
+        try { if (rsiChartApiRef.current) { rsiChartApiRef.current.remove(); rsiChartApiRef.current = null; } } catch { rsiChartApiRef.current = null; }
+        candleSeriesRef.current = null;
+        indicatorSeriesRef.current = [];
 
         import('lightweight-charts').then(({ createChart, ColorType, CrosshairMode }) => {
             if (cancelled || !chartContainerRef.current) return;
@@ -202,68 +200,31 @@ export default function DashboardPage() {
             });
             chartRef.current = chart;
 
+            // Create candle series
             const candleSeries = chart.addCandlestickSeries({
                 upColor: '#00d26a', downColor: '#f23645',
                 borderUpColor: '#00d26a', borderDownColor: '#f23645',
                 wickUpColor: '#00d26a', wickDownColor: '#f23645',
             });
-
-            const chartData = candles.map(c => ({
-                time: parseTime(c.time) as any,
-                open: c.open, high: c.high, low: c.low, close: c.close,
-            })).filter(c => c.time > 0).sort((a, b) => a.time - b.time);
-
-            // Deduplicate
-            const seen = new Set<number>();
-            const unique = chartData.filter(c => { if (seen.has(c.time)) return false; seen.add(c.time); return true; });
-
-            candleSeries.setData(unique);
             candleSeriesRef.current = candleSeries;
-            indicatorSeriesRef.current = [];
 
-            const closes = candles.map(c => c.close);
-            const times = unique.map(c => c.time);
-
-            // EMA 9
+            // Create indicator series (empty — data filled by update effect)
+            const indSeries: any[] = [];
             if (indicators.ema9) {
-                const ema9 = calcEMA(closes, 9);
-                const series = chart.addLineSeries({ color: '#f7931a', lineWidth: 1, title: 'EMA 9' });
-                const lineData = ema9.map((v, i) => v !== null && times[i] ? { time: times[i], value: v } : null).filter(Boolean) as any[];
-                series.setData(lineData);
-                indicatorSeriesRef.current.push(series);
+                indSeries.push(chart.addLineSeries({ color: '#f7931a', lineWidth: 1, title: 'EMA 9' }));
             }
-
-            // EMA 21
             if (indicators.ema21) {
-                const ema21 = calcEMA(closes, 21);
-                const series = chart.addLineSeries({ color: '#2962ff', lineWidth: 1, title: 'EMA 21' });
-                const lineData = ema21.map((v, i) => v !== null && times[i] ? { time: times[i], value: v } : null).filter(Boolean) as any[];
-                series.setData(lineData);
-                indicatorSeriesRef.current.push(series);
+                indSeries.push(chart.addLineSeries({ color: '#2962ff', lineWidth: 1, title: 'EMA 21' }));
             }
-
-            // SMA 50
             if (indicators.sma50) {
-                const sma50 = calcSMA(closes, 50);
-                const series = chart.addLineSeries({ color: '#e040fb', lineWidth: 1, title: 'SMA 50' });
-                const lineData = sma50.map((v, i) => v !== null && times[i] ? { time: times[i], value: v } : null).filter(Boolean) as any[];
-                series.setData(lineData);
-                indicatorSeriesRef.current.push(series);
+                indSeries.push(chart.addLineSeries({ color: '#e040fb', lineWidth: 1, title: 'SMA 50' }));
             }
-
-            // Bollinger Bands
             if (indicators.bollinger) {
-                const bb = calcBollinger(closes, 20, 2);
-                const upper = chart.addLineSeries({ color: 'rgba(76, 175, 80, 0.4)', lineWidth: 1, title: 'BB Upper' });
-                const lower = chart.addLineSeries({ color: 'rgba(244, 67, 54, 0.4)', lineWidth: 1, title: 'BB Lower' });
-                const mid = chart.addLineSeries({ color: 'rgba(255, 255, 255, 0.2)', lineWidth: 1, title: 'BB Mid' });
-                upper.setData(bb.upper.map((v, i) => v !== null && times[i] ? { time: times[i], value: v } : null).filter(Boolean) as any[]);
-                lower.setData(bb.lower.map((v, i) => v !== null && times[i] ? { time: times[i], value: v } : null).filter(Boolean) as any[]);
-                mid.setData(bb.middle.map((v, i) => v !== null && times[i] ? { time: times[i], value: v } : null).filter(Boolean) as any[]);
-                indicatorSeriesRef.current.push(upper, lower, mid);
+                indSeries.push(chart.addLineSeries({ color: 'rgba(76, 175, 80, 0.4)', lineWidth: 1, title: 'BB Upper' }));
+                indSeries.push(chart.addLineSeries({ color: 'rgba(244, 67, 54, 0.4)', lineWidth: 1, title: 'BB Lower' }));
+                indSeries.push(chart.addLineSeries({ color: 'rgba(255, 255, 255, 0.2)', lineWidth: 1, title: 'BB Mid' }));
             }
-
-            chart.timeScale().fitContent();
+            indicatorSeriesRef.current = indSeries;
 
             // RSI sub-chart
             if (indicators.rsi && rsiChartRef.current) {
@@ -276,21 +237,10 @@ export default function DashboardPage() {
                     timeScale: { borderColor: '#21262d', timeVisible: true, visible: false },
                 });
                 rsiChartApiRef.current = rsiChart;
-                const rsiData = calcRSI(closes, 14);
-                const rsiSeries = rsiChart.addLineSeries({ color: '#e040fb', lineWidth: 1, title: 'RSI 14' });
-                rsiSeries.setData(rsiData.map((v, i) => v !== null && times[i] ? { time: times[i], value: v } : null).filter(Boolean) as any[]);
-
-                // Overbought/oversold lines
-                const ob = rsiChart.addLineSeries({ color: 'rgba(244,67,54,0.3)', lineWidth: 1 });
-                ob.setData(times.map(t => ({ time: t, value: 70 })));
-                const os = rsiChart.addLineSeries({ color: 'rgba(76,175,80,0.3)', lineWidth: 1 });
-                os.setData(times.map(t => ({ time: t, value: 30 })));
-
-                rsiChart.timeScale().fitContent();
 
                 // Sync time scales
                 chart.timeScale().subscribeVisibleLogicalRangeChange((range: any) => {
-                    if (range) rsiChart.timeScale().setVisibleLogicalRange(range);
+                    if (range && rsiChartApiRef.current) rsiChartApiRef.current.timeScale().setVisibleLogicalRange(range);
                 });
             }
 
@@ -307,7 +257,69 @@ export default function DashboardPage() {
             try { if (chartRef.current) { chartRef.current.remove(); chartRef.current = null; } } catch { /* */ }
             try { if (rsiChartApiRef.current) { rsiChartApiRef.current.remove(); rsiChartApiRef.current = null; } } catch { /* */ }
         };
-    }, [tab, candles, indicators]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [tab, chartTarget, indicators]);
+
+    /* ─── Update chart data in-place (preserves scroll/zoom) ─── */
+    useEffect(() => {
+        if (!candleSeriesRef.current || candles.length === 0) return;
+
+        const chartData = candles.map(c => ({
+            time: parseTime(c.time) as any,
+            open: c.open, high: c.high, low: c.low, close: c.close,
+        })).filter(c => c.time > 0).sort((a, b) => a.time - b.time);
+
+        // Deduplicate
+        const seen = new Set<number>();
+        const unique = chartData.filter(c => { if (seen.has(c.time)) return false; seen.add(c.time); return true; });
+
+        // Update candle data without recreating chart
+        candleSeriesRef.current.setData(unique);
+
+        const closes = candles.map(c => c.close);
+        const times = unique.map(c => c.time);
+
+        // Update indicator data in-place
+        let idx = 0;
+        const indSeries = indicatorSeriesRef.current;
+        if (indicators.ema9 && indSeries[idx]) {
+            const ema9 = calcEMA(closes, 9);
+            indSeries[idx].setData(ema9.map((v, i) => v !== null && times[i] ? { time: times[i], value: v } : null).filter(Boolean) as any[]);
+            idx++;
+        }
+        if (indicators.ema21 && indSeries[idx]) {
+            const ema21 = calcEMA(closes, 21);
+            indSeries[idx].setData(ema21.map((v, i) => v !== null && times[i] ? { time: times[i], value: v } : null).filter(Boolean) as any[]);
+            idx++;
+        }
+        if (indicators.sma50 && indSeries[idx]) {
+            const sma50 = calcSMA(closes, 50);
+            indSeries[idx].setData(sma50.map((v, i) => v !== null && times[i] ? { time: times[i], value: v } : null).filter(Boolean) as any[]);
+            idx++;
+        }
+        if (indicators.bollinger && indSeries[idx] && indSeries[idx + 1] && indSeries[idx + 2]) {
+            const bb = calcBollinger(closes, 20, 2);
+            indSeries[idx].setData(bb.upper.map((v, i) => v !== null && times[i] ? { time: times[i], value: v } : null).filter(Boolean) as any[]);
+            indSeries[idx + 1].setData(bb.lower.map((v, i) => v !== null && times[i] ? { time: times[i], value: v } : null).filter(Boolean) as any[]);
+            indSeries[idx + 2].setData(bb.middle.map((v, i) => v !== null && times[i] ? { time: times[i], value: v } : null).filter(Boolean) as any[]);
+        }
+
+        // RSI update
+        if (indicators.rsi && rsiChartApiRef.current) {
+            // Get all series from rsi chart and update
+            try {
+                const rsiSeries = rsiChartApiRef.current.addLineSeries({ color: '#e040fb', lineWidth: 1, title: 'RSI 14' });
+                const rsiData = calcRSI(closes, 14);
+                rsiSeries.setData(rsiData.map((v: number | null, i: number) => v !== null && times[i] ? { time: times[i], value: v } : null).filter(Boolean) as any[]);
+            } catch { /* RSI series already exists, skip */ }
+        }
+
+        // Only fitContent on first data load
+        if (chartRef.current && unique.length > 0 && !chartRef.current._hasInitialFit) {
+            chartRef.current.timeScale().fitContent();
+            chartRef.current._hasInitialFit = true;
+        }
+    }, [candles, indicators]);
 
     /* ─── Handlers ─── */
     const handleBotControl = async (action: string) => {
