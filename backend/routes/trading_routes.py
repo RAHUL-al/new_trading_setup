@@ -230,3 +230,115 @@ def update_settings(
     db.commit()
     db.refresh(settings)
     return settings
+
+
+@router.get("/market-data")
+def get_market_data(
+    user: models.User = Depends(get_current_user),
+):
+    """
+    Live market data from Redis — NIFTY price, ATR, CE/PE symbols + prices, signals.
+    Polled every 1s by the frontend (no WebSocket dependency).
+    """
+    try:
+        r = redis.StrictRedis(host="localhost", port=6379, password="Rahul@7355", db=0, decode_responses=True)
+        prefix = f"user:{user.id}:"
+        data = {}
+
+        # NIFTY index price
+        nifty = r.get(f"{prefix}99926000")
+        data["nifty_price"] = float(nifty) if nifty else 0
+
+        # ATR
+        atr = r.get(f"{prefix}ATR_value")
+        data["atr"] = float(atr) if atr else 0
+
+        # Trading symbols with live prices
+        ts_raw = r.get(f"{prefix}Trading_symbol")
+        symbols = {}
+        if ts_raw:
+            ts = json.loads(ts_raw)
+            for opt_type in ["CE", "PE"]:
+                info = ts.get(opt_type, [None, None])
+                if info and info[1]:
+                    price_str = r.get(f"{prefix}{info[1]}")
+                    symbols[opt_type] = {
+                        "symbol": info[0],
+                        "token": str(info[1]),
+                        "price": float(price_str) if price_str else 0,
+                    }
+        data["symbols"] = symbols
+
+        # Signals
+        data["signals"] = {
+            "buy": r.get(f"{prefix}buy_signal") == "true",
+            "sell": r.get(f"{prefix}sell_signal") == "true",
+        }
+
+        # Last candle
+        candle_raw = r.get(f"{prefix}last_candle")
+        data["last_candle"] = json.loads(candle_raw) if candle_raw else None
+
+        # Open position
+        pos_raw = r.get(f"{prefix}active_positions")
+        data["position"] = None
+        if pos_raw:
+            positions = json.loads(pos_raw)
+            if positions:
+                token_key, pdata = next(iter(positions.items()))
+                cur_price_str = r.get(f"{prefix}{token_key}")
+                cur_price = float(cur_price_str) if cur_price_str else float(pdata.get("entry_price", 0))
+                pnl = (cur_price - float(pdata["entry_price"])) * int(pdata.get("quantity", 1))
+                data["position"] = {
+                    "token": token_key,
+                    "trading_symbol": pdata.get("trading_symbol", ""),
+                    "option_type": pdata.get("option_type", ""),
+                    "entry_price": float(pdata["entry_price"]),
+                    "current_price": cur_price,
+                    "quantity": int(pdata.get("quantity", 1)),
+                    "stop_loss": float(pdata.get("stop_loss", 0)),
+                    "pnl": round(pnl, 2),
+                    "entry_time": pdata.get("entry_time", ""),
+                }
+
+        return data
+    except Exception as e:
+        return {"error": str(e), "nifty_price": 0, "atr": 0, "symbols": {}, "signals": {}, "position": None}
+
+
+@router.get("/candles/{symbol_key}")
+def get_candles(
+    symbol_key: str,
+    user: models.User = Depends(get_current_user),
+):
+    """
+    Get candle history from Redis for charting.
+    symbol_key can be 'NIFTY' or an option token like '43212'.
+    Returns array of {timestamp, open, high, low, close, volume}.
+    """
+    try:
+        r = redis.StrictRedis(host="localhost", port=6379, password="Rahul@7355", db=0, decode_responses=True)
+        prefix = f"user:{user.id}:"
+        date_key = datetime.now().strftime("%Y-%m-%d")
+
+        history_key = f"{prefix}HISTORY:{symbol_key}:{date_key}"
+        raw_candles = r.lrange(history_key, 0, -1)
+
+        candles = []
+        for raw in raw_candles:
+            try:
+                c = json.loads(raw)
+                candles.append({
+                    "time": c.get("timestamp", ""),
+                    "open": float(c.get("open", 0)),
+                    "high": float(c.get("high", 0)),
+                    "low": float(c.get("low", 0)),
+                    "close": float(c.get("close", 0)),
+                    "volume": float(c.get("volume", 0)),
+                })
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+        return {"symbol": symbol_key, "date": date_key, "candles": candles}
+    except Exception as e:
+        return {"symbol": symbol_key, "date": "", "candles": [], "error": str(e)}

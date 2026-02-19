@@ -56,6 +56,37 @@ export interface UserSettings {
     square_off_time: string;
 }
 
+export interface SymbolInfo {
+    symbol: string;
+    token: string;
+    price: number;
+}
+
+export interface MarketData {
+    nifty_price: number;
+    atr: number;
+    symbols: { CE?: SymbolInfo; PE?: SymbolInfo };
+    signals: { buy: boolean; sell: boolean };
+    last_candle: { timestamp: string; open: number; high: number; low: number; close: number } | null;
+    position: any | null;
+    error?: string;
+}
+
+export interface CandleData {
+    time: string;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+}
+
+export interface CandleResponse {
+    symbol: string;
+    date: string;
+    candles: CandleData[];
+}
+
 function getToken(): string | null {
     if (typeof window === 'undefined') return null;
     return localStorage.getItem('access_token');
@@ -122,6 +153,10 @@ export const api = {
     controlBot: (action: string) => fetchAPI('/trading/bot/control', { method: 'POST', body: JSON.stringify({ action }) }),
     getSettings: (): Promise<UserSettings> => fetchAPI('/trading/settings'),
     updateSettings: (data: Partial<UserSettings>) => fetchAPI('/trading/settings', { method: 'PUT', body: JSON.stringify(data) }),
+
+    // Market Data (live from Redis)
+    getMarketData: (): Promise<MarketData> => fetchAPI('/trading/market-data'),
+    getCandles: (symbolKey: string): Promise<CandleResponse> => fetchAPI(`/trading/candles/${symbolKey}`),
 };
 
 // WebSocket

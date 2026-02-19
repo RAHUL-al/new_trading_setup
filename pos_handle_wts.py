@@ -514,6 +514,12 @@ class TradingBot:
                     trading_active = self.is_trading_window()
                     window_status = "🟢 TRADING" if trading_active else "🔴 NO NEW TRADES"
                     
+                    # Get ATR and NIFTY index price
+                    current_atr = await self.get_current_atr()
+                    atr_status = "✅" if current_atr >= ATR_MIN_THRESHOLD else "⚠️"
+                    nifty_price = await self.get_index_price()
+                    nifty_str = f"₹{nifty_price:.2f}" if nifty_price else "N/A"
+                    
                     if self.open_pos:
                         pos = self.open_pos
                         cur_price = await self.get_current_price(pos.token)
@@ -521,6 +527,7 @@ class TradingBot:
                         daily_emoji = "📈" if self.daily_pnl >= 0 else "📉"
                         logger.info(
                             f"📊 {window_status} | "
+                            f"NIFTY={nifty_str} ATR={current_atr:.2f}{atr_status} | "
                             f"POSITION: {pos.option_type} {pos.trading_symbol} "
                             f"Entry=₹{pos.entry_price:.2f} Current=₹{cur_price:.2f} "
                             f"SL=₹{pos.stop_loss:.2f} P&L=₹{pnl:.2f} | "
@@ -530,6 +537,7 @@ class TradingBot:
                         daily_emoji = "📈" if self.daily_pnl >= 0 else "📉"
                         logger.info(
                             f"📊 {window_status} | "
+                            f"NIFTY={nifty_str} ATR={current_atr:.2f}{atr_status} | "
                             f"{daily_emoji} Day=₹{self.daily_pnl:.2f} ({self.trade_count} trades) | "
                             f"Waiting for signal"
                         )
