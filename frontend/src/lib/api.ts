@@ -73,7 +73,7 @@ export interface MarketData {
 }
 
 export interface CandleData {
-    time: string;
+    time: number;
     open: number;
     high: number;
     low: number;
