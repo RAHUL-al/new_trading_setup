@@ -399,3 +399,44 @@ def get_candles(
     except Exception as e:
         return {"symbol": symbol_key, "date": "", "candles": [], "error": str(e)}
 
+
+# ─── Scanner Rankings API ────────────────────────────────────────────
+
+@router.get("/scanner/rankings")
+def get_scanner_rankings(
+    user: models.User = Depends(get_current_user),
+):
+    """
+    Get today's gap-up/gap-down stock rankings from the scanner.
+    Returns the analysis produced by gap_analyzer.py at ~3:20 PM.
+    """
+    try:
+        r = redis.StrictRedis(
+            host="localhost", port=6379,
+            password="Rahul@7355", db=0, decode_responses=True
+        )
+        date_key = datetime.now().strftime("%Y-%m-%d")
+        rankings_key = f"SCAN:RANKINGS:{date_key}"
+        raw = r.get(rankings_key)
+
+        if not raw:
+            return {
+                "date": date_key,
+                "timestamp": None,
+                "total_stocks_analyzed": 0,
+                "gap_up": [],
+                "gap_down": [],
+                "message": "Rankings not available yet. Analysis runs at 3:20 PM."
+            }
+
+        rankings = json.loads(raw)
+        rankings["date"] = date_key
+        return rankings
+
+    except Exception as e:
+        return {
+            "date": "",
+            "error": str(e),
+            "gap_up": [],
+            "gap_down": [],
+        }
