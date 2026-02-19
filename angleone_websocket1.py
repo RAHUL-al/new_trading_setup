@@ -30,10 +30,10 @@ REDIS_PREFIX = os.environ.get("REDIS_PREFIX", "")
 
 r = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, db=0, decode_responses=True)
 
-TOTP_TOKEN = os.environ.get("ANGELONE_TOTP_SECRET", "")
-API_KEY = os.environ.get("ANGELONE_API_KEY", "")
-CLIENT_ID = os.environ.get("ANGELONE_CLIENT_ID", "")
-PWD = os.environ.get("ANGELONE_PASSWORD", "")
+TOTP_TOKEN = os.environ.get("ANGELONE_TOTP_SECRET", "33OUTDUE57WS3TUPHPLFUCGHFM")
+API_KEY = os.environ.get("ANGELONE_API_KEY", "Ytt1NkKD")
+CLIENT_ID = os.environ.get("ANGELONE_CLIENT_ID", "R865920")
+PWD = os.environ.get("ANGELONE_PASSWORD", "7355")
 CORRELATION_ID = f"user_{CLIENT_ID}"
 
 TRADING_SYMBOLS_KEY = f"{REDIS_PREFIX}Trading_symbol"
