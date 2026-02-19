@@ -276,14 +276,47 @@ from redis.asyncio import Redis as AsyncRedis
 
 NIFTY_SYMBOL = "NIFTY"
 SIGNAL_COOLDOWN = 60  # Min seconds between same-direction signals
+ATR_MIN_THRESHOLD = 6.9  # Minimum ATR to take new positions
+
+
+def calculate_true_range(data):
+    """
+    True Range = max(High-Low, abs(High-prev_Close), abs(Low-prev_Close))
+    Uses full candle data (High/Low), not just Close.
+    """
+    high = data['High']
+    low = data['Low']
+    prev_close = data['Close'].shift(1)
+
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    # First row: just High-Low since no prev_close
+    true_range.iloc[0] = high.iloc[0] - low.iloc[0]
+    return true_range
+
+
+def rma(series, period):
+    """
+    RMA (Wilder's Smoothing / Running Moving Average).
+    RMA = (prev_RMA * (period-1) + current_value) / period
+    Equivalent to EWM with alpha=1/period.
+    """
+    return series.ewm(alpha=1/period, adjust=False).mean()
 
 
 def calculate_ut_bot(data, a=2, c=100, h=False):
     """
-    UT Bot Alert indicator — exact user implementation.
-    a = ATR multiplier (key value), c = ATR period (sensitivity).
+    UT Bot Alert indicator with proper ATR:
+    - True Range using High/Low/prev_Close (full candle)
+    - RMA smoothing (Wilder's method, alpha=1/c)
+    - a = ATR multiplier (key value), c = ATR period (sensitivity)
     """
-    xATR = data['Close'].diff().abs().ewm(span=c, adjust=False).mean()
+    # ATR using True Range + RMA (not close-to-close EWM)
+    true_range = calculate_true_range(data)
+    xATR = rma(true_range, c)
     nLoss = a * xATR
     src = data['Close']
     xATRTrailingStop = pd.Series(index=data.index, dtype=float)
@@ -326,6 +359,7 @@ async def nifty_signal_engine():
     """
     Async signal engine — polls at 50ms, only recalculates when new candles arrive.
     Uses async Redis for non-blocking I/O.
+    ATR published with every signal for pos_handle_wts to check threshold.
     """
     ar = AsyncRedis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, db=0, decode_responses=True)
 
@@ -336,7 +370,7 @@ async def nifty_signal_engine():
     last_candle_count = 0
     last_published_candle_time = None
 
-    logger.info("⚡ Starting async NIFTY signal engine (UT Bot a=2, c=100, 50ms poll)...")
+    logger.info("⚡ Starting async NIFTY signal engine (UT Bot a=2, c=100, RMA ATR, threshold=6.9)...")
 
     while True:
         try:
@@ -379,10 +413,10 @@ async def nifty_signal_engine():
             if "Volume" in df.columns:
                 df["Volume"] = df["Volume"].astype(float)
 
-            # Run UT Bot
+            # Run UT Bot (now with True Range + RMA)
             signals, xATR = calculate_ut_bot(df, a=2, c=100)
 
-            # Store ATR in Redis (non-blocking)
+            # Store ATR in Redis (non-blocking) — pos_handle_wts reads this
             current_atr = xATR.iloc[-1]
             if pd.notna(current_atr):
                 await ar.set(f"{REDIS_PREFIX}ATR_value", str(round(current_atr, 2)))
@@ -402,24 +436,30 @@ async def nifty_signal_engine():
             curr_buy = bool(signals['buy'].iloc[-1])
             curr_sell = bool(signals['sell'].iloc[-1])
             now_ts = time.time()
+            atr_ok = pd.notna(current_atr) and current_atr > ATR_MIN_THRESHOLD
 
             if curr_buy and not prev_buy:
                 if now_ts - last_signal_time > SIGNAL_COOLDOWN:
-                    await ar.publish(f"{REDIS_PREFIX}signal:buy", "true")
+                    # Always publish signal — pos_handle_wts decides whether to open new position
+                    signal_data = json.dumps({"signal": "buy", "atr": round(current_atr, 2) if pd.notna(current_atr) else 0})
+                    await ar.publish(f"{REDIS_PREFIX}signal:buy", signal_data)
                     await ar.set(f"{REDIS_PREFIX}buy_signal", "true")
                     await ar.set(f"{REDIS_PREFIX}sell_signal", "false")
                     last_signal = "BUY"
                     last_signal_time = now_ts
-                    logger.info(f"🟢 BUY SIGNAL — UT Bot | NIFTY Close={last_row['Close']} ATR={current_atr:.2f}")
+                    atr_status = f"ATR={current_atr:.2f} ✅" if atr_ok else f"ATR={current_atr:.2f} ⚠️ <{ATR_MIN_THRESHOLD}"
+                    logger.info(f"🟢 BUY SIGNAL — UT Bot | NIFTY Close={last_row['Close']} | {atr_status}")
 
             elif curr_sell and not prev_sell:
                 if now_ts - last_signal_time > SIGNAL_COOLDOWN:
-                    await ar.publish(f"{REDIS_PREFIX}signal:sell", "true")
+                    signal_data = json.dumps({"signal": "sell", "atr": round(current_atr, 2) if pd.notna(current_atr) else 0})
+                    await ar.publish(f"{REDIS_PREFIX}signal:sell", signal_data)
                     await ar.set(f"{REDIS_PREFIX}sell_signal", "true")
                     await ar.set(f"{REDIS_PREFIX}buy_signal", "false")
                     last_signal = "SELL"
                     last_signal_time = now_ts
-                    logger.info(f"🔴 SELL SIGNAL — UT Bot | NIFTY Close={last_row['Close']} ATR={current_atr:.2f}")
+                    atr_status = f"ATR={current_atr:.2f} ✅" if atr_ok else f"ATR={current_atr:.2f} ⚠️ <{ATR_MIN_THRESHOLD}"
+                    logger.info(f"🔴 SELL SIGNAL — UT Bot | NIFTY Close={last_row['Close']} | {atr_status}")
 
             prev_buy = curr_buy
             prev_sell = curr_sell

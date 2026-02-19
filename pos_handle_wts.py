@@ -40,6 +40,7 @@ KEY_SELL_SIGNAL = f"{REDIS_PREFIX}sell_signal"
 
 INDEX_TOKEN = "99926000"
 TRAILING_OFFSET = 0
+ATR_MIN_THRESHOLD = 6.9  # Minimum ATR to take new positions
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("TradingBot")
@@ -115,13 +116,21 @@ async def load_last_candle_from_redis(redis_conn) -> Tuple[Optional[float], Opti
 class TradingBot:
     def __init__(self):
         self.r: Redis = Redis(
-            host=REDIS_HOST, 
-            port=REDIS_PORT, 
-            db=REDIS_DB, 
-            password=REDIS_PASSWORD, 
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            db=REDIS_DB,
+            password=REDIS_PASSWORD,
             decode_responses=True,
             socket_timeout=5,
             socket_connect_timeout=5
+        )
+        # Separate connection for PubSub — NO timeout (blocks waiting for messages)
+        self.r_pubsub: Redis = Redis(
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            db=REDIS_DB,
+            password=REDIS_PASSWORD,
+            decode_responses=True,
         )
         self.ce_symbol: Optional[str] = None
         self.ce_token: Optional[str] = None
@@ -162,7 +171,7 @@ class TradingBot:
 
     async def task_continuous_trailing_stop_loss(self):
         """Subscribe to candle:close pub/sub for instant trailing SL updates (no disk polling)."""
-        psub = self.r.pubsub()
+        psub = self.r_pubsub.pubsub()
         await psub.subscribe(CHAN_CANDLE_CLOSE)
         logger.info("⚡ Trailing SL subscribed to candle:close pub/sub")
         
@@ -557,7 +566,15 @@ class TradingBot:
             logger.info(f"🛑 STOP LOSS HIT! NIFTY={price:.2f} ≥ SL={pos.stop_loss:.2f} | Closing {pos.option_type} position")
             await self.close_position("STOP_LOSS")
 
-    
+    async def get_current_atr(self) -> float:
+        """Read latest ATR value from Redis (published by signal engine)."""
+        try:
+            atr_val = await self.r.get(f"{REDIS_PREFIX}ATR_value")
+            if atr_val:
+                return float(atr_val)
+        except Exception:
+            pass
+        return 0.0
 
     async def on_buy_signal(self, signal_candle: Optional[CandleData] = None):
         signal_candle = await self.load_last_complete_candle()
@@ -568,17 +585,23 @@ class TradingBot:
         if not self.is_market_hours():
             return
         
-        # Close opposite PE position if open (works anytime during market hours)
+        # Close opposite PE position if open (ALWAYS — regardless of ATR)
         if self.open_pos and self.open_pos.option_type == "PE":
             logger.info(f"🔄 Closing PE position (opposite BUY signal received)")
             await self.close_position("OPPOSITE_SIGNAL")
         
-        # Only take NEW positions inside trading window (12:30 - 3:10)
+        # Only take NEW positions if: inside trading window AND ATR > threshold
         if not self.open_pos:
             if not self.is_trading_window():
-                logger.info(f"⚠️ BUY signal received but outside trading window (12:30-15:10). Skipping.")
+                logger.info(f"⚠️ BUY signal received but outside trading window. Skipping.")
                 return
-            logger.info(f"🟢 BUY SIGNAL | Taking CE position...")
+            
+            current_atr = await self.get_current_atr()
+            if current_atr < ATR_MIN_THRESHOLD:
+                logger.info(f"⚠️ BUY signal received but ATR={current_atr:.2f} < {ATR_MIN_THRESHOLD}. Skipping new position.")
+                return
+            
+            logger.info(f"🟢 BUY SIGNAL | ATR={current_atr:.2f} ✅ | Taking CE position...")
             await self.take_buy(quantity=1, signal_candle=signal_candle)
 
     async def on_sell_signal(self, signal_candle: Optional[CandleData] = None):
@@ -590,23 +613,29 @@ class TradingBot:
         if not self.is_market_hours():
             return
         
-        # Close opposite CE position if open (works anytime during market hours)
+        # Close opposite CE position if open (ALWAYS — regardless of ATR)
         if self.open_pos and self.open_pos.option_type == "CE":
             logger.info(f"🔄 Closing CE position (opposite SELL signal received)")
             await self.close_position("OPPOSITE_SIGNAL")
         
-        # Only take NEW positions inside trading window (12:30 - 3:10)
+        # Only take NEW positions if: inside trading window AND ATR > threshold
         if not self.open_pos:
             if not self.is_trading_window():
-                logger.info(f"⚠️ SELL signal received but outside trading window (12:30-15:10). Skipping.")
+                logger.info(f"⚠️ SELL signal received but outside trading window. Skipping.")
                 return
-            logger.info(f"🔴 SELL SIGNAL | Taking PE position...")
+            
+            current_atr = await self.get_current_atr()
+            if current_atr < ATR_MIN_THRESHOLD:
+                logger.info(f"⚠️ SELL signal received but ATR={current_atr:.2f} < {ATR_MIN_THRESHOLD}. Skipping new position.")
+                return
+            
+            logger.info(f"🔴 SELL SIGNAL | ATR={current_atr:.2f} ✅ | Taking PE position...")
             await self.take_sell(quantity=1, signal_candle=signal_candle)
 
     async def task_pubsub_listener(self):
         """Listens for Pub/Sub messages for prices, signals, and candle closes."""
         try:
-            psub = self.r.pubsub()
+            psub = self.r_pubsub.pubsub()
             await psub.subscribe(
                 f"{CHAN_PRICE_PREFIX}{INDEX_TOKEN}", 
                 CHAN_SIGNAL_BUY,
