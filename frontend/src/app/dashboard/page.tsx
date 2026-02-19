@@ -11,7 +11,7 @@ import {
 } from '@/lib/api';
 import {
     createChart, ColorType, CrosshairMode,
-    type IChartApi, type ISeriesApi, type LogicalRange,
+    type IChartApi, type ISeriesApi,
 } from 'lightweight-charts';
 
 type Tab = 'overview' | 'charts' | 'trades' | 'settings';
@@ -283,7 +283,7 @@ export default function DashboardPage() {
             rsiChart.timeScale().fitContent();
 
             // Sync time scales
-            chart.timeScale().subscribeVisibleLogicalRangeChange((range: LogicalRange | null) => {
+            chart.timeScale().subscribeVisibleLogicalRangeChange((range: any) => {
                 if (range) rsiChart.timeScale().setVisibleLogicalRange(range);
             });
         }
