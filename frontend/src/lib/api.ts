@@ -87,6 +87,51 @@ export interface CandleResponse {
     candles: CandleData[];
 }
 
+export interface ScannerStock {
+    token: string;
+    symbol: string;
+    company_name: string;
+    type: string;
+    exchange: string;
+    ltp: number;
+    day_open: number;
+    day_high: number;
+    day_low: number;
+    change_pct: number;
+    vol_freeze_qty: number;
+}
+
+export interface ScannerStocksResponse {
+    date: string;
+    total: number;
+    stocks: ScannerStock[];
+    error?: string;
+}
+
+export interface ScannerRankingItem {
+    symbol: string;
+    score: number;
+    ltp: number;
+    change_pct: number;
+    rsi: number;
+    close_position: number;
+    last_hour_pct: number;
+    volume_surge: number;
+    ema_trend: string;
+    reason: string;
+}
+
+export interface ScannerRankingsResponse {
+    date: string;
+    timestamp: string | null;
+    total_stocks_analyzed: number;
+    gap_up: ScannerRankingItem[];
+    gap_down: ScannerRankingItem[];
+    message?: string;
+    error?: string;
+}
+
+
 function getToken(): string | null {
     if (typeof window === 'undefined') return null;
     return localStorage.getItem('access_token');
@@ -157,6 +202,11 @@ export const api = {
     // Market Data (live from Redis)
     getMarketData: (): Promise<MarketData> => fetchAPI('/trading/market-data'),
     getCandles: (symbolKey: string): Promise<CandleResponse> => fetchAPI(`/trading/candles/${symbolKey}`),
+
+    // Scanner APIs
+    getScannerStocks: (): Promise<ScannerStocksResponse> => fetchAPI('/trading/scanner/stocks'),
+    getScannerRankings: (): Promise<ScannerRankingsResponse> => fetchAPI('/trading/scanner/rankings'),
+    getScannerCandles: (symbol: string): Promise<CandleResponse> => fetchAPI(`/trading/scanner/candles/${symbol}`),
 };
 
 // WebSocket

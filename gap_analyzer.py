@@ -470,10 +470,10 @@ def save_results_csv(results: list, date_key: str):
 
 
 def main():
-    """Main loop — run analysis at 3:20 PM (and every minute until 3:25 for updates)."""
-    logger.info("Gap Analyzer started — waiting for 3:20 PM analysis window...")
+    """Main loop — run analysis every 5 minutes from 9:45 AM to 3:30 PM."""
+    logger.info("Gap Analyzer started — continuous analysis mode (every 5 min)")
 
-    analysis_done = False
+    last_run_minute = -1
 
     while True:
         now = datetime.datetime.now(INDIA_TZ)
@@ -484,27 +484,22 @@ def main():
             logger.info("Market closed. Final analysis complete.")
             break
 
-        # Analysis window: 3:15 PM to 3:25 PM
-        if datetime.time(15, 15) <= now_time <= datetime.time(15, 25):
-            logger.info(f"Analysis window active — running at {now.strftime('%H:%M:%S')}")
-            run_analysis()
-
-            if now_time >= datetime.time(15, 20):
-                analysis_done = True
-
-            # Update every 2 minutes during the window
-            time.sleep(120)
-        elif analysis_done:
-            # Post-analysis: update once more at 3:28
-            if datetime.time(15, 27) <= now_time <= datetime.time(15, 29):
-                logger.info("Final update at 3:28 PM...")
-                run_analysis()
-                time.sleep(300)  # sleep until market close
+        # Run analysis every 5 minutes from 9:45 AM to 3:30 PM
+        if datetime.time(9, 45) <= now_time <= datetime.time(15, 30):
+            current_5min = (now.hour * 60 + now.minute) // 5
+            if current_5min != last_run_minute:
+                last_run_minute = current_5min
+                logger.info(f"Running analysis at {now.strftime('%H:%M:%S')}...")
+                try:
+                    run_analysis()
+                except Exception as e:
+                    logger.error(f"Analysis error: {e}")
+                time.sleep(10)  # small buffer after analysis
             else:
-                time.sleep(30)
+                time.sleep(5)
         else:
-            # Before 3:15 — periodic health check
-            if now_time >= datetime.time(9, 30) and now.minute % 30 == 0 and now.second < 5:
+            # Before 9:45 — periodic health check
+            if now_time >= datetime.time(9, 15) and now.minute % 10 == 0 and now.second < 5:
                 symbols, _ = load_all_symbols()
                 date_key = now.strftime('%Y-%m-%d')
                 live_count = 0

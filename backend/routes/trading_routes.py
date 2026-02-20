@@ -400,7 +400,13 @@ def get_candles(
         return {"symbol": symbol_key, "date": "", "candles": [], "error": str(e)}
 
 
-# ─── Scanner Rankings API ────────────────────────────────────────────
+# ─── Scanner APIs ────────────────────────────────────────────────────
+
+import os
+import pandas as pd
+
+SCANNER_CSV = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scanner_all_tokens.csv")
+
 
 @router.get("/scanner/rankings")
 def get_scanner_rankings(
@@ -408,7 +414,7 @@ def get_scanner_rankings(
 ):
     """
     Get today's gap-up/gap-down stock rankings from the scanner.
-    Returns the analysis produced by gap_analyzer.py at ~3:20 PM.
+    Updates every 5 minutes from 9:45 AM.
     """
     try:
         r = redis.StrictRedis(
@@ -426,7 +432,7 @@ def get_scanner_rankings(
                 "total_stocks_analyzed": 0,
                 "gap_up": [],
                 "gap_down": [],
-                "message": "Rankings not available yet. Analysis runs at 3:20 PM."
+                "message": "Rankings not available yet. Analysis starts at 9:45 AM."
             }
 
         rankings = json.loads(raw)
@@ -440,3 +446,130 @@ def get_scanner_rankings(
             "gap_up": [],
             "gap_down": [],
         }
+
+
+@router.get("/scanner/stocks")
+def get_scanner_stocks(
+    user: models.User = Depends(get_current_user),
+):
+    """
+    Get all 212 F&O stocks + 5 indexes with live LTP and change%.
+    Data from scanner_all_tokens.csv + Redis SCAN:* keys.
+    """
+    try:
+        if not os.path.exists(SCANNER_CSV):
+            return {"stocks": [], "error": "scanner_all_tokens.csv not found. Run stock_scanner_setup.py first."}
+
+        df = pd.read_csv(SCANNER_CSV)
+        r = redis.StrictRedis(
+            host="localhost", port=6379,
+            password="Rahul@7355", db=0, decode_responses=True
+        )
+        date_key = datetime.now().strftime("%Y-%m-%d")
+
+        stocks = []
+        for _, row in df.iterrows():
+            symbol = str(row.get("pSymbolName", ""))
+            token = str(row.get("pSymbol", ""))
+            stock_type = str(row.get("type", "STOCK"))
+
+            ltp_raw = r.get(f"SCAN:LTP:{symbol}")
+            open_raw = r.get(f"SCAN:OPEN:{symbol}:{date_key}")
+            high_raw = r.get(f"SCAN:DAY_HIGH:{symbol}:{date_key}")
+            low_raw = r.get(f"SCAN:DAY_LOW:{symbol}:{date_key}")
+
+            ltp = float(ltp_raw) if ltp_raw else 0
+            day_open = float(open_raw) if open_raw else 0
+            day_high = float(high_raw) if high_raw else 0
+            day_low = float(low_raw) if low_raw else 0
+            change_pct = ((ltp - day_open) / day_open * 100) if day_open > 0 else 0
+
+            stocks.append({
+                "token": token,
+                "symbol": symbol,
+                "company_name": str(row.get("company_name", "")),
+                "type": stock_type,
+                "exchange": str(row.get("exchange", "NSE")),
+                "ltp": round(ltp, 2),
+                "day_open": round(day_open, 2),
+                "day_high": round(day_high, 2),
+                "day_low": round(day_low, 2),
+                "change_pct": round(change_pct, 2),
+                "vol_freeze_qty": int(row.get("vol_freeze_qty", 0)),
+            })
+
+        return {"date": date_key, "total": len(stocks), "stocks": stocks}
+
+    except Exception as e:
+        return {"stocks": [], "error": str(e)}
+
+
+@router.get("/scanner/candles/{symbol}")
+def get_scanner_candles(
+    symbol: str,
+    user: models.User = Depends(get_current_user),
+):
+    """
+    Get 5-min candle history for a scanned stock.
+    Returns array of {time, open, high, low, close, volume} for lightweight-charts.
+    """
+    try:
+        r = redis.StrictRedis(
+            host="localhost", port=6379,
+            password="Rahul@7355", db=0, decode_responses=True
+        )
+        date_key = datetime.now().strftime("%Y-%m-%d")
+        history_key = f"SCAN:HISTORY:{symbol}:{date_key}"
+
+        raw_candles = r.lrange(history_key, 0, -1)
+        candles = []
+
+        for raw in raw_candles:
+            try:
+                c = json.loads(raw)
+                ts = c.get("timestamp", "")
+                # Convert to unix epoch for lightweight-charts
+                try:
+                    from datetime import datetime as dt2
+                    epoch = int(dt2.strptime(ts[:16], "%Y-%m-%d %H:%M").timestamp())
+                except:
+                    epoch = 0
+
+                candles.append({
+                    "time": epoch,
+                    "open": float(c.get("open", 0)),
+                    "high": float(c.get("high", 0)),
+                    "low": float(c.get("low", 0)),
+                    "close": float(c.get("close", 0)),
+                    "volume": float(c.get("volume", 0)),
+                })
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+        # Also include current forming candle
+        now = datetime.now()
+        minute = (now.minute // 5) * 5
+        candle_time = now.replace(minute=minute, second=0, microsecond=0).strftime('%Y-%m-%d %H:%M')
+        current_key = f"SCAN:CANDLE:{symbol}:{candle_time}"
+        current_raw = r.get(current_key)
+        if current_raw:
+            try:
+                c = json.loads(current_raw)
+                from datetime import datetime as dt2
+                epoch = int(dt2.strptime(candle_time, "%Y-%m-%d %H:%M").timestamp())
+                candles.append({
+                    "time": epoch,
+                    "open": float(c.get("open", 0)),
+                    "high": float(c.get("high", 0)),
+                    "low": float(c.get("low", 0)),
+                    "close": float(c.get("close", 0)),
+                    "volume": float(c.get("volume", 0)),
+                })
+            except:
+                pass
+
+        candles.sort(key=lambda x: x["time"])
+        return {"symbol": symbol, "date": date_key, "candles": candles}
+
+    except Exception as e:
+        return {"symbol": symbol, "date": "", "candles": [], "error": str(e)}

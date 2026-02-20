@@ -653,8 +653,6 @@ class TradingBot:
             logger.info("✅ Subscribed to Pub/Sub channels: price, buy, sell, candle_close")
             
             async for msg in psub.listen():
-                if not self.is_market_hours():
-                    continue
                 if msg is None or msg.get("type") != "message":
                     continue
                     
@@ -700,10 +698,6 @@ class TradingBot:
         last_sell = None
         
         while True:
-            if not self.is_market_hours():
-                await asyncio.sleep(0.1)
-                continue
-
             try:
                 # Check stop loss with current index price
                 price = await self.get_index_price()
@@ -741,10 +735,9 @@ class TradingBot:
                 daily_emoji = "📈" if self.daily_pnl >= 0 else "📉"
                 logger.info(f"{daily_emoji} FINAL DAY P&L: ₹{self.daily_pnl:.2f} | Trades: {self.trade_count}")
                 
-                # Delete ALL Redis keys EXCEPT trade_history_*
-                logger.info("🧹 Cleaning up Redis (keeping trade_history only)...")
+                logger.info("🧹 Cleaning up Redis (keeping trade_history and SCAN: keys)...")
                 all_keys = await self.r.keys("*")
-                keys_to_delete = [k for k in all_keys if not k.startswith("trade_history_")]
+                keys_to_delete = [k for k in all_keys if not k.startswith("trade_history_") and not k.startswith("SCAN:")]
                 if keys_to_delete:
                     await self.r.delete(*keys_to_delete)
                     logger.info(f"🗑️ Deleted {len(keys_to_delete)} Redis keys")
@@ -794,63 +787,55 @@ class TradingBot:
 
     # ---------- main ----------
     async def run(self):
-        if self.is_market_hours():
-            logger.info("TradingBot starting with trailing stop loss and ATR filtering…")
-            
-            if not await self.load_symbols():
-                logger.error("Failed to load symbols, exiting")
-                return
-            
-            # Recover any existing positions
-            await self.recover_open_position()
-            
-            # Recover daily P&L from trade history
-            try:
-                if await self.r.exists(TRADE_HISTORY_KEY):
-                    history = json.loads(await self.r.get(TRADE_HISTORY_KEY))
-                    self.daily_pnl = sum(t.get("pnl", 0) for t in history)
-                    self.trade_count = len(history)
-                    logger.info(f"📈 Recovered daily P&L: ₹{self.daily_pnl:.2f} from {self.trade_count} trades")
-            except Exception as e:
-                logger.error(f"Error recovering state: {e}")
-            
-            logger.info(f"⏰ Trading window: 12:30 PM - 3:10 PM | Square off: 3:24 PM")
-            
-            # Create tasks
-            tasks = [
-                asyncio.create_task(self.task_pubsub_listener()),
-                asyncio.create_task(self.task_key_fallback_poller()),
-                asyncio.create_task(self.task_square_off_scheduler()),
-                asyncio.create_task(self.task_candle_cache_refresh()),
-                asyncio.create_task(self.task_continuous_trailing_stop_loss()),
-                asyncio.create_task(self.task_status_monitor()),
-                asyncio.create_task(self.task_symbol_refresh()),
-            ]
-            
-            try:
-                await asyncio.gather(*tasks)
-            except asyncio.CancelledError:
-                logger.info("Tasks cancelled")
-            except Exception as e:
-                logger.exception(f"Unexpected error in main loop: {e}")
-            finally:
-                for t in tasks:
-                    t.cancel()
-                await self.r.close()
+        logger.info("TradingBot starting with trailing stop loss and ATR filtering…")
+        
+        if not await self.load_symbols():
+            logger.warning("Symbols not available yet — will retry via symbol_refresh task")
+        
+        # Recover any existing positions
+        await self.recover_open_position()
+        
+        # Recover daily P&L from trade history
+        try:
+            if await self.r.exists(TRADE_HISTORY_KEY):
+                history = json.loads(await self.r.get(TRADE_HISTORY_KEY))
+                self.daily_pnl = sum(t.get("pnl", 0) for t in history)
+                self.trade_count = len(history)
+                logger.info(f"📈 Recovered daily P&L: ₹{self.daily_pnl:.2f} from {self.trade_count} trades")
+        except Exception as e:
+            logger.error(f"Error recovering state: {e}")
+        
+        logger.info(f"⏰ Trading window: 12:30 PM - 3:10 PM | Square off: 3:24 PM")
+        logger.info(f"📊 Market data flows all the time — trades only in trading window")
+        
+        # Create tasks
+        tasks = [
+            asyncio.create_task(self.task_pubsub_listener()),
+            asyncio.create_task(self.task_key_fallback_poller()),
+            asyncio.create_task(self.task_square_off_scheduler()),
+            asyncio.create_task(self.task_candle_cache_refresh()),
+            asyncio.create_task(self.task_continuous_trailing_stop_loss()),
+            asyncio.create_task(self.task_status_monitor()),
+            asyncio.create_task(self.task_symbol_refresh()),
+        ]
+        
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            logger.info("Tasks cancelled")
+        except Exception as e:
+            logger.exception(f"Unexpected error in main loop: {e}")
+        finally:
+            for t in tasks:
+                t.cancel()
+            await self.r.close()
 
 # --------------------------- entrypoint ---------------------------
 if __name__ == "__main__":
     bot = TradingBot()
-    while True:
-        if bot.is_market_hours():
-            try:
-                asyncio.run(bot.run())
-            except KeyboardInterrupt:
-                logger.info("Bot stopped by user")
-                break
-            except Exception as e:
-                logger.exception(f"Unexpected error: {e}")
-                time.sleep(0.1)  # prevent tight retry loop
-        else:
-            print("⏳ Market closed. Waiting for market hours...")
-            time.sleep(1)
+    try:
+        asyncio.run(bot.run())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.exception(f"Unexpected error: {e}")

@@ -8,10 +8,11 @@ import {
     api, clearTokens,
     type PortfolioData, type TradeRecord, type UserProfile,
     type UserSettings, type MarketData, type CandleData,
+    type ScannerStock, type ScannerRankingItem, type ScannerRankingsResponse,
 } from '@/lib/api';
 // lightweight-charts is imported dynamically in useEffect (SSR-safe)
 
-type Tab = 'overview' | 'charts' | 'trades' | 'settings';
+type Tab = 'overview' | 'charts' | 'trades' | 'settings' | 'scanner';
 type ChartTarget = 'NIFTY' | 'CE' | 'PE';
 
 /* ─── Indicator math ─── */
@@ -121,6 +122,18 @@ export default function DashboardPage() {
     const [priceMin, setPriceMin] = useState(110);
     const [priceMax, setPriceMax] = useState(150);
 
+    // Scanner state
+    const [scannerStocks, setScannerStocks] = useState<ScannerStock[]>([]);
+    const [scannerRankings, setScannerRankings] = useState<ScannerRankingsResponse | null>(null);
+    const [scannerSearch, setScannerSearch] = useState('');
+    const [scannerSort, setScannerSort] = useState<'symbol' | 'change_pct' | 'ltp'>('change_pct');
+    const [scannerSortDir, setScannerSortDir] = useState<'asc' | 'desc'>('desc');
+    const [scannerChartSymbol, setScannerChartSymbol] = useState<string | null>(null);
+    const [scannerCandles, setScannerCandles] = useState<CandleData[]>([]);
+    const scannerChartContainerRef = useRef<HTMLDivElement>(null);
+    const scannerChartApiRef = useRef<any>(null);
+    const scannerCandleSeriesRef = useRef<any>(null);
+
     /* ─── Load initial data ─── */
     const loadData = useCallback(async () => {
         try {
@@ -156,6 +169,86 @@ export default function DashboardPage() {
         }, 5000);
         return () => clearInterval(iv);
     }, []);
+
+    /* ─── Scanner: load stocks + rankings when scanner tab active ─── */
+    useEffect(() => {
+        if (tab !== 'scanner') return;
+        let active = true;
+        const loadScanner = async () => {
+            try {
+                const [stocks, rankings] = await Promise.all([
+                    api.getScannerStocks(),
+                    api.getScannerRankings(),
+                ]);
+                if (active) {
+                    setScannerStocks(stocks.stocks || []);
+                    setScannerRankings(rankings);
+                }
+            } catch { /* ignore */ }
+        };
+        loadScanner();
+        const iv = setInterval(loadScanner, 30000); // refresh every 30s
+        return () => { active = false; clearInterval(iv); };
+    }, [tab]);
+
+    /* ─── Scanner: chart for selected stock ─── */
+    useEffect(() => {
+        if (!scannerChartSymbol || tab !== 'scanner') return;
+        let active = true;
+        const loadCandles = () => {
+            api.getScannerCandles(scannerChartSymbol).then(res => {
+                if (active) setScannerCandles(res.candles || []);
+            }).catch(() => { });
+        };
+        loadCandles();
+        const iv = setInterval(loadCandles, 5000);
+        return () => { active = false; clearInterval(iv); };
+    }, [scannerChartSymbol, tab]);
+
+    /* ─── Scanner: render chart ─── */
+    useEffect(() => {
+        if (tab !== 'scanner' || !scannerChartSymbol || !scannerChartContainerRef.current) return;
+        let chartCreated = false;
+        (async () => {
+            const lc = await import('lightweight-charts');
+            if (!scannerChartContainerRef.current) return;
+
+            if (scannerChartApiRef.current) {
+                // Update data in-place
+                if (scannerCandleSeriesRef.current && scannerCandles.length > 0) {
+                    scannerCandleSeriesRef.current.setData(scannerCandles as any);
+                }
+                return;
+            }
+
+            const chart = lc.createChart(scannerChartContainerRef.current, {
+                width: scannerChartContainerRef.current.clientWidth,
+                height: 380,
+                layout: { background: { color: '#0d1117' }, textColor: '#8b949e' },
+                grid: { vertLines: { color: '#161b2233' }, horzLines: { color: '#161b2233' } },
+                crosshair: { mode: lc.CrosshairMode.Normal },
+                timeScale: { timeVisible: true, secondsVisible: false },
+            });
+            const series = chart.addCandlestickSeries({
+                upColor: '#00d97e', downColor: '#e5283e',
+                borderUpColor: '#00d97e', borderDownColor: '#e5283e',
+                wickUpColor: '#00d97e66', wickDownColor: '#e5283e66',
+            });
+            if (scannerCandles.length > 0) series.setData(scannerCandles as any);
+            chart.timeScale().fitContent();
+            scannerChartApiRef.current = chart;
+            scannerCandleSeriesRef.current = series;
+            chartCreated = true;
+        })();
+
+        return () => {
+            if (chartCreated && scannerChartApiRef.current) {
+                scannerChartApiRef.current.remove();
+                scannerChartApiRef.current = null;
+                scannerCandleSeriesRef.current = null;
+            }
+        };
+    }, [scannerCandles, scannerChartSymbol, tab]);
 
     /* ─── Load candles when chart tab or target changes ─── */
     useEffect(() => {
@@ -446,10 +539,10 @@ export default function DashboardPage() {
 
                 {/* ─── Tabs ─── */}
                 <div style={{ display: 'flex', gap: '4px', marginBottom: '20px' }}>
-                    {(['overview', 'charts', 'trades', 'settings'] as Tab[]).map(t => (
+                    {(['overview', 'charts', 'trades', 'settings', 'scanner'] as Tab[]).map(t => (
                         <button key={t} className={`btn btn-sm ${tab === t ? 'btn-primary' : 'btn-outline'}`}
                             onClick={() => setTab(t)} style={{ textTransform: 'capitalize' }}>
-                            {t === 'overview' ? '📊 Overview' : t === 'charts' ? '📈 Charts' : t === 'trades' ? '📜 Trades' : '⚙️ Settings'}
+                            {t === 'overview' ? '📊 Overview' : t === 'charts' ? '📈 Charts' : t === 'trades' ? '📜 Trades' : t === 'settings' ? '⚙️ Settings' : '🔍 Scanner'}
                         </button>
                     ))}
                 </div>
@@ -738,6 +831,152 @@ export default function DashboardPage() {
                                             <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>Auto square-off: {settings?.square_off_time}</div>
                                         </div>
                                     </div>
+                                </div>
+                            </div>
+                        </motion.div>
+                    )}
+
+                    {/* ════════════ SCANNER ════════════ */}
+                    {tab === 'scanner' && (
+                        <motion.div key="scanner" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}>
+                            {/* Gap Rankings Section */}
+                            <div className="grid-2" style={{ marginBottom: '24px' }}>
+                                {/* Gap Up Card */}
+                                <div className="glass" style={{ padding: '24px', borderLeft: '3px solid var(--accent-green)' }}>
+                                    <h3 style={{ marginBottom: '16px', color: 'var(--accent-green)' }}>📈 Gap-Up Candidates</h3>
+                                    {scannerRankings?.timestamp && (
+                                        <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginBottom: '12px' }}>Updated: {scannerRankings.timestamp}</div>
+                                    )}
+                                    {(!scannerRankings?.gap_up || scannerRankings.gap_up.length === 0) ? (
+                                        <div style={{ color: 'var(--text-muted)', fontSize: '13px' }}>{scannerRankings?.message || 'No gap-up candidates yet'}</div>
+                                    ) : (
+                                        <div style={{ maxHeight: '320px', overflowY: 'auto' }}>
+                                            <table className="table" style={{ fontSize: '12px' }}>
+                                                <thead><tr>
+                                                    <th>#</th><th>Symbol</th><th>Score</th><th>LTP</th><th>Chg%</th><th>RSI</th><th>Reason</th>
+                                                </tr></thead>
+                                                <tbody>
+                                                    {scannerRankings.gap_up.slice(0, 10).map((s, i) => (
+                                                        <tr key={s.symbol} style={{ cursor: 'pointer' }} onClick={() => { setScannerChartSymbol(s.symbol); }}>
+                                                            <td>{i + 1}</td>
+                                                            <td style={{ fontWeight: 600 }}>{s.symbol}</td>
+                                                            <td className="mono" style={{ color: 'var(--accent-green)', fontWeight: 700 }}>{s.score}</td>
+                                                            <td className="mono">₹{s.ltp.toFixed(2)}</td>
+                                                            <td className={s.change_pct >= 0 ? 'pnl-positive' : 'pnl-negative'}>{s.change_pct >= 0 ? '+' : ''}{s.change_pct}%</td>
+                                                            <td className="mono">{s.rsi.toFixed(0)}</td>
+                                                            <td style={{ fontSize: '11px', color: 'var(--text-secondary)', maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.reason}</td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    )}
+                                </div>
+
+                                {/* Gap Down Card */}
+                                <div className="glass" style={{ padding: '24px', borderLeft: '3px solid var(--accent-red)' }}>
+                                    <h3 style={{ marginBottom: '16px', color: 'var(--accent-red)' }}>📉 Gap-Down Candidates</h3>
+                                    {scannerRankings?.timestamp && (
+                                        <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginBottom: '12px' }}>Updated: {scannerRankings.timestamp}</div>
+                                    )}
+                                    {(!scannerRankings?.gap_down || scannerRankings.gap_down.length === 0) ? (
+                                        <div style={{ color: 'var(--text-muted)', fontSize: '13px' }}>{scannerRankings?.message || 'No gap-down candidates yet'}</div>
+                                    ) : (
+                                        <div style={{ maxHeight: '320px', overflowY: 'auto' }}>
+                                            <table className="table" style={{ fontSize: '12px' }}>
+                                                <thead><tr>
+                                                    <th>#</th><th>Symbol</th><th>Score</th><th>LTP</th><th>Chg%</th><th>RSI</th><th>Reason</th>
+                                                </tr></thead>
+                                                <tbody>
+                                                    {scannerRankings.gap_down.slice(0, 10).map((s, i) => (
+                                                        <tr key={s.symbol} style={{ cursor: 'pointer' }} onClick={() => { setScannerChartSymbol(s.symbol); }}>
+                                                            <td>{i + 1}</td>
+                                                            <td style={{ fontWeight: 600 }}>{s.symbol}</td>
+                                                            <td className="mono" style={{ color: 'var(--accent-red)', fontWeight: 700 }}>{s.score}</td>
+                                                            <td className="mono">₹{s.ltp.toFixed(2)}</td>
+                                                            <td className={s.change_pct >= 0 ? 'pnl-positive' : 'pnl-negative'}>{s.change_pct >= 0 ? '+' : ''}{s.change_pct}%</td>
+                                                            <td className="mono">{s.rsi.toFixed(0)}</td>
+                                                            <td style={{ fontSize: '11px', color: 'var(--text-secondary)', maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.reason}</td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Scanner Chart Panel */}
+                            {scannerChartSymbol && (
+                                <div className="glass" style={{ padding: '20px', marginBottom: '24px' }}>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                                        <h3 style={{ margin: 0 }}>📊 {scannerChartSymbol} — 5 Min Candles</h3>
+                                        <button className="btn btn-sm btn-outline" onClick={() => { setScannerChartSymbol(null); setScannerCandles([]); if (scannerChartApiRef.current) { scannerChartApiRef.current.remove(); scannerChartApiRef.current = null; scannerCandleSeriesRef.current = null; } }}>✕ Close</button>
+                                    </div>
+                                    <div ref={scannerChartContainerRef} style={{ width: '100%', height: '380px', borderRadius: '8px', overflow: 'hidden' }} />
+                                </div>
+                            )}
+
+                            {/* All Stocks Table */}
+                            <div className="glass" style={{ padding: '24px' }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', flexWrap: 'wrap', gap: '12px' }}>
+                                    <h3 style={{ margin: 0 }}>🔍 All F&O Stocks ({scannerStocks.filter(s => s.ltp > 0).length}/{scannerStocks.length})</h3>
+                                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                                        <input
+                                            className="input mono"
+                                            placeholder="Search symbol..."
+                                            value={scannerSearch}
+                                            onChange={e => setScannerSearch(e.target.value)}
+                                            style={{ width: '180px', padding: '6px 12px', fontSize: '13px' }}
+                                        />
+                                        <select
+                                            className="input mono"
+                                            value={scannerSort}
+                                            onChange={e => setScannerSort(e.target.value as any)}
+                                            style={{ padding: '6px 8px', fontSize: '12px', background: 'var(--bg-glass)', color: 'var(--text-primary)', border: '1px solid var(--border-glass)', borderRadius: '6px' }}
+                                        >
+                                            <option value="change_pct">Sort: Change%</option>
+                                            <option value="symbol">Sort: Symbol</option>
+                                            <option value="ltp">Sort: LTP</option>
+                                        </select>
+                                        <button className="btn btn-sm btn-outline" onClick={() => setScannerSortDir(d => d === 'asc' ? 'desc' : 'asc')}>
+                                            {scannerSortDir === 'desc' ? '↓' : '↑'}
+                                        </button>
+                                    </div>
+                                </div>
+                                <div style={{ maxHeight: '500px', overflowY: 'auto' }}>
+                                    <table className="table" style={{ fontSize: '12px' }}>
+                                        <thead><tr>
+                                            <th>Symbol</th><th>Type</th><th>LTP</th><th>Open</th><th>High</th><th>Low</th><th>Change%</th>
+                                        </tr></thead>
+                                        <tbody>
+                                            {scannerStocks
+                                                .filter(s => s.ltp > 0)
+                                                .filter(s => !scannerSearch || s.symbol.toLowerCase().includes(scannerSearch.toLowerCase()) || s.company_name.toLowerCase().includes(scannerSearch.toLowerCase()))
+                                                .sort((a, b) => {
+                                                    const dir = scannerSortDir === 'desc' ? -1 : 1;
+                                                    if (scannerSort === 'symbol') return dir * a.symbol.localeCompare(b.symbol);
+                                                    if (scannerSort === 'ltp') return dir * (a.ltp - b.ltp);
+                                                    return dir * (a.change_pct - b.change_pct);
+                                                })
+                                                .map(s => (
+                                                    <tr key={s.symbol} style={{ cursor: 'pointer' }} onClick={() => setScannerChartSymbol(s.symbol)}>
+                                                        <td style={{ fontWeight: 600 }}>
+                                                            {s.symbol}
+                                                            <span style={{ fontSize: '10px', color: 'var(--text-muted)', marginLeft: '6px' }}>{s.company_name.slice(0, 20)}</span>
+                                                        </td>
+                                                        <td><span style={{ fontSize: '10px', padding: '2px 6px', borderRadius: '4px', background: s.type === 'INDEX' ? 'var(--accent-blue)22' : 'var(--accent-purple)22', color: s.type === 'INDEX' ? 'var(--accent-blue)' : 'var(--accent-purple)' }}>{s.type}</span></td>
+                                                        <td className="mono" style={{ fontWeight: 600 }}>₹{s.ltp.toFixed(2)}</td>
+                                                        <td className="mono">₹{s.day_open.toFixed(2)}</td>
+                                                        <td className="mono">₹{s.day_high.toFixed(2)}</td>
+                                                        <td className="mono">₹{s.day_low.toFixed(2)}</td>
+                                                        <td className={s.change_pct >= 0 ? 'pnl-positive' : 'pnl-negative'} style={{ fontWeight: 700 }}>
+                                                            {s.change_pct >= 0 ? '+' : ''}{s.change_pct.toFixed(2)}%
+                                                        </td>
+                                                    </tr>
+                                                ))}
+                                        </tbody>
+                                    </table>
                                 </div>
                             </div>
                         </motion.div>
