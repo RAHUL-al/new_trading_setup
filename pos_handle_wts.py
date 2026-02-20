@@ -735,12 +735,39 @@ class TradingBot:
                 daily_emoji = "📈" if self.daily_pnl >= 0 else "📉"
                 logger.info(f"{daily_emoji} FINAL DAY P&L: ₹{self.daily_pnl:.2f} | Trades: {self.trade_count}")
                 
-                logger.info("🧹 Cleaning up Redis (keeping trade_history and SCAN: keys)...")
+                # ─── Smart cleanup: keep 10 days of history ───
+                logger.info("🧹 Smart cleanup: keeping last 10 days of data...")
                 all_keys = await self.r.keys("*")
-                keys_to_delete = [k for k in all_keys if not k.startswith("trade_history_") and not k.startswith("SCAN:")]
+
+                # Patterns to ALWAYS preserve (regardless of age)
+                keep_prefixes = ("trade_history_", "SCAN:")
+
+                # Patterns for date-keyed historical data (keep last 10 days)
+                history_prefixes = ("CANDLE:", "HISTORY:")
+
+                # Build set of valid date suffixes (last 10 days)
+                valid_dates = set()
+                for i in range(10):
+                    d = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+                    valid_dates.add(d)
+
+                keys_to_delete = []
+                for k in all_keys:
+                    # Always keep trade_history and SCAN keys
+                    if any(k.startswith(pfx) for pfx in keep_prefixes):
+                        continue
+
+                    # For CANDLE:/HISTORY: keys, check if they contain a recent date
+                    if any(pfx in k for pfx in history_prefixes):
+                        if any(d in k for d in valid_dates):
+                            continue  # Recent history — keep it
+
+                    # Delete everything else (session keys, old data)
+                    keys_to_delete.append(k)
+
                 if keys_to_delete:
                     await self.r.delete(*keys_to_delete)
-                    logger.info(f"🗑️ Deleted {len(keys_to_delete)} Redis keys")
+                    logger.info(f"🗑️ Deleted {len(keys_to_delete)} session/old keys (kept {len(all_keys) - len(keys_to_delete)} history keys)")
                 
                 logger.info("✅ Market day complete. All cleaned up.")
                 squared_off_today = True

@@ -239,19 +239,39 @@ def run_websocket():
 # ─────────── Market Close Cleanup ───────────
 
 def market_close_cleanup():
-    """At 3:30 PM: delete all Redis keys except trade_history_*."""
+    """At 3:30 PM: smart cleanup — keep last 10 days of history data."""
     while True:
         now = datetime.datetime.now(INDIA_TZ)
         market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
 
         if now >= market_close:
             try:
-                # Delete ALL Redis keys except trade_history_*
                 all_keys = r.keys("*")
-                keys_to_delete = [k for k in all_keys if not k.startswith("trade_history_")]
+
+                # Patterns to ALWAYS preserve
+                keep_prefixes = ("trade_history_", "SCAN:")
+
+                # Date-keyed historical data patterns
+                history_prefixes = ("CANDLE:", "HISTORY:")
+
+                # Build set of valid date suffixes (last 10 days)
+                valid_dates = set()
+                for i in range(10):
+                    d = (now - datetime.timedelta(days=i)).strftime("%Y-%m-%d")
+                    valid_dates.add(d)
+
+                keys_to_delete = []
+                for k in all_keys:
+                    if any(k.startswith(pfx) for pfx in keep_prefixes):
+                        continue
+                    if any(pfx in k for pfx in history_prefixes):
+                        if any(d in k for d in valid_dates):
+                            continue
+                    keys_to_delete.append(k)
+
                 if keys_to_delete:
                     r.delete(*keys_to_delete)
-                    logger.info(f"🗑️ Deleted {len(keys_to_delete)} Redis keys (kept trade_history)")
+                    logger.info(f"🗑️ Deleted {len(keys_to_delete)} session/old keys (kept {len(all_keys) - len(keys_to_delete)} history keys)")
                 logger.info("✅ Market close cleanup completed.")
 
             except Exception as e:
