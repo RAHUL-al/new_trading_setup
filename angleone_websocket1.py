@@ -327,19 +327,12 @@ def rma(series, period):
     return series.ewm(alpha=1/period, adjust=False).mean()
 
 
-def calculate_ut_bot(data, a=2, c=100, h=False):
-    """
-    UT Bot Alert indicator with proper ATR:
-    - True Range using High/Low/prev_Close (full candle)
-    - RMA smoothing (Wilder's method, alpha=1/c)
-    - a = ATR multiplier (key value), c = ATR period (sensitivity)
-    """
-    # ATR using True Range + RMA (not close-to-close EWM)
-    true_range = calculate_true_range(data)
-    xATR = rma(true_range, c)
+def calculate_indicators(data, a=2, c=100, h=False):
+    """UT Bot Alert indicator — uses ewm-based ATR for trailing stop (user's exact code)."""
+    xATR = data['Close'].diff().abs().ewm(span=c, adjust=False).mean()
     nLoss = a * xATR
     src = data['Close']
-    xATRTrailingStop = pd.Series(index=data.index, dtype=float)
+    xATRTrailingStop = pd.Series(index=data.index)
 
     for i in range(len(data)):
         if i == 0:
@@ -372,7 +365,16 @@ def calculate_ut_bot(data, a=2, c=100, h=False):
     signals['buy'] = buy
     signals['sell'] = sell
 
-    return signals, xATR
+    return signals
+
+
+def calculate_atr_rma(data, period=14):
+    """Separate ATR using True Range + RMA (Wilder's smoothing), period=14.
+    Used independently to gate new position entries (ATR > 6.90).
+    UT Bot signals are NOT affected by this — they always fire."""
+    true_range = calculate_true_range(data)
+    atr = rma(true_range, period)
+    return atr
 
 
 async def nifty_signal_engine():
@@ -390,7 +392,7 @@ async def nifty_signal_engine():
     last_candle_count = 0
     last_published_candle_time = None
 
-    logger.info("⚡ Starting async NIFTY signal engine (UT Bot a=2, c=100, RMA ATR, threshold=6.9)...")
+    logger.info("⚡ Starting async NIFTY signal engine (UT Bot a=2, c=100, EWM | Separate RMA ATR(14) > 6.9 for gating)...")
 
     while True:
         try:
@@ -433,11 +435,14 @@ async def nifty_signal_engine():
             if "Volume" in df.columns:
                 df["Volume"] = df["Volume"].astype(float)
 
-            # Run UT Bot (now with True Range + RMA)
-            signals, xATR = calculate_ut_bot(df, a=2, c=100)
+            # UT Bot signals (ewm-based, independent — always fires)
+            signals = calculate_indicators(df, a=2, c=100)
 
-            # Store ATR in Redis (non-blocking) — pos_handle_wts reads this
-            current_atr = xATR.iloc[-1]
+            # Separate ATR with RMA for gating (period=14)
+            atr_series = calculate_atr_rma(df, period=14)
+            current_atr = atr_series.iloc[-1]
+
+            # Store ATR in Redis — pos_handle_wts reads this to gate new entries
             if pd.notna(current_atr):
                 await ar.set(f"{REDIS_PREFIX}ATR_value", str(round(current_atr, 2)))
 

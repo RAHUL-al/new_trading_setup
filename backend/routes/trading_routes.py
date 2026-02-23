@@ -5,6 +5,8 @@ from sqlalchemy.orm import Session
 from datetime import datetime, timezone
 import redis
 import json
+import os
+import csv
 
 from database import get_db
 from auth import get_current_user
@@ -402,9 +404,6 @@ def get_candles(
 
 # ─── Scanner APIs ────────────────────────────────────────────────────
 
-import os
-import pandas as pd
-
 SCANNER_CSV = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scanner_all_tokens.csv")
 
 
@@ -460,7 +459,10 @@ def get_scanner_stocks(
         if not os.path.exists(SCANNER_CSV):
             return {"stocks": [], "error": "scanner_all_tokens.csv not found. Run stock_scanner_setup.py first."}
 
-        df = pd.read_csv(SCANNER_CSV)
+        with open(SCANNER_CSV, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+
         r = redis.StrictRedis(
             host="localhost", port=6379,
             password="Rahul@7355", db=0, decode_responses=True
@@ -468,7 +470,7 @@ def get_scanner_stocks(
         date_key = datetime.now().strftime("%Y-%m-%d")
 
         stocks = []
-        for _, row in df.iterrows():
+        for row in rows:
             symbol = str(row.get("pSymbolName", ""))
             token = str(row.get("pSymbol", ""))
             stock_type = str(row.get("type", "STOCK"))
@@ -484,6 +486,12 @@ def get_scanner_stocks(
             day_low = float(low_raw) if low_raw else 0
             change_pct = ((ltp - day_open) / day_open * 100) if day_open > 0 else 0
 
+            vfq = row.get("vol_freeze_qty", "0")
+            try:
+                vfq_int = int(float(vfq)) if vfq else 0
+            except (ValueError, TypeError):
+                vfq_int = 0
+
             stocks.append({
                 "token": token,
                 "symbol": symbol,
@@ -495,7 +503,7 @@ def get_scanner_stocks(
                 "day_high": round(day_high, 2),
                 "day_low": round(day_low, 2),
                 "change_pct": round(change_pct, 2),
-                "vol_freeze_qty": int(row.get("vol_freeze_qty", 0)),
+                "vol_freeze_qty": vfq_int,
             })
 
         return {"date": date_key, "total": len(stocks), "stocks": stocks}
@@ -530,9 +538,8 @@ def get_scanner_candles(
                 ts = c.get("timestamp", "")
                 # Convert to unix epoch for lightweight-charts
                 try:
-                    from datetime import datetime as dt2
-                    epoch = int(dt2.strptime(ts[:16], "%Y-%m-%d %H:%M").timestamp())
-                except:
+                    epoch = int(datetime.strptime(ts[:16], "%Y-%m-%d %H:%M").timestamp())
+                except Exception:
                     epoch = 0
 
                 candles.append({
@@ -555,8 +562,7 @@ def get_scanner_candles(
         if current_raw:
             try:
                 c = json.loads(current_raw)
-                from datetime import datetime as dt2
-                epoch = int(dt2.strptime(candle_time, "%Y-%m-%d %H:%M").timestamp())
+                epoch = int(datetime.strptime(candle_time, "%Y-%m-%d %H:%M").timestamp())
                 candles.append({
                     "time": epoch,
                     "open": float(c.get("open", 0)),
