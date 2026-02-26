@@ -17,10 +17,14 @@ import os
 from multiprocessing import Process
 
 # ─────────── Config (read from environment, set by BotManager) ───────────
-TOTP_TOKEN = os.environ.get("ANGELONE_TOTP_SECRET", "33OUTDUE57WS3TUPHPLFUCGHFM")
-API_KEY = os.environ.get("ANGELONE_API_KEY", "Ytt1NkKD")
-CLIENT_ID = os.environ.get("ANGELONE_CLIENT_ID", "R865920")
-PWD = os.environ.get("ANGELONE_PASSWORD", "7355")
+TOTP_TOKEN = os.environ.get("ANGELONE_TOTP_SECRET", "OIN6QBZAYV4I26Q55OYASIEQVY")
+API_KEY = os.environ.get("ANGELONE_API_KEY", "SsUDlNA9")
+CLIENT_ID = os.environ.get("ANGELONE_CLIENT_ID", "A1079871")
+PWD = os.environ.get("ANGELONE_PASSWORD", "0465")
+# TOTP_TOKEN = os.environ.get("ANGELONE_TOTP_SECRET", "33OUTDUE57WS3TUPHPLFUCGHFM")
+# API_KEY = os.environ.get("ANGELONE_API_KEY", "Ytt1NkKD")
+# CLIENT_ID = os.environ.get("ANGELONE_CLIENT_ID", "R865920")
+# PWD = os.environ.get("ANGELONE_PASSWORD", "7355")
 
 REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
