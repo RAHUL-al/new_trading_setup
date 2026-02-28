@@ -1,13 +1,19 @@
 """
-fetch_nifty_data.py — Fetch NIFTY 50 historical 1-minute candle data from AngelOne SmartAPI.
+fetch_nifty_data.py — Fetch NIFTY 50 historical candle data from AngelOne SmartAPI.
 
 Usage:
-    python fetch_nifty_data.py
+    python fetch_nifty_data.py                          # Fetches all timeframes
+    python fetch_nifty_data.py --interval ONE_MINUTE    # Only 1-min
+    python fetch_nifty_data.py --interval THREE_MINUTE  # Only 3-min
+    python fetch_nifty_data.py --interval FIVE_MINUTE   # Only 5-min
 
-Output: nifty_1min_data.csv with columns: Time, Open, High, Low, Close, Volume
+Output files:
+    nifty_1min_data.csv   (from 2025-01-01)
+    nifty_3min_data.csv   (from 2024-01-01 — more data per request)
+    nifty_5min_data.csv   (from 2024-01-01 — even more data per request)
 
-Note: AngelOne limits ~30 days per request for 1-minute data.
-      This script automatically paginates to fetch full date range.
+Note: AngelOne limits ~2000 candles per request.
+      Larger intervals = more days per chunk = can go further back.
 """
 
 from SmartApi import SmartConnect
@@ -27,17 +33,25 @@ PWD = os.environ.get("ANGELONE_PASSWORD", "0465")
 
 NIFTY_TOKEN = "99926000"
 NIFTY_EXCHANGE = "NSE"
-INTERVAL = "ONE_MINUTE"
 
-# How far back to fetch (AngelOne allows ~2000 candles per request for 1-min)
-# 1 trading day = ~375 candles (9:15 to 15:30 = 375 minutes)
-# Safe chunk = 5 trading days (~1875 candles per request)
-CHUNK_DAYS = 5
-
-# Fetch data from this date
-FROM_DATE = os.environ.get("FETCH_FROM_DATE", "2025-01-01")
-
-OUTPUT_FILE = "nifty_1min_data.csv"
+# Each interval config: chunk_days, default_from_date, output_file
+INTERVAL_CONFIG = {
+    "ONE_MINUTE": {
+        "chunk_days": 5,         # ~1875 candles (375/day × 5)
+        "from_date": "2025-01-01",
+        "output_file": "nifty_1min_data.csv",
+    },
+    "THREE_MINUTE": {
+        "chunk_days": 15,        # ~1875 candles (125/day × 15)
+        "from_date": "2024-01-01",
+        "output_file": "nifty_3min_data.csv",
+    },
+    "FIVE_MINUTE": {
+        "chunk_days": 25,        # ~1875 candles (75/day × 25)
+        "from_date": "2024-01-01",
+        "output_file": "nifty_5min_data.csv",
+    },
+}
 
 
 def connect_api():
@@ -57,13 +71,13 @@ def connect_api():
     return smart_api
 
 
-def fetch_candles(smart_api, from_date, to_date):
-    """Fetch 1-minute candles for NIFTY between two dates."""
+def fetch_candles(smart_api, from_date, to_date, interval):
+    """Fetch candles for NIFTY between two dates."""
     try:
         params = {
             "exchange": NIFTY_EXCHANGE,
             "symboltoken": NIFTY_TOKEN,
-            "interval": INTERVAL,
+            "interval": interval,
             "fromdate": f"{from_date} 09:15",
             "todate": f"{to_date} 15:30",
         }
@@ -83,44 +97,46 @@ def fetch_candles(smart_api, from_date, to_date):
         return pd.DataFrame()
 
 
-def get_trading_days(start_date, end_date):
-    """Generate date chunks for pagination (skip weekends)."""
+def get_date_chunks(start_date, end_date, chunk_days):
+    """Generate date chunks for pagination."""
     chunks = []
     current = start_date
 
     while current < end_date:
-        chunk_end = min(current + timedelta(days=CHUNK_DAYS - 1), end_date)
+        chunk_end = min(current + timedelta(days=chunk_days - 1), end_date)
         chunks.append((current.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
         current = chunk_end + timedelta(days=1)
 
     return chunks
 
 
-def main():
-    logger.info("=" * 60)
-    logger.info("NIFTY 1-MINUTE DATA FETCHER")
-    logger.info("=" * 60)
+def fetch_interval(smart_api, interval):
+    """Fetch all data for a specific interval."""
+    config = INTERVAL_CONFIG[interval]
+    from_override = os.environ.get("FETCH_FROM_DATE")
+    from_date = from_override if from_override else config["from_date"]
+    output_file = config["output_file"]
+    chunk_days = config["chunk_days"]
 
-    # Parse date range
-    start_date = datetime.strptime(FROM_DATE, "%Y-%m-%d")
+    start_date = datetime.strptime(from_date, "%Y-%m-%d")
     end_date = datetime.now()
 
-    logger.info(f"Date range: {start_date.strftime('%Y-%m-%d')} → {end_date.strftime('%Y-%m-%d')}")
-    logger.info(f"Interval: {INTERVAL}")
-    logger.info(f"Token: {NIFTY_TOKEN} (NIFTY 50)")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"FETCHING {interval} DATA")
+    logger.info(f"  Date range: {from_date} → {end_date.strftime('%Y-%m-%d')}")
+    logger.info(f"  Chunk size: {chunk_days} days")
+    logger.info(f"  Output: {output_file}")
+    logger.info(f"{'='*60}")
 
-    # Connect to API
-    smart_api = connect_api()
-
-    # Generate date chunks
-    chunks = get_trading_days(start_date, end_date)
-    logger.info(f"Total chunks to fetch: {len(chunks)}")
+    # Generate chunks
+    chunks = get_date_chunks(start_date, end_date, chunk_days)
+    logger.info(f"Total chunks: {len(chunks)}")
 
     # Fetch all chunks
     all_data = []
     for i, (from_d, to_d) in enumerate(chunks):
         logger.info(f"[{i+1}/{len(chunks)}] Fetching {from_d} → {to_d}...")
-        df = fetch_candles(smart_api, from_d, to_d)
+        df = fetch_candles(smart_api, from_d, to_d, interval)
 
         if not df.empty:
             all_data.append(df)
@@ -128,12 +144,12 @@ def main():
         else:
             logger.info(f"  No data (weekend/holiday?)")
 
-        # Rate limit: wait between requests
+        # Rate limit
         if i < len(chunks) - 1:
             time.sleep(0.5)
 
     if not all_data:
-        logger.error("No data fetched at all! Check credentials and date range.")
+        logger.error(f"No data fetched for {interval}!")
         return
 
     # Combine and deduplicate
@@ -151,17 +167,38 @@ def main():
     ].drop(columns=["time_only"])
 
     # Save to CSV
-    combined.to_csv(OUTPUT_FILE, index=False)
+    combined.to_csv(output_file, index=False)
 
     # Summary
     total_days = combined["Time"].dt.date.nunique()
-    logger.info("=" * 60)
-    logger.info(f"FETCH COMPLETE")
+    logger.info(f"\n✅ {interval} FETCH COMPLETE")
     logger.info(f"  Total candles: {len(combined)}")
     logger.info(f"  Trading days:  {total_days}")
     logger.info(f"  Date range:    {combined['Time'].iloc[0]} → {combined['Time'].iloc[-1]}")
-    logger.info(f"  Saved to:      {OUTPUT_FILE}")
-    logger.info("=" * 60)
+    logger.info(f"  Saved to:      {output_file}")
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Fetch NIFTY historical candle data")
+    parser.add_argument("--interval", default="ALL",
+                        choices=["ONE_MINUTE", "THREE_MINUTE", "FIVE_MINUTE", "ALL"],
+                        help="Which interval to fetch (default: ALL)")
+    args = parser.parse_args()
+
+    # Connect once
+    smart_api = connect_api()
+
+    if args.interval == "ALL":
+        # Fetch all three timeframes
+        for interval in ["ONE_MINUTE", "THREE_MINUTE", "FIVE_MINUTE"]:
+            fetch_interval(smart_api, interval)
+    else:
+        fetch_interval(smart_api, args.interval)
+
+    logger.info(f"\n{'='*60}")
+    logger.info(f"ALL DONE!")
+    logger.info(f"{'='*60}")
 
 
 if __name__ == "__main__":

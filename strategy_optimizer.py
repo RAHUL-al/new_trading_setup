@@ -58,11 +58,11 @@ class Trade:
 
 # ─────────── Indicator Functions ───────────
 
-def resample_to_5min(df_1min: pd.DataFrame) -> pd.DataFrame:
-    """Resample 1-min candles to 5-min candles."""
+def resample_candles(df_1min: pd.DataFrame, interval_min: int = 3) -> pd.DataFrame:
+    """Resample 1-min candles to any interval (3-min, 5-min, etc.)."""
     df = df_1min.copy()
     df = df.set_index('Time')
-    resampled = df.resample('5min', label='left', closed='left').agg({
+    resampled = df.resample(f'{interval_min}min', label='left', closed='left').agg({
         'Open': 'first',
         'High': 'max',
         'Low': 'min',
@@ -338,50 +338,31 @@ def calc_metrics(trades):
 
 # ─────────── Strategy Runners ───────────
 
-def test_ut_bot_5min(df_1min, a=2, c=100, atr_gate=6.9, sl_mult=1.5, min_hold=3):
-    """UT Bot on 5-minute candles."""
+def test_strategy_resampled(df_1min, strategy_fn, interval_min=3, min_candles=10, **kwargs):
+    """Generic runner: resample to N-min, apply strategy, backtest."""
     results = []
     for day, day_1min in df_1min.groupby(df_1min['Time'].dt.date):
-        day_5min = resample_to_5min(day_1min)
-        if len(day_5min) < 10:
+        day_resampled = resample_candles(day_1min, interval_min=interval_min)
+        if len(day_resampled) < min_candles:
             continue
-        buy, sell = calculate_ut_bot(day_5min, a=a, c=c)
-        atr = calculate_atr(day_5min, 14)
-        trades = run_backtest(day_5min, buy, sell, atr,
-                              atr_gate=atr_gate, sl_atr_mult=sl_mult,
-                              min_hold=min_hold, trail_atr_mult=2.0)
-        results.extend(trades)
-    return results
 
+        # Get signals from strategy function
+        signals = strategy_fn(day_resampled, **{k: v for k, v in kwargs.items()
+                              if k not in ('atr_gate', 'sl_mult', 'min_hold', 'trail_mult')})
 
-def test_supertrend_5min(df_1min, period=10, multiplier=3.0, atr_gate=0, sl_mult=1.5, min_hold=2):
-    """Supertrend on 5-minute candles."""
-    results = []
-    for day, day_1min in df_1min.groupby(df_1min['Time'].dt.date):
-        day_5min = resample_to_5min(day_1min)
-        if len(day_5min) < 10:
-            continue
-        buy, sell, st, direction = calculate_supertrend(day_5min, period=period, multiplier=multiplier)
-        atr = calculate_atr(day_5min, 14)
-        trades = run_backtest(day_5min, buy, sell, atr,
-                              atr_gate=atr_gate, sl_atr_mult=sl_mult,
-                              min_hold=min_hold, trail_atr_mult=2.0)
-        results.extend(trades)
-    return results
+        if len(signals) == 2:
+            buy, sell = signals
+        else:
+            buy, sell = signals[0], signals[1]
 
-
-def test_ema_cross_5min(df_1min, fast=9, slow=21, atr_gate=0, sl_mult=1.5, min_hold=2):
-    """EMA Crossover on 5-minute candles."""
-    results = []
-    for day, day_1min in df_1min.groupby(df_1min['Time'].dt.date):
-        day_5min = resample_to_5min(day_1min)
-        if len(day_5min) < 30:
-            continue
-        buy, sell = calculate_ema_crossover(day_5min, fast=fast, slow=slow)
-        atr = calculate_atr(day_5min, 14)
-        trades = run_backtest(day_5min, buy, sell, atr,
-                              atr_gate=atr_gate, sl_atr_mult=sl_mult,
-                              min_hold=min_hold, trail_atr_mult=2.0)
+        atr = calculate_atr(day_resampled, 14)
+        trades = run_backtest(
+            day_resampled, buy, sell, atr,
+            atr_gate=kwargs.get('atr_gate', 0),
+            sl_atr_mult=kwargs.get('sl_mult', 2.0),
+            min_hold=kwargs.get('min_hold', 2),
+            trail_atr_mult=kwargs.get('trail_mult', 2.0),
+        )
         results.extend(trades)
     return results
 
@@ -414,10 +395,22 @@ def main():
         return
 
     print("Loading data...")
-    df = pd.read_csv(args.file)
-    df['Time'] = pd.to_datetime(df['Time'])
-    df = df.sort_values('Time').reset_index(drop=True)
-    print(f"Loaded {len(df)} candles | {df['Time'].dt.date.nunique()} days")
+    df_1min = pd.read_csv(args.file)
+    df_1min['Time'] = pd.to_datetime(df_1min['Time'])
+    df_1min = df_1min.sort_values('Time').reset_index(drop=True)
+    print(f"  1-min: {len(df_1min)} candles | {df_1min['Time'].dt.date.nunique()} days")
+
+    # Load native 3-min and 5-min CSVs if available (more historical data)
+    tf_data = {}
+    for tf, csv_file in [(3, "nifty_3min_data.csv"), (5, "nifty_5min_data.csv")]:
+        if os.path.exists(csv_file):
+            df_tf = pd.read_csv(csv_file)
+            df_tf['Time'] = pd.to_datetime(df_tf['Time'])
+            df_tf = df_tf.sort_values('Time').reset_index(drop=True)
+            tf_data[tf] = df_tf
+            print(f"  {tf}-min: {len(df_tf)} candles | {df_tf['Time'].dt.date.nunique()} days (native CSV ✅)")
+        else:
+            print(f"  {tf}-min: will resample from 1-min data")
 
     print("\n" + "=" * 100)
     print("  STRATEGY OPTIMIZER — Testing multiple strategies and parameters")
@@ -425,45 +418,81 @@ def main():
 
     all_results = []
 
-    # ─── 1. Supertrend on 5-min (multiple parameter combos) ───
-    print("\n🔵 Testing Supertrend on 5-min candles...")
-    for period in [7, 10, 14]:
-        for mult in [2.0, 3.0, 4.0]:
-            for sl in [1.5, 2.0, 3.0]:
-                label = f"Supertrend 5min (P={period}, M={mult}, SL={sl}x)"
-                trades = test_supertrend_5min(df, period=period, multiplier=mult, sl_mult=sl, min_hold=2)
-                m = calc_metrics(trades)
-                all_results.append({"strategy": label, **m})
-
-    # ─── 2. UT Bot on 5-min (parameter sweep) ───
-    print("🟢 Testing UT Bot on 5-min candles...")
-    for a in [1, 2, 3, 4]:
-        for c in [14, 21, 50, 100]:
-            for sl in [1.5, 2.0, 3.0]:
-                label = f"UT Bot 5min (a={a}, c={c}, SL={sl}x)"
-                trades = test_ut_bot_5min(df, a=a, c=c, atr_gate=0, sl_mult=sl, min_hold=2)
-                m = calc_metrics(trades)
-                all_results.append({"strategy": label, **m})
-
-    # ─── 3. EMA Crossover on 5-min ───
-    print("🟡 Testing EMA Crossover on 5-min candles...")
-    for fast in [5, 9, 13]:
-        for slow in [21, 34, 50]:
-            if fast >= slow:
+    # ─── Helper: run strategy on native CSV data (per day) ───
+    def run_on_native(native_df, strategy_fn, sl_mult=2.0, min_hold=2, min_candles=10):
+        results = []
+        for day, day_df in native_df.groupby(native_df['Time'].dt.date):
+            day_df = day_df.reset_index(drop=True)
+            if len(day_df) < min_candles:
                 continue
-            for sl in [1.5, 2.0, 3.0]:
-                label = f"EMA Cross 5min ({fast}/{slow}, SL={sl}x)"
-                trades = test_ema_cross_5min(df, fast=fast, slow=slow, sl_mult=sl, min_hold=2)
-                m = calc_metrics(trades)
-                all_results.append({"strategy": label, **m})
+            signals = strategy_fn(day_df)
+            buy, sell = signals[0], signals[1]
+            atr = calculate_atr(day_df, 14)
+            trades = run_backtest(day_df, buy, sell, atr,
+                                  sl_atr_mult=sl_mult, min_hold=min_hold, trail_atr_mult=2.0)
+            results.extend(trades)
+        return results
 
-    # ─── 4. UT Bot on 1-min with improved SL (select params) ───
+    # ─── 1. Supertrend on 3-min and 5-min ───
+    for tf in [3, 5]:
+        print(f"\n🔵 Testing Supertrend on {tf}-min candles...")
+        for period in [7, 10, 14]:
+            for mult in [2.0, 3.0, 4.0]:
+                for sl in [1.5, 2.0, 3.0]:
+                    label = f"Supertrend {tf}min (P={period}, M={mult}, SL={sl}x)"
+                    if tf in tf_data:
+                        trades = run_on_native(tf_data[tf], lambda d, p=period, m=mult: calculate_supertrend(d, period=p, multiplier=m)[:2], sl_mult=sl, min_hold=2)
+                    else:
+                        trades = test_strategy_resampled(
+                            df_1min, lambda d, p=period, m=mult: calculate_supertrend(d, period=p, multiplier=m)[:2],
+                            interval_min=tf, sl_mult=sl, min_hold=2,
+                        )
+                    m = calc_metrics(trades)
+                    all_results.append({"strategy": label, **m})
+
+    # ─── 2. UT Bot on 3-min and 5-min ───
+    for tf in [3, 5]:
+        print(f"🟢 Testing UT Bot on {tf}-min candles...")
+        for a in [1, 2, 3, 4]:
+            for c in [14, 21, 50, 100]:
+                for sl in [1.5, 2.0, 3.0]:
+                    label = f"UT Bot {tf}min (a={a}, c={c}, SL={sl}x)"
+                    if tf in tf_data:
+                        trades = run_on_native(tf_data[tf], lambda d, a_=a, c_=c: calculate_ut_bot(d, a=a_, c=c_), sl_mult=sl, min_hold=2)
+                    else:
+                        trades = test_strategy_resampled(
+                            df_1min, lambda d, a_=a, c_=c: calculate_ut_bot(d, a=a_, c=c_),
+                            interval_min=tf, sl_mult=sl, min_hold=2,
+                        )
+                    m = calc_metrics(trades)
+                    all_results.append({"strategy": label, **m})
+
+    # ─── 3. EMA Crossover on 3-min and 5-min ───
+    for tf in [3, 5]:
+        print(f"🟡 Testing EMA Crossover on {tf}-min candles...")
+        for fast in [5, 9, 13]:
+            for slow in [21, 34, 50]:
+                if fast >= slow:
+                    continue
+                for sl in [1.5, 2.0, 3.0]:
+                    label = f"EMA Cross {tf}min ({fast}/{slow}, SL={sl}x)"
+                    if tf in tf_data:
+                        trades = run_on_native(tf_data[tf], lambda d, f_=fast, s_=slow: calculate_ema_crossover(d, fast=f_, slow=s_), sl_mult=sl, min_hold=2)
+                    else:
+                        trades = test_strategy_resampled(
+                            df_1min, lambda d, f_=fast, s_=slow: calculate_ema_crossover(d, fast=f_, slow=s_),
+                            interval_min=tf, sl_mult=sl, min_hold=2,
+                        )
+                    m = calc_metrics(trades)
+                    all_results.append({"strategy": label, **m})
+
+    # ─── 4. UT Bot on 1-min with improved SL ───
     print("🔴 Testing UT Bot on 1-min with ATR-based SL...")
     for a in [2, 3, 4, 5]:
         for c in [50, 100, 150]:
             for sl in [2.0, 3.0, 4.0]:
                 label = f"UT Bot 1min (a={a}, c={c}, SL={sl}x, hold=5)"
-                trades = test_ut_bot_1min(df, a=a, c=c, atr_gate=6.9, sl_mult=sl, min_hold=5)
+                trades = test_ut_bot_1min(df_1min, a=a, c=c, atr_gate=6.9, sl_mult=sl, min_hold=5)
                 m = calc_metrics(trades)
                 all_results.append({"strategy": label, **m})
 
