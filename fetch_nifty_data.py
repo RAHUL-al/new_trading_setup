@@ -38,17 +38,17 @@ NIFTY_EXCHANGE = "NSE"
 INTERVAL_CONFIG = {
     "ONE_MINUTE": {
         "chunk_days": 5,         # ~1875 candles (375/day × 5)
-        "from_date": "2025-01-01",
+        "from_date": "2022-01-01",
         "output_file": "nifty_1min_data.csv",
     },
     "THREE_MINUTE": {
         "chunk_days": 15,        # ~1875 candles (125/day × 15)
-        "from_date": "2024-01-01",
+        "from_date": "2022-01-01",
         "output_file": "nifty_3min_data.csv",
     },
     "FIVE_MINUTE": {
         "chunk_days": 25,        # ~1875 candles (75/day × 25)
-        "from_date": "2024-01-01",
+        "from_date": "2022-01-01",
         "output_file": "nifty_5min_data.csv",
     },
 }
