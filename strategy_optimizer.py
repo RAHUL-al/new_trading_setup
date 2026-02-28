@@ -209,6 +209,11 @@ def run_backtest(df, buy_signals, sell_signals, atr_series,
         use_trailing: Enable ATR-based trailing stop loss
         trail_atr_mult: Trailing SL distance = ATR × trail_atr_mult
     """
+    # Convert signals/ATR to numpy arrays for consistent indexing
+    buy_arr = np.asarray(buy_signals)
+    sell_arr = np.asarray(sell_signals)
+    atr_arr = np.asarray(atr_series)
+
     trades = []
     open_pos = None
 
@@ -218,7 +223,7 @@ def run_backtest(df, buy_signals, sell_signals, atr_series,
         close = row['Close']
         high = row['High']
         low = row['Low']
-        atr = atr_series.iloc[i] if i < len(atr_series) else 0
+        atr = float(atr_arr[i]) if i < len(atr_arr) else 0
 
         if not (MARKET_OPEN <= t <= MARKET_CLOSE):
             continue
@@ -255,8 +260,8 @@ def run_backtest(df, buy_signals, sell_signals, atr_series,
                     open_pos.stop_loss = new_sl
 
         # Signal processing
-        curr_buy = bool(buy_signals.iloc[i]) if i < len(buy_signals) else False
-        curr_sell = bool(sell_signals.iloc[i]) if i < len(sell_signals) else False
+        curr_buy = bool(buy_arr[i]) if i < len(buy_arr) else False
+        curr_sell = bool(sell_arr[i]) if i < len(sell_arr) else False
 
         # Opposite signal close (with min hold time)
         if curr_buy and open_pos and open_pos.direction == "PE":
