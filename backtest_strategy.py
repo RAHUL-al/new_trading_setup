@@ -4,7 +4,6 @@ backtest_strategy.py — Backtest the NIFTY trading strategy on historical 1-min
 Strategy:
   - UT Bot Alerts (a=2, c=100, EWM-based) for buy/sell signals
   - ATR RMA(14) > 6.9 gate for new entries
-  - EMA(9)/EMA(21) trend filter (BUY only in uptrend, SELL only in downtrend)
   - Trailing stop loss using candle high/low
   - Trading window: 12:30 to 15:10 (new entries only)
   - Square off at 15:24
@@ -148,7 +147,7 @@ class Backtester:
         """Run backtest on preprocessed DataFrame with all indicators."""
         print("\n" + "=" * 70)
         print("  BACKTEST RUNNING")
-        print(f"  Strategy: UT Bot (a={UT_BOT_A}, c={UT_BOT_C}) + ATR RMA({ATR_RMA_PERIOD}) > {ATR_MIN_THRESHOLD} + EMA({EMA_FAST}/{EMA_SLOW})")
+        print(f"  Strategy: UT Bot (a={UT_BOT_A}, c={UT_BOT_C}) + ATR RMA({ATR_RMA_PERIOD}) > {ATR_MIN_THRESHOLD}")
         print(f"  Trading window: {TRADING_START.strftime('%H:%M')} - {TRADING_END.strftime('%H:%M')} | Square off: {SQUARE_OFF_TIME.strftime('%H:%M')}")
         print("=" * 70)
 
@@ -182,9 +181,6 @@ class Backtester:
             curr_buy = bool(row.get('buy_signal', False))
             curr_sell = bool(row.get('sell_signal', False))
             atr_val = row.get('atr_rma', 0)
-            ema9_val = row.get('ema9', 0)
-            ema21_val = row.get('ema21', 0)
-            trend = "up" if ema9_val > ema21_val else "down"
             atr_ok = atr_val > ATR_MIN_THRESHOLD
 
             # New BUY edge
@@ -195,7 +191,7 @@ class Backtester:
 
                 # New CE entry — requires: no position + trading window + trend up + ATR ok
                 if not self.open_pos and TRADING_START <= t <= TRADING_END:
-                    if trend == "up" and atr_ok:
+                    if atr_ok:
                         sl = nifty_low  # SL = low of signal candle
                         self.open_pos = Position(
                             direction="CE",
@@ -214,7 +210,7 @@ class Backtester:
 
                 # New PE entry — requires: no position + trading window + trend down + ATR ok
                 if not self.open_pos and TRADING_START <= t <= TRADING_END:
-                    if trend == "down" and atr_ok:
+                    if atr_ok:
                         sl = nifty_high  # SL = high of signal candle
                         self.open_pos = Position(
                             direction="PE",
