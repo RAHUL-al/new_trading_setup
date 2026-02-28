@@ -584,6 +584,16 @@ class TradingBot:
             pass
         return 0.0
 
+    async def get_current_trend(self) -> str:
+        """Read EMA trend direction from Redis (published by signal engine)."""
+        try:
+            trend = await self.r.get(f"{REDIS_PREFIX}trend_direction")
+            if trend:
+                return trend
+        except Exception:
+            pass
+        return "unknown"
+
     async def on_buy_signal(self, signal_candle: Optional[CandleData] = None):
         signal_candle = await self.load_last_complete_candle()
         if signal_candle is None:
@@ -598,10 +608,15 @@ class TradingBot:
             logger.info(f"🔄 Closing PE position (opposite BUY signal received)")
             await self.close_position("OPPOSITE_SIGNAL")
         
-        # Only take NEW positions if: inside trading window AND ATR > threshold
+        # Only take NEW positions if: trading window + trend alignment + ATR > threshold
         if not self.open_pos:
             if not self.is_trading_window():
                 logger.info(f"⚠️ BUY signal received but outside trading window. Skipping.")
+                return
+            
+            trend = await self.get_current_trend()
+            if trend != "up":
+                logger.info(f"⚠️ BUY signal but trend={trend} (need up). EMA filter blocked. Skipping.")
                 return
             
             current_atr = await self.get_current_atr()
@@ -609,7 +624,7 @@ class TradingBot:
                 logger.info(f"⚠️ BUY signal received but ATR={current_atr:.2f} < {ATR_MIN_THRESHOLD}. Skipping new position.")
                 return
             
-            logger.info(f"🟢 BUY SIGNAL | ATR={current_atr:.2f} ✅ | Taking CE position...")
+            logger.info(f"🟢 BUY SIGNAL | Trend={trend} ✅ | ATR={current_atr:.2f} ✅ | Taking CE position...")
             await self.take_buy(quantity=1, signal_candle=signal_candle)
 
     async def on_sell_signal(self, signal_candle: Optional[CandleData] = None):
@@ -626,10 +641,15 @@ class TradingBot:
             logger.info(f"🔄 Closing CE position (opposite SELL signal received)")
             await self.close_position("OPPOSITE_SIGNAL")
         
-        # Only take NEW positions if: inside trading window AND ATR > threshold
+        # Only take NEW positions if: trading window + trend alignment + ATR > threshold
         if not self.open_pos:
             if not self.is_trading_window():
                 logger.info(f"⚠️ SELL signal received but outside trading window. Skipping.")
+                return
+            
+            trend = await self.get_current_trend()
+            if trend != "down":
+                logger.info(f"⚠️ SELL signal but trend={trend} (need down). EMA filter blocked. Skipping.")
                 return
             
             current_atr = await self.get_current_atr()
@@ -637,7 +657,7 @@ class TradingBot:
                 logger.info(f"⚠️ SELL signal received but ATR={current_atr:.2f} < {ATR_MIN_THRESHOLD}. Skipping new position.")
                 return
             
-            logger.info(f"🔴 SELL SIGNAL | ATR={current_atr:.2f} ✅ | Taking PE position...")
+            logger.info(f"🔴 SELL SIGNAL | Trend={trend} ✅ | ATR={current_atr:.2f} ✅ | Taking PE position...")
             await self.take_sell(quantity=1, signal_candle=signal_candle)
 
     async def task_pubsub_listener(self):

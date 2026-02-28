@@ -381,6 +381,26 @@ def calculate_atr_rma(data, period=14):
     return atr
 
 
+def calculate_ema_trend(data, fast=9, slow=21):
+    """EMA trend filter — uses only close prices (no volume needed).
+    Returns: (trend, body_strength, ema_fast_val, ema_slow_val)
+    - trend: 'up' if EMA(fast) > EMA(slow), else 'down'
+    - body_strength: ratio of candle body to full range (0-1), strong > 0.5
+    """
+    ema_fast = data['Close'].ewm(span=fast, adjust=False).mean()
+    ema_slow = data['Close'].ewm(span=slow, adjust=False).mean()
+
+    trend = "up" if ema_fast.iloc[-1] > ema_slow.iloc[-1] else "down"
+
+    # Candle body strength (strong body = strong conviction)
+    last = data.iloc[-1]
+    body = abs(float(last['Close']) - float(last['Open']))
+    full_range = float(last['High']) - float(last['Low'])
+    body_strength = (body / full_range) if full_range > 0 else 0
+
+    return trend, round(body_strength, 2), round(float(ema_fast.iloc[-1]), 2), round(float(ema_slow.iloc[-1]), 2)
+
+
 async def nifty_signal_engine():
     """
     Async signal engine — polls at 50ms, only recalculates when new candles arrive.
@@ -396,7 +416,7 @@ async def nifty_signal_engine():
     last_candle_count = 0
     last_published_candle_time = None
 
-    logger.info("⚡ Starting async NIFTY signal engine (UT Bot a=2, c=100, EWM | Separate RMA ATR(14) > 6.9 for gating)...")
+    logger.info("⚡ Starting async NIFTY signal engine (UT Bot a=2, c=100 | ATR RMA(14) > 6.9 | EMA 9/21 trend filter)...")
 
     while True:
         try:
@@ -450,6 +470,12 @@ async def nifty_signal_engine():
             if pd.notna(current_atr):
                 await ar.set(f"{REDIS_PREFIX}ATR_value", str(round(current_atr, 2)))
 
+            # EMA trend filter (9/21) — uses only close prices
+            trend, body_strength, ema9, ema21 = calculate_ema_trend(df, fast=9, slow=21)
+            await ar.set(f"{REDIS_PREFIX}trend_direction", trend)
+            await ar.set(f"{REDIS_PREFIX}ema9", str(ema9))
+            await ar.set(f"{REDIS_PREFIX}ema21", str(ema21))
+
             # Store last candle in Redis (NO CSV — pure Redis for low latency)
             last_row = df.iloc[-1]
             last_candle_data = json.dumps({
@@ -470,25 +496,41 @@ async def nifty_signal_engine():
             if curr_buy and not prev_buy:
                 if now_ts - last_signal_time > SIGNAL_COOLDOWN:
                     # Always publish signal — pos_handle_wts decides whether to open new position
-                    signal_data = json.dumps({"signal": "buy", "atr": round(current_atr, 2) if pd.notna(current_atr) else 0})
+                    signal_data = json.dumps({
+                        "signal": "buy",
+                        "atr": round(current_atr, 2) if pd.notna(current_atr) else 0,
+                        "trend": trend,
+                        "body_strength": body_strength,
+                        "ema9": ema9,
+                        "ema21": ema21,
+                    })
                     await ar.publish(f"{REDIS_PREFIX}signal:buy", signal_data)
                     await ar.set(f"{REDIS_PREFIX}buy_signal", "true")
                     await ar.set(f"{REDIS_PREFIX}sell_signal", "false")
                     last_signal = "BUY"
                     last_signal_time = now_ts
                     atr_status = f"ATR={current_atr:.2f} ✅" if atr_ok else f"ATR={current_atr:.2f} ⚠️ <{ATR_MIN_THRESHOLD}"
-                    logger.info(f"🟢 BUY SIGNAL — UT Bot | NIFTY Close={last_row['Close']} | {atr_status}")
+                    trend_status = f"Trend={trend} ✅" if trend == "up" else f"Trend={trend} ⚠️"
+                    logger.info(f"🟢 BUY SIGNAL — UT Bot | NIFTY Close={last_row['Close']} | {atr_status} | {trend_status} EMA({ema9}/{ema21}) | Body={body_strength}")
 
             elif curr_sell and not prev_sell:
                 if now_ts - last_signal_time > SIGNAL_COOLDOWN:
-                    signal_data = json.dumps({"signal": "sell", "atr": round(current_atr, 2) if pd.notna(current_atr) else 0})
+                    signal_data = json.dumps({
+                        "signal": "sell",
+                        "atr": round(current_atr, 2) if pd.notna(current_atr) else 0,
+                        "trend": trend,
+                        "body_strength": body_strength,
+                        "ema9": ema9,
+                        "ema21": ema21,
+                    })
                     await ar.publish(f"{REDIS_PREFIX}signal:sell", signal_data)
                     await ar.set(f"{REDIS_PREFIX}sell_signal", "true")
                     await ar.set(f"{REDIS_PREFIX}buy_signal", "false")
                     last_signal = "SELL"
                     last_signal_time = now_ts
                     atr_status = f"ATR={current_atr:.2f} ✅" if atr_ok else f"ATR={current_atr:.2f} ⚠️ <{ATR_MIN_THRESHOLD}"
-                    logger.info(f"🔴 SELL SIGNAL — UT Bot | NIFTY Close={last_row['Close']} | {atr_status}")
+                    trend_status = f"Trend={trend} ✅" if trend == "down" else f"Trend={trend} ⚠️"
+                    logger.info(f"🔴 SELL SIGNAL — UT Bot | NIFTY Close={last_row['Close']} | {atr_status} | {trend_status} EMA({ema9}/{ema21}) | Body={body_strength}")
 
             prev_buy = curr_buy
             prev_sell = curr_sell
