@@ -40,11 +40,20 @@ warnings.filterwarnings('ignore')
 
 
 # ─────────── Config ───────────
-TRADING_START = dt_time(9, 30)     # Skip first 15 min (high noise)
-TRADING_END = dt_time(15, 15)      # No new trades after 3:15 PM
-SQUARE_OFF_TIME = dt_time(15, 24)  # Force close at 3:24 PM
+# Two trading windows (reduces trades, avoids mid-day chop)
+WINDOW_1_START = dt_time(9, 15)    # Morning window start
+WINDOW_1_END = dt_time(10, 30)     # Morning window end (no new entries after this)
+WINDOW_1_CLOSE = dt_time(10, 30)   # Force close morning positions
+
+WINDOW_2_START = dt_time(13, 0)    # Afternoon window start
+WINDOW_2_END = dt_time(15, 15)     # No new entries after 3:15 PM
+WINDOW_2_CLOSE = dt_time(15, 24)   # Force close at 3:24 PM
+
+SQUARE_OFF_TIME = dt_time(15, 24)
 MARKET_OPEN = dt_time(9, 15)
 MARKET_CLOSE = dt_time(15, 25)
+
+MAX_TRADES_PER_WINDOW = 999         # Unlimited trades per window
 
 # ATR sweet spot — too low = no movement, too high = choppy
 ATR_MIN = 8.0
@@ -347,10 +356,11 @@ def generate_signals(df):
 # ─────────── Backtest Engine ───────────
 
 def run_backtest(df, signals):
-    """Backtest with advanced risk management."""
+    """Backtest with dual trading windows and strict trade limits."""
     trades = []
     open_pos = None
     prev_date = None
+    window_trades_today = {1: 0, 2: 0}  # Track trades per window per day
 
     for i in range(len(df)):
         row = df.iloc[i]
@@ -362,24 +372,45 @@ def run_backtest(df, signals):
         curr_atr = float(signals.iloc[i]['atr']) if i < len(signals) else 0
 
         # Day boundary reset
-        if prev_date and curr_date != prev_date and open_pos:
-            pnl = _pnl(open_pos, float(df.iloc[i-1]['Close']))
-            trades.append(Trade(open_pos.direction, open_pos.entry_price,
-                                float(df.iloc[i-1]['Close']), open_pos.entry_time,
-                                df.iloc[i-1]['Time'], round(pnl, 2), "DAY_END", open_pos.entry_atr))
-            open_pos = None
+        if prev_date and curr_date != prev_date:
+            if open_pos:
+                pnl = _pnl(open_pos, float(df.iloc[i-1]['Close']))
+                trades.append(Trade(open_pos.direction, open_pos.entry_price,
+                                    float(df.iloc[i-1]['Close']), open_pos.entry_time,
+                                    df.iloc[i-1]['Time'], round(pnl, 2), "DAY_END", open_pos.entry_atr))
+                open_pos = None
+            window_trades_today = {1: 0, 2: 0}  # Reset daily counters
         prev_date = curr_date
 
         if not (MARKET_OPEN <= t <= MARKET_CLOSE):
             continue
 
-        # Square off
+        # Determine current window
+        in_window_1 = WINDOW_1_START <= t <= WINDOW_1_CLOSE
+        in_window_2 = WINDOW_2_START <= t <= WINDOW_2_CLOSE
+        can_enter_w1 = WINDOW_1_START <= t <= WINDOW_1_END and window_trades_today[1] < MAX_TRADES_PER_WINDOW
+        can_enter_w2 = WINDOW_2_START <= t <= WINDOW_2_END and window_trades_today[2] < MAX_TRADES_PER_WINDOW
+
+        # Window 1 close: force close morning positions at 10:30
+        if open_pos and t >= WINDOW_1_CLOSE and open_pos.entry_time.time() < WINDOW_1_CLOSE and t < WINDOW_2_START:
+            pnl = _pnl(open_pos, close)
+            trades.append(Trade(open_pos.direction, open_pos.entry_price, close,
+                                open_pos.entry_time, row['Time'], round(pnl, 2),
+                                "WINDOW_1_CLOSE", open_pos.entry_atr))
+            open_pos = None
+            continue
+
+        # Window 2 close: square off at 3:24
         if open_pos and t >= SQUARE_OFF_TIME:
             pnl = _pnl(open_pos, close)
             trades.append(Trade(open_pos.direction, open_pos.entry_price, close,
                                 open_pos.entry_time, row['Time'], round(pnl, 2),
                                 "SQUARE_OFF", open_pos.entry_atr))
             open_pos = None
+            continue
+
+        # Skip if not in any active window
+        if not in_window_1 and not in_window_2:
             continue
 
         # Stop loss (using high/low for realistic fills)
@@ -397,11 +428,11 @@ def run_backtest(df, signals):
                                     row['Time'], round(pnl, 2), "STOP_LOSS", open_pos.entry_atr))
                 open_pos = None
 
-        # Breakeven stop: move SL to entry after 1:1 R:R reached
+        # Breakeven stop
         if open_pos and not open_pos.breakeven_hit:
             if open_pos.direction == "CE":
                 if close - open_pos.entry_price >= open_pos.initial_risk * BREAKEVEN_RR:
-                    open_pos.stop_loss = max(open_pos.stop_loss, open_pos.entry_price + 1)  # +1 for commission
+                    open_pos.stop_loss = max(open_pos.stop_loss, open_pos.entry_price + 1)
                     open_pos.breakeven_hit = True
             elif open_pos.direction == "PE":
                 if open_pos.entry_price - close >= open_pos.initial_risk * BREAKEVEN_RR:
@@ -441,16 +472,20 @@ def run_backtest(df, signals):
                                 "OPPOSITE_SIGNAL", open_pos.entry_atr))
             open_pos = None
 
-        # New entry
-        if not open_pos and TRADING_START <= t <= TRADING_END:
+        # New entry — only in allowed windows with trade limit
+        if not open_pos and (can_enter_w1 or can_enter_w2):
             if is_buy and curr_atr > 0:
                 sl = close - (curr_atr * INITIAL_SL_MULT)
                 risk = close - sl
                 open_pos = Position("CE", close, row['Time'], sl, risk, i, curr_atr)
+                if can_enter_w1: window_trades_today[1] += 1
+                if can_enter_w2: window_trades_today[2] += 1
             elif is_sell and curr_atr > 0:
                 sl = close + (curr_atr * INITIAL_SL_MULT)
                 risk = sl - close
                 open_pos = Position("PE", close, row['Time'], sl, risk, i, curr_atr)
+                if can_enter_w1: window_trades_today[1] += 1
+                if can_enter_w2: window_trades_today[2] += 1
 
     return trades
 
@@ -647,6 +682,9 @@ def main():
 
     # Backtest
     print(f"\n🚀 Running backtest...")
+    print(f"  Window 1: {WINDOW_1_START.strftime('%H:%M')} - {WINDOW_1_END.strftime('%H:%M')} (close at {WINDOW_1_CLOSE.strftime('%H:%M')})")
+    print(f"  Window 2: {WINDOW_2_START.strftime('%H:%M')} - {WINDOW_2_END.strftime('%H:%M')} (close at {WINDOW_2_CLOSE.strftime('%H:%M')})")
+    print(f"  Max trades/window:  {MAX_TRADES_PER_WINDOW}")
     print(f"  ATR range: {ATR_MIN} - {ATR_MAX}")
     print(f"  SL: {INITIAL_SL_MULT}x ATR | Trail: {TRAIL_SL_MULT}x ATR")
     print(f"  Breakeven at {BREAKEVEN_RR}:1 R:R")
