@@ -31,7 +31,7 @@ CLIENT_ID = os.environ.get("ANGELONE_CLIENT_ID", "A1079871")
 PWD = os.environ.get("ANGELONE_PASSWORD", "0465")
 
 DATA_DIR = "stock_data"
-MONTHS_BACK = 26                # ~2 years from Jan 2024
+MONTHS_BACK = 6
 SCRIP_MASTER_URL = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
 
 # NIFTY 50 stock symbols (NSE trading symbols)
