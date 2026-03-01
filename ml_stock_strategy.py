@@ -4,8 +4,15 @@ ml_stock_strategy.py — XGBoost ML Model for Ultra-Selective Stock Trading
 HOW THIS IS DIFFERENT FROM FIXED-RULE STRATEGIES:
   Fixed rules (EMA cross, ORB) apply the SAME logic every time.
   ML learns WHICH CONDITIONS lead to profitable trades from YOUR data.
-  It finds patterns humans can't see — complex interactions between
-  volume, price, time, and momentum.
+
+  ENSEMBLE VOTING (3 models must all agree):
+  XGBoost  → BUY 57%
+  LightGBM → BUY 59%   ← All agree → TAKE TRADE ✅
+  CatBoost → BUY 56%
+
+  XGBoost  → BUY 55%
+  LightGBM → SELL 52%  ← Disagree → SKIP ❌
+  CatBoost → BUY 54%
 
 FEATURES (40+ including volume-based):
   - Price: returns, gaps, candle body ratio, wick ratios
@@ -48,15 +55,29 @@ try:
     HAS_XGB = True
 except ImportError:
     HAS_XGB = False
-    print("⚠️ Install xgboost: pip install xgboost")
+    print("⚠️ pip install xgboost")
+
+try:
+    import lightgbm as lgb
+    HAS_LGB = True
+except ImportError:
+    HAS_LGB = False
+    print("⚠️ pip install lightgbm")
+
+try:
+    from catboost import CatBoostClassifier
+    HAS_CAT = True
+except ImportError:
+    HAS_CAT = False
+    print("⚠️ pip install catboost")
 
 try:
     from sklearn.preprocessing import StandardScaler
-    from sklearn.metrics import accuracy_score, classification_report
+    from sklearn.metrics import accuracy_score
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
-    print("⚠️ Install scikit-learn: pip install scikit-learn")
+    print("⚠️ pip install scikit-learn")
 
 
 # ─────────── Config ───────────
@@ -255,40 +276,87 @@ def create_labels(df, lookahead=5, threshold_pct=0.15):
 
 # ─────────── Model ───────────
 
-def train_model(X_train, y_train, X_test, y_test):
-    """Train XGBoost classifier with anti-overfitting config."""
-    model = xgb.XGBClassifier(
-        n_estimators=200,          # ↓ from 300 (less overfitting)
-        max_depth=3,               # ↓ from 5 (shallower = generalizes better)
-        learning_rate=0.03,        # ↓ from 0.05 (slower learning)
-        subsample=0.7,             # ↓ from 0.8 (more randomness)
-        colsample_bytree=0.6,     # ↓ from 0.8 (use less features per tree)
-        min_child_weight=10,       # ↑ from 5 (need more samples per leaf)
-        reg_alpha=0.5,             # ↑ from 0.1 (L1 regularization)
-        reg_lambda=3.0,            # ↑ from 1.0 (L2 regularization)
-        gamma=0.3,                 # NEW: min loss reduction for split
-        max_delta_step=1,          # NEW: limits each tree's prediction
-        scale_pos_weight=1.0,
-        use_label_encoder=False,
-        eval_metric='logloss',
-        random_state=42,
+def train_ensemble(X_train, y_train, X_test, y_test):
+    """Train 3-model ensemble: XGBoost + LightGBM + CatBoost."""
+    models = {}
+    accuracies = {}
+
+    # ── 1. XGBoost ──
+    xgb_model = xgb.XGBClassifier(
+        n_estimators=200, max_depth=3, learning_rate=0.03,
+        subsample=0.7, colsample_bytree=0.6, min_child_weight=10,
+        reg_alpha=0.5, reg_lambda=3.0, gamma=0.3, max_delta_step=1,
+        use_label_encoder=False, eval_metric='logloss', random_state=42,
     )
+    xgb_model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+    models['xgb'] = xgb_model
+    accuracies['xgb_train'] = accuracy_score(y_train, xgb_model.predict(X_train))
+    accuracies['xgb_test'] = accuracy_score(y_test, xgb_model.predict(X_test))
 
-    model.fit(
-        X_train, y_train,
-        eval_set=[(X_test, y_test)],
-        verbose=False,
-    )
+    # ── 2. LightGBM ──
+    if HAS_LGB:
+        lgb_model = lgb.LGBMClassifier(
+            n_estimators=200, max_depth=3, learning_rate=0.03,
+            subsample=0.7, colsample_bytree=0.6, min_child_samples=20,
+            reg_alpha=0.5, reg_lambda=3.0, min_split_gain=0.1,
+            random_state=42, verbose=-1,
+        )
+        lgb_model.fit(X_train, y_train, eval_set=[(X_test, y_test)])
+        models['lgb'] = lgb_model
+        accuracies['lgb_train'] = accuracy_score(y_train, lgb_model.predict(X_train))
+        accuracies['lgb_test'] = accuracy_score(y_test, lgb_model.predict(X_test))
 
-    # Predictions
-    train_pred = model.predict(X_train)
-    test_pred = model.predict(X_test)
-    test_proba = model.predict_proba(X_test)
+    # ── 3. CatBoost ──
+    if HAS_CAT:
+        cat_model = CatBoostClassifier(
+            iterations=200, depth=3, learning_rate=0.03,
+            subsample=0.7, colsample_bylevel=0.6, min_data_in_leaf=20,
+            l2_leaf_reg=3.0, random_seed=42, verbose=0,
+        )
+        cat_model.fit(X_train, y_train, eval_set=(X_test, y_test))
+        models['cat'] = cat_model
+        accuracies['cat_train'] = accuracy_score(y_train, cat_model.predict(X_train))
+        accuracies['cat_test'] = accuracy_score(y_test, cat_model.predict(X_test))
 
-    train_acc = accuracy_score(y_train, train_pred)
-    test_acc = accuracy_score(y_test, test_pred)
+    return models, accuracies
 
-    return model, train_acc, test_acc, test_pred, test_proba
+
+def ensemble_predict(models, X):
+    """
+    All 3 models must agree on direction.
+    Returns: predictions (array), probabilities (array of [prob_down, prob_up]),
+             agreement mask (bool array)
+    """
+    all_preds = {}
+    all_probas = {}
+
+    for name, model in models.items():
+        all_preds[name] = model.predict(X)
+        all_probas[name] = model.predict_proba(X)
+
+    n = len(X)
+    final_pred = np.zeros(n)
+    final_proba = np.full((n, 2), 0.5)
+    agreement = np.zeros(n, dtype=bool)
+
+    model_names = list(models.keys())
+
+    for i in range(n):
+        preds = [int(all_preds[name][i]) for name in model_names]
+        probas = [all_probas[name][i] for name in model_names]
+
+        # Check if ALL models agree
+        if all(p == preds[0] for p in preds):
+            agreement[i] = True
+            final_pred[i] = preds[0]
+            # Average probabilities across models
+            final_proba[i] = np.mean(probas, axis=0)
+        else:
+            agreement[i] = False
+            final_pred[i] = 0
+            final_proba[i] = [0.5, 0.5]  # No confidence → skip
+
+    return final_pred, final_proba, agreement
 
 
 # ─────────── Backtest ───────────
@@ -477,10 +545,11 @@ def _pnl(pos, exit_price):
 
 # ─────────── Report ───────────
 
-def print_report(symbol, trades, test_acc, train_acc, total_signals, filtered_signals,
-                 total_candles, trading_days, date_range, feature_importance=None):
+def print_report(symbol, trades, accuracies, total_signals, filtered_signals,
+                 total_candles, trading_days, date_range, agreement_rate=0,
+                 feature_importance=None):
     if not trades:
-        print(f"\n  {symbol}: No trades at confidence threshold {CONFIDENCE_THRESHOLD}")
+        print(f"\n  {symbol}: No trades (all-3-agree filter too strict or low confidence)")
         return
 
     pnl_pts = [t.pnl_pts for t in trades]
@@ -501,20 +570,22 @@ def print_report(symbol, trades, test_acc, train_acc, total_signals, filtered_si
 
     avg_conf = np.mean([t.confidence for t in trades])
 
-    print(f"\n  {'='*60}")
-    print(f"  📈 {symbol} — ML STRATEGY RESULTS")
+    print(f"\n  {'='*65}")
+    print(f"  📈 {symbol} — ENSEMBLE STRATEGY (XGB + LGB + CAT)")
     print(f"  {date_range} | {trading_days} days")
-    print(f"  {'='*60}")
+    print(f"  {'='*65}")
 
-    print(f"\n  🤖 MODEL")
-    print(f"  Train accuracy:   {train_acc:.1%}")
-    print(f"  Test accuracy:    {test_acc:.1%}")
-    print(f"  Avg confidence:   {avg_conf:.1%}")
+    print(f"\n  🤖 MODEL ACCURACY (per model)")
+    for key in sorted(accuracies.keys()):
+        label = key.replace('_', ' ').title()
+        print(f"    {label:20s}: {accuracies[key]:.1%}")
+    print(f"    Agreement rate   : {agreement_rate:.1%}")
 
     print(f"\n  📊 SELECTIVITY")
     print(f"  Total candles:    {total_candles}")
-    print(f"  High-conf signals: {total_signals}")
+    print(f"  Agreed signals:   {total_signals}")
     print(f"  Trades taken:     {filtered_signals} ({filtered_signals/max(total_candles,1)*100:.2f}% of candles)")
+    print(f"  Avg confidence:   {avg_conf:.1%}")
 
     print(f"\n  💰 PERFORMANCE")
     print(f"  Total trades:     {len(trades)}")
@@ -535,20 +606,19 @@ def print_report(symbol, trades, test_acc, train_acc, total_signals, filtered_si
         r_wr = sum(1 for t in r_t if t.pnl_pts > 0)/len(r_t)*100
         print(f"    {r:20s}: {c:4d} | Win: {r_wr:.0f}%")
 
-    # Top features
     if feature_importance is not None:
-        print(f"\n  🧠 TOP 10 FEATURES")
+        print(f"\n  🧠 TOP 10 FEATURES (XGBoost)")
         top = feature_importance.head(10)
         for _, row in top.iterrows():
             print(f"    {row['feature']:25s}: {row['importance']:.4f}")
 
-    print(f"  {'='*60}")
+    print(f"  {'='*65}")
 
 
 # ─────────── Process One Stock ───────────
 
-def process_stock(symbol, file_path, confidence_threshold, window_name='afternoon', detailed=False):
-    """Full pipeline for one stock: features → train → backtest."""
+def process_stock(symbol, file_path, confidence_threshold, window_name='full', detailed=False):
+    """Full pipeline: features → train 3 models → ensemble vote → backtest."""
     df = pd.read_csv(file_path)
     if len(df) < 500:
         return None
@@ -565,7 +635,6 @@ def process_stock(symbol, file_path, confidence_threshold, window_name='afternoo
     features, atr_val = engineer_features(df)
     labels = create_labels(df, LOOKAHEAD_CANDLES, MOVE_THRESHOLD_PCT)
 
-    # Combine and drop NaN
     combined = features.copy()
     combined['label'] = labels
     combined = combined.dropna()
@@ -590,23 +659,21 @@ def process_stock(symbol, file_path, confidence_threshold, window_name='afternoo
     X_train_s = scaler.fit_transform(X_train)
     X_test_s = scaler.transform(X_test)
 
-    # Train
-    model, train_acc, test_acc, test_pred, test_proba = train_model(
-        X_train_s, y_train, X_test_s, y_test
-    )
+    # Train ensemble
+    models, accuracies = train_ensemble(X_train_s, y_train, X_test_s, y_test)
+    n_models = len(models)
 
-    # Feature importance
+    # Feature importance (from XGBoost)
     fi = pd.DataFrame({
         'feature': feature_cols,
-        'importance': model.feature_importances_
+        'importance': models['xgb'].feature_importances_
     }).sort_values('importance', ascending=False)
 
-    # Backtest on TEST data only (no lookahead bias)
+    # Backtest on TEST data only
     test_start_idx = combined.index[split_idx]
     df_test = df.loc[test_start_idx:].reset_index(drop=True)
     atr_test = atr_val.loc[test_start_idx:].reset_index(drop=True)
 
-    # Generate predictions for all test candles
     test_features = features.loc[test_start_idx:]
     test_features_clean = test_features.dropna()
 
@@ -614,10 +681,12 @@ def process_stock(symbol, file_path, confidence_threshold, window_name='afternoo
         return None
 
     X_all_test = scaler.transform(test_features_clean[feature_cols].values)
-    all_pred = model.predict(X_all_test)
-    all_proba = model.predict_proba(X_all_test)
 
-    # Map predictions back to full test DataFrame
+    # Ensemble prediction (all 3 must agree)
+    all_pred, all_proba, all_agree = ensemble_predict(models, X_all_test)
+    agreement_rate = all_agree.mean()
+
+    # Map back to full test dataframe
     full_pred = np.zeros(len(df_test))
     full_proba = np.full((len(df_test), 2), 0.5)
 
@@ -627,7 +696,7 @@ def process_stock(symbol, file_path, confidence_threshold, window_name='afternoo
             full_pred[ci] = all_pred[j]
             full_proba[ci] = all_proba[j]
 
-    # Backtest each window config
+    # Backtest
     window_config = WINDOW_CONFIGS[window_name]
     trades, total_signals, filtered_signals = run_backtest(
         df_test, full_pred, full_proba, atr_test, confidence_threshold, window_config
@@ -635,25 +704,32 @@ def process_stock(symbol, file_path, confidence_threshold, window_name='afternoo
 
     # Report
     if detailed:
-        print(f"\n  ⏰ Window: {window_name.upper()}")
-        print_report(symbol, trades, test_acc, train_acc, total_signals, filtered_signals,
+        print(f"\n  ⏰ Window: {window_name.upper()} | Models: {n_models}")
+        print_report(symbol, trades, accuracies, total_signals, filtered_signals,
                      len(df_test), df_test['Time'].dt.date.nunique(),
                      f"{df_test['Time'].iloc[0].strftime('%Y-%m-%d')} → {df_test['Time'].iloc[-1].strftime('%Y-%m-%d')}",
-                     fi)
+                     agreement_rate, fi)
 
-    # Save model
+    # Save models
     os.makedirs(MODEL_DIR, exist_ok=True)
-    joblib.dump(model, f"{MODEL_DIR}/{symbol}_xgb.pkl")
+    for name, model in models.items():
+        joblib.dump(model, f"{MODEL_DIR}/{symbol}_{name}.pkl")
     joblib.dump(scaler, f"{MODEL_DIR}/{symbol}_scaler.pkl")
 
-    # Return summary
+    # Summary
     win_rate = sum(1 for t in trades if t.pnl_pts > 0) / max(len(trades), 1) * 100
     total_pnl = sum(t.pnl_pct for t in trades) if trades else 0
     gp = sum(t.pnl_pts for t in trades if t.pnl_pts > 0) if trades else 0
     gl = abs(sum(t.pnl_pts for t in trades if t.pnl_pts <= 0)) if trades else 1
     pf = gp / gl if gl > 0 else 0
 
-    # For 'all' mode: also test other windows and return comparison
+    # Avg test accuracy across models
+    test_accs = [v for k, v in accuracies.items() if 'test' in k]
+    train_accs = [v for k, v in accuracies.items() if 'train' in k]
+    avg_test = np.mean(test_accs) if test_accs else 0
+    avg_train = np.mean(train_accs) if train_accs else 0
+
+    # Window comparison for 'all' mode
     window_results = None
     if window_name == 'all_internal':
         window_results = {}
@@ -669,8 +745,9 @@ def process_stock(symbol, file_path, confidence_threshold, window_name='afternoo
                                    'pnl_pct': round(w_pnl, 3), 'pf': round(w_pf, 2)}
 
     return {
-        'symbol': symbol, 'test_acc': round(test_acc * 100, 1),
-        'train_acc': round(train_acc * 100, 1),
+        'symbol': symbol, 'test_acc': round(avg_test * 100, 1),
+        'train_acc': round(avg_train * 100, 1),
+        'n_models': n_models, 'agreement_rate': round(agreement_rate * 100, 1),
         'trades': len(trades), 'win_rate': round(win_rate, 1),
         'pnl_pct': round(total_pnl, 3), 'profit_factor': round(pf, 2),
         'signals': total_signals, 'filtered': filtered_signals,
@@ -683,10 +760,14 @@ def process_stock(symbol, file_path, confidence_threshold, window_name='afternoo
 def main():
     global CONFIDENCE_THRESHOLD, ACTIVE_WINDOW
     if not HAS_XGB or not HAS_SKLEARN:
-        print("❌ Install: pip install xgboost scikit-learn")
+        print("❌ Install: pip install xgboost scikit-learn lightgbm catboost")
         return
 
-    parser = argparse.ArgumentParser(description="ML Stock Strategy (XGBoost)")
+    n_models = 1 + (1 if HAS_LGB else 0) + (1 if HAS_CAT else 0)
+    if n_models < 3:
+        print(f"⚠️ Only {n_models}/3 models available. For best results: pip install xgboost lightgbm catboost")
+
+    parser = argparse.ArgumentParser(description="ML Ensemble Strategy (XGB+LGB+CAT)")
     parser.add_argument("--stock", default=None)
     parser.add_argument("--confidence", type=float, default=CONFIDENCE_THRESHOLD)
     parser.add_argument("--data-dir", default=DATA_DIR)
@@ -726,9 +807,10 @@ def main():
     test_all_windows = ACTIVE_WINDOW == 'all'
     window_to_use = 'all_internal' if test_all_windows else ACTIVE_WINDOW
 
-    print(f"🤖 ML STOCK STRATEGY v2 — Anti-Overfitting + Window Testing")
+    print(f"🤖 ENSEMBLE STRATEGY — XGBoost + LightGBM + CatBoost")
+    print(f"All {n_models} models must agree → ultra-selective")
     print(f"Confidence: {CONFIDENCE_THRESHOLD:.0%} | Window: {ACTIVE_WINDOW}")
-    print(f"Anti-overfit: depth=3, reg_alpha=0.5, reg_lambda=3.0, gamma=0.3")
+    print(f"Post-filters: vol surge>{MIN_VOL_SURGE}x, body>{MIN_BODY_RATIO}, max {MAX_TRADES_PER_DAY}/day")
     print(f"Found {len(files)} stocks")
     print(f"{'='*60}")
 
