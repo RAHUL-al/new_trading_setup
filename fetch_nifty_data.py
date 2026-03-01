@@ -35,21 +35,37 @@ NIFTY_TOKEN = "99926000"
 NIFTY_EXCHANGE = "NSE"
 
 # Each interval config: chunk_days, default_from_date, output_file
+# Note: AngelOne API supports: ONE_MINUTE, THREE_MINUTE, FIVE_MINUTE, TEN_MINUTE,
+#       FIFTEEN_MINUTE, THIRTY_MINUTE, ONE_HOUR, ONE_DAY
+# TWO_MINUTE is NOT natively supported — we fetch 1-min and resample.
 INTERVAL_CONFIG = {
     "ONE_MINUTE": {
-        "chunk_days": 5,         # ~1875 candles (375/day × 5)
+        "chunk_days": 5,
         "from_date": "2025-01-01",
         "output_file": "nifty_1min_data.csv",
+        "api_interval": "ONE_MINUTE",
+        "resample_to": None,
+    },
+    "TWO_MINUTE": {
+        "chunk_days": 5,          # Fetch 1-min, then resample to 2-min
+        "from_date": "2024-01-01",
+        "output_file": "nifty_2min_data.csv",
+        "api_interval": "ONE_MINUTE",  # Fetch 1-min from API
+        "resample_to": 2,              # Then resample to 2-min
     },
     "THREE_MINUTE": {
-        "chunk_days": 15,        # ~1875 candles (125/day × 15)
-        "from_date": "2025-01-01",
+        "chunk_days": 15,
+        "from_date": "2024-01-01",
         "output_file": "nifty_3min_data.csv",
+        "api_interval": "THREE_MINUTE",
+        "resample_to": None,
     },
     "FIVE_MINUTE": {
-        "chunk_days": 25,        # ~1875 candles (75/day × 25)
-        "from_date": "2025-01-01",
+        "chunk_days": 25,
+        "from_date": "2024-01-01",
         "output_file": "nifty_5min_data.csv",
+        "api_interval": "FIVE_MINUTE",
+        "resample_to": None,
     },
 }
 
@@ -136,7 +152,7 @@ def fetch_interval(smart_api, interval):
     all_data = []
     for i, (from_d, to_d) in enumerate(chunks):
         logger.info(f"[{i+1}/{len(chunks)}] Fetching {from_d} → {to_d}...")
-        df = fetch_candles(smart_api, from_d, to_d, interval)
+        df = fetch_candles(smart_api, from_d, to_d, config["api_interval"])
 
         if not df.empty:
             all_data.append(df)
@@ -166,6 +182,26 @@ def fetch_interval(smart_api, interval):
         (combined["time_only"] <= market_close)
     ].drop(columns=["time_only"])
 
+    # Resample if needed (e.g., TWO_MINUTE = fetch 1-min then resample)
+    resample_to = config.get("resample_to")
+    if resample_to:
+        logger.info(f"Resampling to {resample_to}-minute candles...")
+        combined = combined.set_index('Time')
+        combined = combined.resample(f'{resample_to}min', label='left', closed='left').agg({
+            'Open': 'first',
+            'High': 'max',
+            'Low': 'min',
+            'Close': 'last',
+            'Volume': 'sum',
+        }).dropna().reset_index()
+        # Re-filter market hours after resampling
+        combined["time_only"] = combined["Time"].dt.time
+        combined = combined[
+            (combined["time_only"] >= market_open) &
+            (combined["time_only"] <= market_close)
+        ].drop(columns=["time_only"])
+        logger.info(f"  After resampling: {len(combined)} candles")
+
     # Save to CSV
     combined.to_csv(output_file, index=False)
 
@@ -181,17 +217,16 @@ def fetch_interval(smart_api, interval):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Fetch NIFTY historical candle data")
-    parser.add_argument("--interval", default="ALL",
-                        choices=["ONE_MINUTE", "THREE_MINUTE", "FIVE_MINUTE", "ALL"],
-                        help="Which interval to fetch (default: ALL)")
+    parser.add_argument("--interval", default="TWO_MINUTE",
+                        choices=["ONE_MINUTE", "TWO_MINUTE", "THREE_MINUTE", "FIVE_MINUTE", "ALL"],
+                        help="Which interval to fetch (default: TWO_MINUTE)")
     args = parser.parse_args()
 
     # Connect once
     smart_api = connect_api()
 
     if args.interval == "ALL":
-        # Fetch all three timeframes
-        for interval in ["ONE_MINUTE", "THREE_MINUTE", "FIVE_MINUTE"]:
+        for interval in ["ONE_MINUTE", "TWO_MINUTE", "THREE_MINUTE", "FIVE_MINUTE"]:
             fetch_interval(smart_api, interval)
     else:
         fetch_interval(smart_api, args.interval)
