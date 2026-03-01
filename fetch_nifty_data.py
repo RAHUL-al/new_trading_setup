@@ -41,7 +41,7 @@ NIFTY_EXCHANGE = "NSE"
 INTERVAL_CONFIG = {
     "ONE_MINUTE": {
         "chunk_days": 5,
-        "from_date": "2025-01-01",
+        "from_date": "2024-01-01",
         "output_file": "nifty_1min_data.csv",
         "api_interval": "ONE_MINUTE",
         "resample_to": None,
