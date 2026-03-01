@@ -72,7 +72,7 @@ WINDOW_CONFIGS = {
     'full':      {'w1': (dt_time(9, 15), dt_time(15, 15)), 'w2': None, 'sqoff': dt_time(15, 24)},
 }
 
-ACTIVE_WINDOW = 'afternoon'       # Default: 1:00 PM - 3:24 PM
+ACTIVE_WINDOW = 'full'            # Default: Full day 9:15 AM - 3:24 PM
 
 CONFIDENCE_THRESHOLD = 0.55       # Regularized model → narrower proba range, 55% is meaningful
 LOOKAHEAD_CANDLES = 5             # Predict movement over next 5 candles
