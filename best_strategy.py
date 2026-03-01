@@ -592,6 +592,8 @@ def print_report(trades, total_candles, total_days, date_range):
 # ─────────── Main ───────────
 
 def main():
+    global ATR_MIN, ATR_MAX, INITIAL_SL_MULT
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--file", default="nifty_2min_data.csv")
     parser.add_argument("--atr-min", type=float, default=ATR_MIN)
@@ -599,7 +601,6 @@ def main():
     parser.add_argument("--sl-mult", type=float, default=INITIAL_SL_MULT)
     args = parser.parse_args()
 
-    global ATR_MIN, ATR_MAX, INITIAL_SL_MULT
     ATR_MIN = args.atr_min
     ATR_MAX = args.atr_max
     INITIAL_SL_MULT = args.sl_mult
