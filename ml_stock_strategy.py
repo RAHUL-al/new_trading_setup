@@ -64,11 +64,15 @@ DATA_DIR = "stock_data"
 MODEL_DIR = "ml_models"
 RESULTS_DIR = "scan_results"
 
-WINDOW_1_START = dt_time(9, 15)
-WINDOW_1_END = dt_time(10, 30)
-WINDOW_2_START = dt_time(13, 0)
-WINDOW_2_END = dt_time(15, 15)
-SQUARE_OFF_TIME = dt_time(15, 24)
+# Window configurations
+WINDOW_CONFIGS = {
+    'morning':   {'w1': (dt_time(9, 15), dt_time(10, 30)), 'w2': None, 'sqoff': dt_time(10, 30)},
+    'afternoon': {'w1': None, 'w2': (dt_time(13, 0), dt_time(15, 15)), 'sqoff': dt_time(15, 24)},
+    'both':      {'w1': (dt_time(9, 15), dt_time(10, 30)), 'w2': (dt_time(13, 0), dt_time(15, 15)), 'sqoff': dt_time(15, 24)},
+    'full':      {'w1': (dt_time(9, 15), dt_time(15, 15)), 'w2': None, 'sqoff': dt_time(15, 24)},
+}
+
+ACTIVE_WINDOW = 'afternoon'       # Default: 1:00 PM - 3:24 PM
 
 CONFIDENCE_THRESHOLD = 0.70       # Only trade when prediction > 70% confident
 LOOKAHEAD_CANDLES = 5             # Predict movement over next 5 candles
@@ -246,16 +250,18 @@ def create_labels(df, lookahead=5, threshold_pct=0.15):
 # ─────────── Model ───────────
 
 def train_model(X_train, y_train, X_test, y_test):
-    """Train XGBoost classifier."""
+    """Train XGBoost classifier with anti-overfitting config."""
     model = xgb.XGBClassifier(
-        n_estimators=300,
-        max_depth=5,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        min_child_weight=5,
-        reg_alpha=0.1,
-        reg_lambda=1.0,
+        n_estimators=200,          # ↓ from 300 (less overfitting)
+        max_depth=3,               # ↓ from 5 (shallower = generalizes better)
+        learning_rate=0.03,        # ↓ from 0.05 (slower learning)
+        subsample=0.7,             # ↓ from 0.8 (more randomness)
+        colsample_bytree=0.6,     # ↓ from 0.8 (use less features per tree)
+        min_child_weight=10,       # ↑ from 5 (need more samples per leaf)
+        reg_alpha=0.5,             # ↑ from 0.1 (L1 regularization)
+        reg_lambda=3.0,            # ↑ from 1.0 (L2 regularization)
+        gamma=0.3,                 # NEW: min loss reduction for split
+        max_delta_step=1,          # NEW: limits each tree's prediction
         scale_pos_weight=1.0,
         use_label_encoder=False,
         eval_metric='logloss',
@@ -281,17 +287,25 @@ def train_model(X_train, y_train, X_test, y_test):
 
 # ─────────── Backtest ───────────
 
-def in_window(t):
-    return (WINDOW_1_START <= t <= WINDOW_1_END) or (WINDOW_2_START <= t <= WINDOW_2_END)
+def in_window(t, window_config):
+    w1 = window_config['w1']
+    w2 = window_config['w2']
+    in_w1 = w1 and w1[0] <= t <= w1[1]
+    in_w2 = w2 and w2[0] <= t <= w2[1]
+    return in_w1 or in_w2
 
 
-def run_backtest(df, predictions, probabilities, atr_val, confidence_threshold):
+def run_backtest(df, predictions, probabilities, atr_val, confidence_threshold, window_config):
     """Backtest ML predictions with ultra-selective filtering."""
     trades = []
     pos = None
     prev_date = None
     total_signals = 0
     filtered_signals = 0
+
+    w1 = window_config['w1']
+    w2 = window_config['w2']
+    sqoff = window_config['sqoff']
 
     for i in range(len(df)):
         row = df.iloc[i]
@@ -314,9 +328,9 @@ def run_backtest(df, predictions, probabilities, atr_val, confidence_threshold):
                 pos = None
         prev_date = curr_date
 
-        # W1 close
-        if pos and t > WINDOW_1_END and t < WINDOW_2_START:
-            if pos.entry_time.time() <= WINDOW_1_END:
+        # W1 close (if both windows exist, close W1 positions before gap)
+        if pos and w1 and w2 and t > w1[1] and t < w2[0]:
+            if pos.entry_time.time() <= w1[1]:
                 pnl = _pnl(pos, close)
                 trades.append(Trade(pos.direction, pos.entry_price, close,
                                     pos.entry_time, row['Time'],
@@ -326,7 +340,7 @@ def run_backtest(df, predictions, probabilities, atr_val, confidence_threshold):
             continue
 
         # Square off
-        if pos and t >= SQUARE_OFF_TIME:
+        if pos and t >= sqoff:
             pnl = _pnl(pos, close)
             trades.append(Trade(pos.direction, pos.entry_price, close,
                                 pos.entry_time, row['Time'],
@@ -335,9 +349,12 @@ def run_backtest(df, predictions, probabilities, atr_val, confidence_threshold):
             pos = None
             continue
 
-        in_w1 = WINDOW_1_START <= t <= WINDOW_1_END
-        in_w2 = WINDOW_2_START <= t <= SQUARE_OFF_TIME
-        if not in_w1 and not in_w2:
+        # Check if in any active window
+        in_active = False
+        if w1 and w1[0] <= t <= w1[1]: in_active = True
+        if w2 and w2[0] <= t <= sqoff: in_active = True
+        if w1 and not w2 and w1[0] <= t <= sqoff: in_active = True  # 'full' mode
+        if not in_active:
             continue
 
         # SL check
@@ -400,7 +417,7 @@ def run_backtest(df, predictions, probabilities, atr_val, confidence_threshold):
             pos = None
 
         # New entry
-        can_enter = in_window(t)
+        can_enter = in_window(t, window_config)
         if not pos and can_enter and curr_atr > 0:
             if is_buy:
                 sl = close - curr_atr * SL_ATR_MULT
@@ -490,7 +507,7 @@ def print_report(symbol, trades, test_acc, train_acc, total_signals, filtered_si
 
 # ─────────── Process One Stock ───────────
 
-def process_stock(symbol, file_path, confidence_threshold, mode="both", detailed=False):
+def process_stock(symbol, file_path, confidence_threshold, window_name='afternoon', detailed=False):
     """Full pipeline for one stock: features → train → backtest."""
     df = pd.read_csv(file_path)
     if len(df) < 500:
@@ -570,13 +587,15 @@ def process_stock(symbol, file_path, confidence_threshold, mode="both", detailed
             full_pred[ci] = all_pred[j]
             full_proba[ci] = all_proba[j]
 
-    # Backtest
+    # Backtest each window config
+    window_config = WINDOW_CONFIGS[window_name]
     trades, total_signals, filtered_signals = run_backtest(
-        df_test, full_pred, full_proba, atr_test, confidence_threshold
+        df_test, full_pred, full_proba, atr_test, confidence_threshold, window_config
     )
 
     # Report
     if detailed:
+        print(f"\n  ⏰ Window: {window_name.upper()}")
         print_report(symbol, trades, test_acc, train_acc, total_signals, filtered_signals,
                      len(df_test), df_test['Time'].dt.date.nunique(),
                      f"{df_test['Time'].iloc[0].strftime('%Y-%m-%d')} → {df_test['Time'].iloc[-1].strftime('%Y-%m-%d')}",
@@ -594,20 +613,35 @@ def process_stock(symbol, file_path, confidence_threshold, mode="both", detailed
     gl = abs(sum(t.pnl_pts for t in trades if t.pnl_pts <= 0)) if trades else 1
     pf = gp / gl if gl > 0 else 0
 
+    # For 'all' mode: also test other windows and return comparison
+    window_results = None
+    if window_name == 'all_internal':
+        window_results = {}
+        for wn in ['morning', 'afternoon', 'both', 'full']:
+            wc = WINDOW_CONFIGS[wn]
+            wt, ws, wf = run_backtest(df_test, full_pred, full_proba, atr_test, confidence_threshold, wc)
+            w_wr = sum(1 for t in wt if t.pnl_pts > 0) / max(len(wt), 1) * 100
+            w_pnl = sum(t.pnl_pct for t in wt) if wt else 0
+            w_gp = sum(t.pnl_pts for t in wt if t.pnl_pts > 0) if wt else 0
+            w_gl = abs(sum(t.pnl_pts for t in wt if t.pnl_pts <= 0)) if wt else 1
+            w_pf = w_gp / w_gl if w_gl > 0 else 0
+            window_results[wn] = {'trades': len(wt), 'win_rate': round(w_wr, 1),
+                                   'pnl_pct': round(w_pnl, 3), 'pf': round(w_pf, 2)}
+
     return {
         'symbol': symbol, 'test_acc': round(test_acc * 100, 1),
         'train_acc': round(train_acc * 100, 1),
         'trades': len(trades), 'win_rate': round(win_rate, 1),
         'pnl_pct': round(total_pnl, 3), 'profit_factor': round(pf, 2),
         'signals': total_signals, 'filtered': filtered_signals,
-        'all_trades': trades
+        'all_trades': trades, 'window_results': window_results,
     }
 
 
 # ─────────── Main ───────────
 
 def main():
-    global CONFIDENCE_THRESHOLD
+    global CONFIDENCE_THRESHOLD, ACTIVE_WINDOW
     if not HAS_XGB or not HAS_SKLEARN:
         print("❌ Install: pip install xgboost scikit-learn")
         return
@@ -618,45 +652,80 @@ def main():
     parser.add_argument("--data-dir", default=DATA_DIR)
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--detailed", action="store_true")
+    parser.add_argument("--window", default=ACTIVE_WINDOW,
+                        choices=['morning', 'afternoon', 'both', 'full', 'all'],
+                        help="Trading window: morning (9:15-10:30), afternoon (1:00-3:24), "
+                             "both (morning+afternoon), full (9:15-3:24), all (compare all)")
     args = parser.parse_args()
 
     CONFIDENCE_THRESHOLD = args.confidence
+    ACTIVE_WINDOW = args.window
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    # Find files
+    # Find files — fix duplicate matching
     if args.stock:
-        files = glob.glob(f"{args.data_dir}/{args.stock}*_*min.csv") + \
-                glob.glob(f"{args.data_dir}/{args.stock.upper()}*_*min.csv")
+        stock_upper = args.stock.upper()
+        all_files = glob.glob(f"{args.data_dir}/*_*min.csv")
+        files = []
+        seen = set()
+        for f in all_files:
+            fname = os.path.basename(f)
+            sym = fname.split('_')[0].upper()
+            if sym == stock_upper and f not in seen:
+                files.append(f)
+                seen.add(f)
+                break  # Only take first match
     else:
-        files = glob.glob(f"{args.data_dir}/*_*min.csv")
+        files = sorted(set(glob.glob(f"{args.data_dir}/*_*min.csv")))
 
     if not files:
         print(f"❌ No data in {args.data_dir}/. Run fetch_stock_data.py first.")
         return
 
-    print(f"🤖 ML STOCK STRATEGY — XGBoost Ultra-Selective")
-    print(f"Confidence threshold: {CONFIDENCE_THRESHOLD:.0%}")
+    # Determine window mode
+    test_all_windows = ACTIVE_WINDOW == 'all'
+    window_to_use = 'all_internal' if test_all_windows else ACTIVE_WINDOW
+
+    print(f"🤖 ML STOCK STRATEGY v2 — Anti-Overfitting + Window Testing")
+    print(f"Confidence: {CONFIDENCE_THRESHOLD:.0%} | Window: {ACTIVE_WINDOW}")
+    print(f"Anti-overfit: depth=3, reg_alpha=0.5, reg_lambda=3.0, gamma=0.3")
     print(f"Found {len(files)} stocks")
     print(f"{'='*60}")
 
     results = []
     all_trades = []
+    window_comparison = {}  # For --window all
 
     for idx, fp in enumerate(sorted(files)):
         symbol = os.path.basename(fp).split("_")[0]
         print(f"[{idx+1}/{len(files)}] {symbol}...", end=" ", flush=True)
 
         try:
-            result = process_stock(symbol, fp, CONFIDENCE_THRESHOLD,
-                                   detailed=args.detailed or bool(args.stock))
+            if test_all_windows:
+                # Test all windows and show comparison
+                result = process_stock(symbol, fp, CONFIDENCE_THRESHOLD,
+                                       window_name='all_internal',
+                                       detailed=args.detailed or bool(args.stock))
+                if result and result.get('window_results'):
+                    window_comparison[symbol] = result['window_results']
+                    # Pick the best window for ranking
+                    best_w = max(result['window_results'].items(),
+                                 key=lambda x: x[1]['pnl_pct'])
+                    result['best_window'] = best_w[0]
+                    result['trades'] = best_w[1]['trades']
+                    result['win_rate'] = best_w[1]['win_rate']
+                    result['pnl_pct'] = best_w[1]['pnl_pct']
+                    result['profit_factor'] = best_w[1]['pf']
+                    print(f"Acc: {result['test_acc']:.1f}% | Best: {best_w[0]} ({best_w[1]['win_rate']:.1f}% win, {best_w[1]['pnl_pct']:+.2f}%)")
+            else:
+                result = process_stock(symbol, fp, CONFIDENCE_THRESHOLD,
+                                       window_name=window_to_use,
+                                       detailed=args.detailed or bool(args.stock))
+                if result:
+                    print(f"Acc: {result['test_acc']:.1f}% | {result['trades']} trades | Win: {result['win_rate']:.1f}% | P&L: {result['pnl_pct']:+.2f}%")
+
             if result:
                 results.append(result)
-                n = result['trades']
-                wr = result['win_rate']
-                pnl = result['pnl_pct']
-                ta = result['test_acc']
-                print(f"Acc: {ta:.1f}% | {n} trades | Win: {wr:.1f}% | P&L: {pnl:+.2f}%")
-
                 for t in result['all_trades']:
                     all_trades.append({
                         'symbol': symbol, 'direction': t.direction,
@@ -674,47 +743,69 @@ def main():
         print("❌ No results.")
         return
 
+    # Window comparison table (--window all)
+    if test_all_windows and window_comparison:
+        print(f"\n{'='*100}")
+        print(f"  ⏰ WINDOW COMPARISON (per stock)")
+        print(f"{'='*100}")
+        print(f"  {'Symbol':>12} | {'Morning':>20} | {'Afternoon':>20} | {'Both':>20} | {'Full Day':>20}")
+        print(f"  {'-'*96}")
+        for sym, wrs in sorted(window_comparison.items()):
+            parts = []
+            for w in ['morning', 'afternoon', 'both', 'full']:
+                d = wrs.get(w, {})
+                t = d.get('trades', 0)
+                wr = d.get('win_rate', 0)
+                pnl = d.get('pnl_pct', 0)
+                parts.append(f"{t:>3}t {wr:>4.0f}% {pnl:>+6.2f}%")
+            print(f"  {sym:>12} | {parts[0]:>20} | {parts[1]:>20} | {parts[2]:>20} | {parts[3]:>20}")
+
     # Ranking
     sorted_results = sorted(results, key=lambda r: r['win_rate'], reverse=True)
 
     print(f"\n{'='*95}")
-    print(f"  ML STRATEGY RANKINGS — Confidence ≥ {CONFIDENCE_THRESHOLD:.0%} | Top {min(args.top, len(sorted_results))}")
+    print(f"  ML RANKINGS — Confidence ≥ {CONFIDENCE_THRESHOLD:.0%} | Window: {ACTIVE_WINDOW}")
     print(f"{'='*95}")
-    print(f"  {'Rank':>4} {'Symbol':>12} {'TestAcc':>8} {'Trades':>7} {'Win%':>6} {'P&L%':>8} {'PF':>5} {'Signals':>8} {'Taken':>6}")
+    header = f"  {'Rank':>4} {'Symbol':>12} {'Train%':>7} {'Test%':>6} {'Trades':>7} {'Win%':>6} {'P&L%':>8} {'PF':>5}"
+    if test_all_windows:
+        header += f" {'BestWin':>8}"
+    print(header)
     print(f"  {'-'*75}")
 
     for rank, r in enumerate(sorted_results[:args.top], 1):
         star = "⭐" if rank <= 5 else "  "
-        print(f"  {rank:>3}. {r['symbol']:>12} {r['test_acc']:>7.1f}% {r['trades']:>7} {r['win_rate']:>5.1f}% {r['pnl_pct']:>+7.2f}% {r['profit_factor']:>5.2f} {r['signals']:>8} {r['filtered']:>6} {star}")
+        line = f"  {rank:>3}. {r['symbol']:>12} {r['train_acc']:>6.1f}% {r['test_acc']:>5.1f}% {r['trades']:>7} {r['win_rate']:>5.1f}% {r['pnl_pct']:>+7.2f}% {r['profit_factor']:>5.2f}"
+        if test_all_windows and 'best_window' in r:
+            line += f" {r['best_window']:>8}"
+        print(f"{line} {star}")
 
     # Summary
     total_trades = sum(r['trades'] for r in results)
     total_wins = sum(sum(1 for t in r['all_trades'] if t.pnl_pts > 0) for r in results)
     overall_wr = total_wins / max(total_trades, 1) * 100
-
     profitable = [r for r in results if r['pnl_pct'] > 0]
     avg_test_acc = np.mean([r['test_acc'] for r in results])
+    avg_train_acc = np.mean([r['train_acc'] for r in results])
 
-    print(f"\n  📊 OVERALL SUMMARY")
-    print(f"  Stocks tested:    {len(results)}")
-    print(f"  Avg ML accuracy:  {avg_test_acc:.1f}%")
-    print(f"  Total trades:     {total_trades}")
-    print(f"  Overall win rate: {overall_wr:.1f}%")
-    print(f"  Profitable stocks: {len(profitable)}/{len(results)}")
+    print(f"\n  📊 OVERALL")
+    print(f"  Stocks:       {len(results)}")
+    print(f"  Avg train:    {avg_train_acc:.1f}% → test: {avg_test_acc:.1f}% (gap: {avg_train_acc - avg_test_acc:.1f}%)")
+    print(f"  Total trades: {total_trades} | Win: {overall_wr:.1f}%")
+    print(f"  Profitable:   {len(profitable)}/{len(results)}")
     print(f"{'='*95}")
 
     # Save
-    pd.DataFrame([{k: v for k, v in r.items() if k != 'all_trades'} for r in sorted_results]).to_csv(
-        f"{RESULTS_DIR}/ml_rankings.csv", index=False)
+    save_data = [{k: v for k, v in r.items() if k not in ('all_trades', 'window_results')} for r in sorted_results]
+    pd.DataFrame(save_data).to_csv(f"{RESULTS_DIR}/ml_rankings.csv", index=False)
     if all_trades:
         pd.DataFrame(all_trades).to_csv(f"{RESULTS_DIR}/ml_all_trades.csv", index=False)
 
     top5 = sorted_results[:5]
-    print(f"\n🎯 TOP 5 STOCKS FOR ML TRADING:")
+    print(f"\n🎯 TOP 5:")
     for r in top5:
-        print(f"  ⭐ {r['symbol']}: Acc {r['test_acc']:.1f}% | Win {r['win_rate']:.1f}% | PF {r['profit_factor']:.2f} | {r['trades']} trades")
-    print(f"\n  💾 Models saved to {MODEL_DIR}/")
-    print(f"  💾 Rankings: {RESULTS_DIR}/ml_rankings.csv")
+        extra = f" | Best: {r.get('best_window', ACTIVE_WINDOW)}" if test_all_windows else ""
+        print(f"  ⭐ {r['symbol']}: Test {r['test_acc']:.1f}% | Win {r['win_rate']:.1f}% | PF {r['profit_factor']:.2f}{extra}")
+    print(f"\n  💾 {MODEL_DIR}/ | {RESULTS_DIR}/ml_rankings.csv")
 
 
 if __name__ == "__main__":
