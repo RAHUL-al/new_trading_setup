@@ -74,14 +74,20 @@ WINDOW_CONFIGS = {
 
 ACTIVE_WINDOW = 'full'            # Default: Full day 9:15 AM - 3:24 PM
 
-CONFIDENCE_THRESHOLD = 0.55       # Regularized model → narrower proba range, 55% is meaningful
-LOOKAHEAD_CANDLES = 5             # Predict movement over next 5 candles
-MOVE_THRESHOLD_PCT = 0.15         # 0.15% move = label as up/down
-TRAIN_RATIO = 0.75                # First 75% for training
+CONFIDENCE_THRESHOLD = 0.55       # Regularized model → narrower proba range
+LOOKAHEAD_CANDLES = 8             # Predict movement over next 8 candles (was 5)
+MOVE_THRESHOLD_PCT = 0.30         # 0.30% move = label as up/down (was 0.15 → noisy)
+TRAIN_RATIO = 0.75
 
-SL_ATR_MULT = 1.5
-TRAIL_ATR_MULT = 1.0
-MIN_HOLD = 2
+SL_ATR_MULT = 2.0                 # Wider SL = fewer stop outs (was 1.5)
+TRAIL_ATR_MULT = 1.2              # Slightly wider trail (was 1.0)
+MIN_HOLD = 3
+MAX_TRADES_PER_DAY = 2            # Hard limit: max 2 trades per day
+
+# Post-ML hard filters (on top of ML prediction)
+MIN_ATR_GATE = 0.10               # ATR must be > 0.10% of price
+MIN_VOL_SURGE = 1.3               # Volume must be > 1.3x 20-candle avg
+MIN_BODY_RATIO = 0.40             # Candle body > 40% of range
 
 
 # ─────────── Models ───────────
@@ -296,16 +302,24 @@ def in_window(t, window_config):
 
 
 def run_backtest(df, predictions, probabilities, atr_val, confidence_threshold, window_config):
-    """Backtest ML predictions with ultra-selective filtering."""
+    """Backtest ML predictions with ultra-selective filtering + hard rules."""
     trades = []
     pos = None
     prev_date = None
     total_signals = 0
     filtered_signals = 0
+    trades_today = 0
 
     w1 = window_config['w1']
     w2 = window_config['w2']
     sqoff = window_config['sqoff']
+
+    # Pre-compute volume and body ratio for hard filters
+    volume = df['Volume'].astype(float) if 'Volume' in df.columns else pd.Series(0, index=df.index)
+    vol_avg = volume.rolling(20).mean()
+    body = (df['Close'].astype(float) - df['Open'].astype(float)).abs()
+    full_range = (df['High'].astype(float) - df['Low'].astype(float)).replace(0, np.nan)
+    body_ratio = body / full_range
 
     for i in range(len(df)):
         row = df.iloc[i]
@@ -326,9 +340,10 @@ def run_backtest(df, predictions, probabilities, atr_val, confidence_threshold, 
                                     round(pnl, 2), round(pnl/pos.entry_price*100, 3),
                                     "DAY_END", pos.confidence))
                 pos = None
+            trades_today = 0
         prev_date = curr_date
 
-        # W1 close (if both windows exist, close W1 positions before gap)
+        # W1 close (if both windows exist)
         if pos and w1 and w2 and t > w1[1] and t < w2[0]:
             if pos.entry_time.time() <= w1[1]:
                 pnl = _pnl(pos, close)
@@ -353,7 +368,7 @@ def run_backtest(df, predictions, probabilities, atr_val, confidence_threshold, 
         in_active = False
         if w1 and w1[0] <= t <= w1[1]: in_active = True
         if w2 and w2[0] <= t <= sqoff: in_active = True
-        if w1 and not w2 and w1[0] <= t <= sqoff: in_active = True  # 'full' mode
+        if w1 and not w2 and w1[0] <= t <= sqoff: in_active = True
         if not in_active:
             continue
 
@@ -393,12 +408,35 @@ def run_backtest(df, predictions, probabilities, atr_val, confidence_threshold, 
         prob_up = probabilities[i][1] if len(probabilities[i]) > 1 else 0.5
         prob_down = probabilities[i][0] if len(probabilities[i]) > 1 else 0.5
 
-        # ─── ULTRA-SELECTIVE: Only trade when confidence > threshold ───
         is_buy = pred == 1 and prob_up >= confidence_threshold
         is_sell = pred == 0 and prob_down >= confidence_threshold
 
         if is_buy or is_sell:
             total_signals += 1
+
+        # ─── POST-ML HARD FILTERS (reduce noise) ───
+        if is_buy or is_sell:
+            # ATR gate: skip low volatility
+            atr_pct = curr_atr / close * 100 if close > 0 else 0
+            if atr_pct < MIN_ATR_GATE:
+                is_buy = is_sell = False
+
+            # Volume surge: must have institutional interest
+            curr_vol_avg = vol_avg.iloc[i] if i < len(vol_avg) else 0
+            if not np.isnan(curr_vol_avg) and curr_vol_avg > 0:
+                if volume.iloc[i] < curr_vol_avg * MIN_VOL_SURGE:
+                    is_buy = is_sell = False
+
+            # Candle body: skip dojis/indecision
+            br = body_ratio.iloc[i] if i < len(body_ratio) else 0
+            if np.isnan(br) or br < MIN_BODY_RATIO:
+                is_buy = is_sell = False
+
+            # Candle direction must match signal
+            if is_buy and close < float(row['Open']):
+                is_buy = False
+            if is_sell and close > float(row['Open']):
+                is_sell = False
 
         # Opposite signal close
         if is_buy and pos and pos.direction == "SHORT" and (i - pos.entry_idx) >= MIN_HOLD:
@@ -416,17 +454,19 @@ def run_backtest(df, predictions, probabilities, atr_val, confidence_threshold, 
                                 "OPPOSITE", pos.confidence))
             pos = None
 
-        # New entry
-        can_enter = in_window(t, window_config)
+        # New entry — with daily trade limit
+        can_enter = in_window(t, window_config) and trades_today < MAX_TRADES_PER_DAY
         if not pos and can_enter and curr_atr > 0:
             if is_buy:
                 sl = close - curr_atr * SL_ATR_MULT
                 pos = Position("LONG", close, row['Time'], sl, i, prob_up)
                 filtered_signals += 1
+                trades_today += 1
             elif is_sell:
                 sl = close + curr_atr * SL_ATR_MULT
                 pos = Position("SHORT", close, row['Time'], sl, i, prob_down)
                 filtered_signals += 1
+                trades_today += 1
 
     return trades, total_signals, filtered_signals
 
