@@ -74,7 +74,7 @@ WINDOW_CONFIGS = {
 
 ACTIVE_WINDOW = 'afternoon'       # Default: 1:00 PM - 3:24 PM
 
-CONFIDENCE_THRESHOLD = 0.70       # Only trade when prediction > 70% confident
+CONFIDENCE_THRESHOLD = 0.55       # Regularized model → narrower proba range, 55% is meaningful
 LOOKAHEAD_CANDLES = 5             # Predict movement over next 5 candles
 MOVE_THRESHOLD_PCT = 0.15         # 0.15% move = label as up/down
 TRAIN_RATIO = 0.75                # First 75% for training
