@@ -156,13 +156,14 @@ def fetch_stock(smart_api, symbol, token, interval="THREE_MINUTE", chunk_days=15
 
 def main():
     import argparse
+    global MONTHS_BACK
+
     parser = argparse.ArgumentParser(description="Fetch NIFTY 50 stock data from AngelOne")
     parser.add_argument("--stock", default=None, help="Fetch only this stock (e.g., RELIANCE)")
     parser.add_argument("--interval", type=int, default=3, help="Candle interval in minutes (default: 3)")
     parser.add_argument("--months", type=int, default=MONTHS_BACK, help="Months of history (default: 6)")
     args = parser.parse_args()
 
-    global MONTHS_BACK
     MONTHS_BACK = args.months
 
     # Determine API interval and resampling
