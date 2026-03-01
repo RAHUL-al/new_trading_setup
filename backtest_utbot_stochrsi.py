@@ -32,11 +32,11 @@ warnings.filterwarnings('ignore')
 
 
 # ─────────── Config ───────────
-TRADING_START = dt_time(12, 50)
-TRADING_END = dt_time(15, 10)
-SQUARE_OFF_TIME = dt_time(15, 24)
-MARKET_OPEN = dt_time(9, 16)
-MARKET_CLOSE = dt_time(15, 30)
+TRADING_START = dt_time(9, 15)     # Signal checking starts
+TRADING_END = dt_time(15, 15)      # No new trades after 3:15 PM
+SQUARE_OFF_TIME = dt_time(15, 24)  # Force close all at 3:24 PM
+MARKET_OPEN = dt_time(9, 15)
+MARKET_CLOSE = dt_time(15, 25)
 ATR_GATE = 13.0              # Minimum ATR to enter new trade
 ATR_PERIOD = 14               # ATR calculation period
 SL_ATR_MULT = 2.0             # Stop loss = entry ± (ATR × multiplier)
@@ -190,12 +190,27 @@ def run_backtest(df, ut_buy, ut_sell, stoch_buy, stoch_sell, stoch_k, stoch_d, a
     """
     trades = []
     open_pos = None
+    prev_date = None
 
     for i in range(len(df)):
         row = df.iloc[i]
         t = row['Time'].time() if hasattr(row['Time'], 'time') else row['Time']
+        curr_date = row['Time'].date() if hasattr(row['Time'], 'date') else None
         close = float(row['Close'])
         high = float(row['High'])
+
+        # ── Day boundary: force close any open position from previous day ──
+        if prev_date is not None and curr_date != prev_date and open_pos:
+            # Use previous candle's close to square off
+            prev_row = df.iloc[i-1]
+            pnl = _calc_pnl(open_pos, float(prev_row['Close']))
+            trades.append(Trade(
+                open_pos.direction, open_pos.entry_price, float(prev_row['Close']),
+                open_pos.entry_time, prev_row['Time'], round(pnl, 2),
+                "DAY_END_CLOSE", open_pos.entry_atr, float(atr[i-1])
+            ))
+            open_pos = None
+        prev_date = curr_date
         low = float(row['Low'])
         curr_atr = float(atr[i])
 
