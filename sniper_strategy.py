@@ -51,17 +51,17 @@ VOL_AVG_PERIOD = 20
 ATR_PERIOD = 14
 
 # Confluence thresholds
-VOL_SPIKE_MULT = 2.0              # Volume must be > 2x average
-MIN_BODY_RATIO = 0.60             # Candle body > 60% of range
-RSI_OVERSOLD = 40                 # RSI was below this (for BUY)
-RSI_RECOVERY_BUY = 45             # RSI now above this (recovery)
-RSI_OVERBOUGHT = 60               # RSI was above this (for SELL)
-RSI_RECOVERY_SELL = 55            # RSI now below this (recovery)
+VOL_SPIKE_MULT = 1.5              # Volume must be > 1.5x average (was 2x, too strict)
+MIN_BODY_RATIO = 0.55             # Candle body > 55% of range
+RSI_BUY_MIN = 40                  # BUY: RSI between 40-65 (healthy momentum, not overbought)
+RSI_BUY_MAX = 65
+RSI_SELL_MIN = 35                 # SELL: RSI between 35-60 (healthy momentum, not oversold)
+RSI_SELL_MAX = 60
 
 # Risk management
 TARGET_MULT = 1.5                 # Target = 1.5x SL distance
 MAX_TRADES_PER_DAY = 1            # Only the BEST setup
-MIN_CONFLUENCES = 6               # Need all 6 conditions
+MIN_CONFLUENCES = 5               # Need 5/6 (achievable now)
 
 # Window
 ENTRY_START = dt_time(13, 0)      # 1:00 PM
@@ -123,10 +123,6 @@ def scan_confluences(df):
     vwap = calc_vwap(df)
     vol_avg = volume.rolling(VOL_AVG_PERIOD).mean()
     
-    # RSI lookback (was RSI below/above threshold in last 5 candles?)
-    rsi_was_oversold = rsi.rolling(5).min()
-    rsi_was_overbought = rsi.rolling(5).max()
-    
     # Candle body analysis
     body = (close - open_).abs()
     full_range = (high - low).replace(0, np.nan)
@@ -134,9 +130,9 @@ def scan_confluences(df):
     bullish_candle = close > open_
     bearish_candle = close < open_
     
-    # Pullback check: was any of last 3 candles opposite color?
-    had_red_in_3 = bearish_candle.rolling(3).sum() >= 1  # At least 1 red in last 3
-    had_green_in_3 = bullish_candle.rolling(3).sum() >= 1  # At least 1 green in last 3
+    # Pullback check: 2 of last 4 candles were opposite color (stronger pullback)
+    had_red_in_4 = bearish_candle.rolling(4).sum() >= 2
+    had_green_in_4 = bullish_candle.rolling(4).sum() >= 2
     
     n = len(df)
     results = []
@@ -152,13 +148,11 @@ def scan_confluences(df):
         c_vol_avg = float(vol_avg.iloc[i]) if not np.isnan(vol_avg.iloc[i]) else v
         c_atr = float(atr.iloc[i])
         c_body_ratio = float(body_ratio.iloc[i]) if not np.isnan(body_ratio.iloc[i]) else 0
-        c_rsi_was_os = float(rsi_was_oversold.iloc[i]) if not np.isnan(rsi_was_oversold.iloc[i]) else 50
-        c_rsi_was_ob = float(rsi_was_overbought.iloc[i]) if not np.isnan(rsi_was_overbought.iloc[i]) else 50
         
         is_bullish = bool(bullish_candle.iloc[i])
         is_bearish = bool(bearish_candle.iloc[i])
-        had_red = bool(had_red_in_3.iloc[i]) if not np.isnan(had_red_in_3.iloc[i]) else False
-        had_green = bool(had_green_in_3.iloc[i]) if not np.isnan(had_green_in_3.iloc[i]) else False
+        had_red = bool(had_red_in_4.iloc[i]) if not np.isnan(had_red_in_4.iloc[i]) else False
+        had_green = bool(had_green_in_4.iloc[i]) if not np.isnan(had_green_in_4.iloc[i]) else False
         
         # ═══ BUY CONFLUENCES ═══
         buy_score = 0
@@ -169,13 +163,13 @@ def scan_confluences(df):
             buy_score += 1
             buy_reasons.append("VWAP↑")
         
-        # 2. EMA trend: close above EMA20
+        # 2. EMA trend: close above EMA20 AND close > open (current candle bullish)
         if c > c_ema:
             buy_score += 1
             buy_reasons.append("EMA↑")
         
-        # 3. RSI recovery: was oversold, now recovering
-        if c_rsi_was_os < RSI_OVERSOLD and c_rsi > RSI_RECOVERY_BUY:
+        # 3. RSI healthy zone: between 40-65 (not overbought, has room to run)
+        if RSI_BUY_MIN <= c_rsi <= RSI_BUY_MAX:
             buy_score += 1
             buy_reasons.append("RSI↑")
         
@@ -208,8 +202,8 @@ def scan_confluences(df):
             sell_score += 1
             sell_reasons.append("EMA↓")
         
-        # 3. RSI recovery: was overbought, now dropping
-        if c_rsi_was_ob > RSI_OVERBOUGHT and c_rsi < RSI_RECOVERY_SELL:
+        # 3. RSI healthy zone: between 35-60 (not oversold, has room to fall)
+        if RSI_SELL_MIN <= c_rsi <= RSI_SELL_MAX:
             sell_score += 1
             sell_reasons.append("RSI↓")
         
