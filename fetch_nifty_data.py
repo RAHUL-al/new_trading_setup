@@ -46,27 +46,6 @@ INTERVAL_CONFIG = {
         "api_interval": "ONE_MINUTE",
         "resample_to": None,
     },
-    "TWO_MINUTE": {
-        "chunk_days": 5,          # Fetch 1-min, then resample to 2-min
-        "from_date": "2024-01-01",
-        "output_file": "nifty_2min_data.csv",
-        "api_interval": "ONE_MINUTE",  # Fetch 1-min from API
-        "resample_to": 2,              # Then resample to 2-min
-    },
-    "THREE_MINUTE": {
-        "chunk_days": 15,
-        "from_date": "2024-01-01",
-        "output_file": "nifty_3min_data.csv",
-        "api_interval": "THREE_MINUTE",
-        "resample_to": None,
-    },
-    "FIVE_MINUTE": {
-        "chunk_days": 25,
-        "from_date": "2024-01-01",
-        "output_file": "nifty_5min_data.csv",
-        "api_interval": "FIVE_MINUTE",
-        "resample_to": None,
-    },
 }
 
 
