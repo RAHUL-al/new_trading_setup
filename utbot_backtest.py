@@ -386,7 +386,7 @@ def print_summary(all_trades, daily_results):
             monthly[m]['wins'] += 1
     
     print(f"\n{'='*65}")
-    print(f"  🤖 UT BOT ALERT + EMA {EMA_FAST}/{EMA_SLOW} — OVERALL RESULTS")
+    print(f"  🤖 UT BOT ALERT — OVERALL RESULTS")
     print(f"{'='*65}")
     
     print(f"\n  📊 TRADE STATS")
