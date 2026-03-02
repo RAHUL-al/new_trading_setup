@@ -1,11 +1,11 @@
 """
 utbot_backtest.py — UT Bot Alert Strategy Backtest (NIFTY 1-min)
 
-STRATEGY: UT Bot Alert + EMA 4/13 Trend Filter
+STRATEGY: UT Bot Alert (Pure ATR + Trailing Stop)
   - ATR calculated with RMA (Wilder's moving average), period 14
   - Trailing stop: ATR * key_value (1.0) below/above price
-  - BUY signal: price crosses ABOVE trailing stop AND EMA4 > EMA13
-  - SELL signal: price crosses BELOW trailing stop AND EMA4 < EMA13
+  - BUY signal: price crosses ABOVE trailing stop
+  - SELL signal: price crosses BELOW trailing stop
   - ATR must be > 10
 
 RULES:
@@ -13,7 +13,6 @@ RULES:
   - Square off all positions at 3:24 PM
   - Trailing SL: if candle closes beyond previous SL → trail
   - Close on: opposite signal OR trailing SL hit OR 3:24 PM
-  - EMA 4/13 must confirm trend direction for entry
   - Show EACH DAY result + overall summary
 
 DATA: NIFTY 1-minute, 2 years
@@ -37,10 +36,6 @@ warnings.filterwarnings('ignore')
 ATR_PERIOD = 14
 ATR_KEY_VALUE = 1.0               # UT Bot: trailing stop = ATR * key_value
 MIN_ATR = 10                      # ATR must be > 10
-
-# EMA trend filter
-EMA_FAST = 4
-EMA_SLOW = 13
 
 ENTRY_START = dt_time(13, 0)      # 1:00 PM
 ENTRY_END = dt_time(15, 15)       # 3:15 PM
@@ -144,13 +139,12 @@ def compute_ut_bot_signals(df, atr_period=14, key_value=1.0, min_atr=10):
 
 # ─────────── Backtest ───────────
 
-def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals, ema_fast_vals, ema_slow_vals):
+def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
     """
     Backtest with:
     - New trades only 1:00 PM - 3:15 PM
     - Square off at 3:24 PM
     - Trail SL: if candle closes beyond previous SL → update SL
-    - EMA 4/13 trend filter: BUY only when EMA4 > EMA13, SELL when EMA4 < EMA13
     - Close on: opposite signal, SL hit, or square off
     
     Returns list of daily results.
@@ -163,7 +157,6 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals, ema_fast_vals, ema
     all_trades = []
     daily_results = {}
     prev_date = None
-    ema_filtered_count = 0
     
     for i in range(len(df)):
         t = df.iloc[i]['Time'].time()
@@ -174,12 +167,7 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals, ema_fast_vals, ema
         curr_atr = float(atr_vals[i])
         curr_ts = float(trail_stop[i])
         
-        # EMA values
-        ema_f = float(ema_fast_vals[i]) if not np.isnan(ema_fast_vals[i]) else 0
-        ema_s = float(ema_slow_vals[i]) if not np.isnan(ema_slow_vals[i]) else 0
-        ema_bullish = ema_f > ema_s  # EMA4 > EMA13 = bullish trend
-        ema_bearish = ema_f < ema_s  # EMA4 < EMA13 = bearish trend
-        
+
         # ── Day boundary reset ──
         if prev_date and curr_date != prev_date:
             if pos:
@@ -248,15 +236,7 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals, ema_fast_vals, ema
             _add_daily(daily_results, curr_date, trade)
             pos = None
         
-        # ── EMA filter: BUY only if EMA4 > EMA13, SELL only if EMA4 < EMA13 ──
-        if is_buy and not ema_bullish:
-            is_buy = False
-            ema_filtered_count += 1
-        if is_sell and not ema_bearish:
-            is_sell = False
-            ema_filtered_count += 1
-        
-        # ── New entry (only within window + EMA confirmed) ──
+        # ── New entry (only within window) ──
         if not pos and in_window and t <= ENTRY_END:
             if is_buy and curr_atr >= MIN_ATR:
                 sl = c - curr_atr * ATR_KEY_VALUE
@@ -267,7 +247,7 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals, ema_fast_vals, ema
                 pos = {'dir': 'SHORT', 'entry': c, 'sl': sl,
                        'entry_time': df.iloc[i]['Time'], 'entry_idx': i}
     
-    return all_trades, daily_results, ema_filtered_count
+    return all_trades, daily_results
 
 
 def _pnl(pos, exit_price):
@@ -485,19 +465,13 @@ def main():
     print(f"Loaded {total_candles:,} candles | {total_days} days")
     print(f"Date range: {date_range}")
     
-    print(f"\n🤖 UT BOT ALERT + EMA {EMA_FAST}/{EMA_SLOW} BACKTEST")
+    print(f"\n🤖 UT BOT ALERT BACKTEST (Pure)")
     print(f"ATR: RMA({args.atr_period}) × {ATR_KEY_VALUE} | Min ATR: {MIN_ATR}")
-    print(f"EMA filter: EMA{EMA_FAST} vs EMA{EMA_SLOW} (BUY: EMA{EMA_FAST}>EMA{EMA_SLOW}, SELL: EMA{EMA_FAST}<EMA{EMA_SLOW})")
     print(f"Window: {ENTRY_START.strftime('%H:%M')} - {ENTRY_END.strftime('%H:%M')} | Square off: {SQUARE_OFF.strftime('%H:%M')}")
     print(f"{'='*60}")
     
-    # Compute EMAs
-    close = df['Close'].astype(float)
-    ema_fast_vals = calc_ema(close, EMA_FAST).values
-    ema_slow_vals = calc_ema(close, EMA_SLOW).values
-    
     # Generate UT Bot signals
-    print(f"\nComputing UT Bot signals + EMA filter...")
+    print(f"\nComputing UT Bot signals...")
     buy_sig, sell_sig, trail_stop, atr_vals, direction = compute_ut_bot_signals(
         df, args.atr_period, ATR_KEY_VALUE, MIN_ATR
     )
@@ -505,23 +479,17 @@ def main():
     total_buy = buy_sig.sum()
     total_sell = sell_sig.sum()
     
-    # Count how many pass EMA filter
-    ema_ok_buy = sum(1 for i in range(len(buy_sig)) if buy_sig[i] and ema_fast_vals[i] > ema_slow_vals[i])
-    ema_ok_sell = sum(1 for i in range(len(sell_sig)) if sell_sig[i] and ema_fast_vals[i] < ema_slow_vals[i])
-    
-    print(f"  UT Bot buy signals:  {total_buy} → EMA confirmed: {ema_ok_buy}")
-    print(f"  UT Bot sell signals: {total_sell} → EMA confirmed: {ema_ok_sell}")
-    print(f"  EMA filtered out:    {(total_buy - ema_ok_buy) + (total_sell - ema_ok_sell)} signals")
+    print(f"  UT Bot buy signals:  {total_buy}")
+    print(f"  UT Bot sell signals: {total_sell}")
     print(f"  ATR range:           {atr_vals[~np.isnan(atr_vals)].min():.1f} - {atr_vals[~np.isnan(atr_vals)].max():.1f}")
     
     # Backtest
     print(f"\n🚀 Running backtest...")
-    all_trades, daily_results, ema_filtered = run_backtest(
-        df, buy_sig, sell_sig, trail_stop, atr_vals, ema_fast_vals, ema_slow_vals
+    all_trades, daily_results = run_backtest(
+        df, buy_sig, sell_sig, trail_stop, atr_vals
     )
     
     print(f"  Total trades: {len(all_trades)}")
-    print(f"  EMA filtered: {ema_filtered} entries blocked by EMA trend")
     
     # Daily results
     print_daily_results(daily_results)
