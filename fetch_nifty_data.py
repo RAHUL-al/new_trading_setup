@@ -87,30 +87,44 @@ def connect_api():
     return smart_api
 
 
-def fetch_candles(smart_api, from_date, to_date, interval):
-    """Fetch candles for NIFTY between two dates."""
-    try:
-        params = {
-            "exchange": NIFTY_EXCHANGE,
-            "symboltoken": NIFTY_TOKEN,
-            "interval": interval,
-            "fromdate": f"{from_date} 09:15",
-            "todate": f"{to_date} 15:30",
-        }
-        response = smart_api.getCandleData(params)
+def fetch_candles(smart_api, from_date, to_date, interval, max_retries=3):
+    """Fetch candles for NIFTY between two dates. Retries on rate limit."""
+    for attempt in range(max_retries):
+        try:
+            params = {
+                "exchange": NIFTY_EXCHANGE,
+                "symboltoken": NIFTY_TOKEN,
+                "interval": interval,
+                "fromdate": f"{from_date} 09:15",
+                "todate": f"{to_date} 15:30",
+            }
+            response = smart_api.getCandleData(params)
 
-        if response and response.get("data"):
-            columns = ["Time", "Open", "High", "Low", "Close", "Volume"]
-            df = pd.DataFrame(response["data"], columns=columns)
-            return df
-        else:
-            msg = response.get("message", "No data") if response else "No response"
-            logger.warning(f"No data for {from_date} to {to_date}: {msg}")
+            if response and response.get("data"):
+                columns = ["Time", "Open", "High", "Low", "Close", "Volume"]
+                df = pd.DataFrame(response["data"], columns=columns)
+                return df
+            else:
+                msg = response.get("message", "No data") if response else "No response"
+                if "TooManyRequests" in str(msg):
+                    wait = 5 * (attempt + 1)  # 5s, 10s, 15s backoff
+                    logger.warning(f"Rate limited. Waiting {wait}s... (attempt {attempt+1}/{max_retries})")
+                    time.sleep(wait)
+                    continue
+                logger.warning(f"No data for {from_date} to {to_date}: {msg}")
+                return pd.DataFrame()
+
+        except Exception as e:
+            if "TooManyRequests" in str(e):
+                wait = 5 * (attempt + 1)
+                logger.warning(f"Rate limited. Waiting {wait}s... (attempt {attempt+1}/{max_retries})")
+                time.sleep(wait)
+                continue
+            logger.error(f"API failed for {from_date} to {to_date}: {e}")
             return pd.DataFrame()
-
-    except Exception as e:
-        logger.error(f"API failed for {from_date} to {to_date}: {e}")
-        return pd.DataFrame()
+    
+    logger.error(f"Failed after {max_retries} retries: {from_date} to {to_date}")
+    return pd.DataFrame()
 
 
 def get_date_chunks(start_date, end_date, chunk_days):
@@ -160,9 +174,9 @@ def fetch_interval(smart_api, interval):
         else:
             logger.info(f"  No data (weekend/holiday?)")
 
-        # Rate limit
+        # Rate limit — 2 seconds between API calls to avoid TooManyRequests
         if i < len(chunks) - 1:
-            time.sleep(0.5)
+            time.sleep(2)
 
     if not all_data:
         logger.error(f"No data fetched for {interval}!")

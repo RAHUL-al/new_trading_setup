@@ -87,24 +87,40 @@ def get_symbol_tokens():
     return token_map
 
 
-def fetch_candles(smart_api, symbol_token, from_date, to_date, interval="THREE_MINUTE"):
-    """Fetch candle data for a stock."""
-    try:
-        params = {
-            "exchange": "NSE",
-            "symboltoken": symbol_token,
-            "interval": interval,
-            "fromdate": f"{from_date} 09:15",
-            "todate": f"{to_date} 15:30",
-        }
-        response = smart_api.getCandleData(params)
-        if response and response.get("data"):
-            columns = ["Time", "Open", "High", "Low", "Close", "Volume"]
-            return pd.DataFrame(response["data"], columns=columns)
-        return pd.DataFrame()
-    except Exception as e:
-        logger.error(f"API error: {e}")
-        return pd.DataFrame()
+def fetch_candles(smart_api, symbol_token, from_date, to_date, interval="THREE_MINUTE", max_retries=3):
+    """Fetch candle data for a stock. Retries on rate limit."""
+    for attempt in range(max_retries):
+        try:
+            params = {
+                "exchange": "NSE",
+                "symboltoken": symbol_token,
+                "interval": interval,
+                "fromdate": f"{from_date} 09:15",
+                "todate": f"{to_date} 15:30",
+            }
+            response = smart_api.getCandleData(params)
+            if response and response.get("data"):
+                columns = ["Time", "Open", "High", "Low", "Close", "Volume"]
+                return pd.DataFrame(response["data"], columns=columns)
+            else:
+                msg = response.get("message", "No data") if response else "No response"
+                if "TooManyRequests" in str(msg):
+                    wait = 5 * (attempt + 1)
+                    logger.warning(f"Rate limited. Waiting {wait}s... (attempt {attempt+1}/{max_retries})")
+                    time.sleep(wait)
+                    continue
+                return pd.DataFrame()
+        except Exception as e:
+            if "TooManyRequests" in str(e):
+                wait = 5 * (attempt + 1)
+                logger.warning(f"Rate limited. Waiting {wait}s... (attempt {attempt+1}/{max_retries})")
+                time.sleep(wait)
+                continue
+            logger.error(f"API error: {e}")
+            return pd.DataFrame()
+    
+    logger.error(f"Failed after {max_retries} retries")
+    return pd.DataFrame()
 
 
 def fetch_stock(smart_api, symbol, token, interval="THREE_MINUTE", chunk_days=15, resample_to=None):
@@ -126,7 +142,7 @@ def fetch_stock(smart_api, symbol, token, interval="THREE_MINUTE", chunk_days=15
             all_data.append(df)
 
         current = chunk_end + timedelta(days=1)
-        time.sleep(0.3)  # Rate limit
+        time.sleep(2)  # Rate limit — 2s between API calls
 
     if not all_data:
         return pd.DataFrame()
@@ -236,7 +252,7 @@ def main():
             logger.warning(f"  ❌ No data for {symbol}")
             failed.append(symbol)
 
-        time.sleep(0.5)
+        time.sleep(1)  # Pause between stocks
 
     logger.info(f"\n{'='*60}")
     logger.info(f"DONE! {success}/{len(stocks)} stocks fetched")
