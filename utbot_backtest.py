@@ -35,7 +35,7 @@ ATR_PERIOD = 14
 ATR_KEY_VALUE = 1.0
 MIN_ATR = 10
 
-ENTRY_START = dt_time(13, 0)      # 1:00 PM
+ENTRY_START = dt_time(9, 15)      # 9:15 AM
 ENTRY_END = dt_time(15, 15)       # 3:15 PM
 SQUARE_OFF = dt_time(15, 24)      # 3:24 PM
 
