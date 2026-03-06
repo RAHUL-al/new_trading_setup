@@ -1,27 +1,31 @@
 """
-utbot_backtest.py — UT Bot Alert Strategy Backtest (NIFTY 1-min)
+utbot_backtest.py — UT Bot Alert Strategy Backtest (NIFTY 1-min) [OPTIMIZED]
 
 STRATEGY: UT Bot Alert (Pure ATR + Trailing Stop)
   - ATR calculated with RMA (Wilder's moving average), period 14
   - Trailing stop: ATR * key_value (1.0) below/above price
   - BUY signal: price crosses ABOVE trailing stop
   - SELL signal: price crosses BELOW trailing stop
-  - ATR must be > 10
 
 RULES:
   - New trades only between 1:00 PM and 3:15 PM
   - Square off all positions at 3:24 PM
   - Trailing SL: if candle closes beyond previous SL → trail
   - Close on: opposite signal OR trailing SL hit OR 3:24 PM
-  - Show EACH DAY result + overall summary
+
+OPTIMIZATIONS:
+  1. MARTINGALE RECOVERY: Double qty after >15pt loss (max 3x), reset after recovery (7pt buffer)
+  2. COOLDOWN: Skip 3 candles after SL hit (anti-whipsaw)
+  3. MAX DAILY LOSS: Stop trading at -80pts/day
+  4. MAX TRADES/DAY: Cap at 8 trades
+  5. DIRECTION BIAS: Only trade in UT Bot trailing stop direction
 
 DATA: NIFTY 1-minute, 2 years
 
 Usage:
     python utbot_backtest.py                            # Default: nifty_1min_data.csv
-    python utbot_backtest.py --file nifty_1min_data.csv
     python utbot_backtest.py --atr-key 1.5              # Different ATR multiplier
-    python utbot_backtest.py --min-atr 12               # Higher ATR threshold
+    python utbot_backtest.py --min-atr 6.9              # Lower ATR threshold
 """
 
 import pandas as pd
@@ -139,16 +143,32 @@ def compute_ut_bot_signals(df, atr_period=14, key_value=1.0, min_atr=10):
 
 # ─────────── Backtest ───────────
 
-def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
+def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals, direction):
     """
-    Backtest with:
+    Optimized Backtest with:
     - New trades only 1:00 PM - 3:15 PM
     - Square off at 3:24 PM
     - Trail SL: if candle closes beyond previous SL → update SL
     - Close on: opposite signal, SL hit, or square off
     
-    Returns list of daily results.
+    OPTIMIZATIONS:
+    1. MARTINGALE RECOVERY: If trade loses > LOSS_THRESHOLD pts → double qty (max 3x)
+       Reset to 1x when accumulated loss recovered (within RECOVERY_BUFFER pts)
+    2. COOLDOWN: Skip COOLDOWN_CANDLES candles after SL hit (avoid whipsaw)
+    3. MAX DAILY LOSS: Stop trading for the day if daily loss > MAX_DAILY_LOSS
+    4. MAX TRADES/DAY: Cap at MAX_TRADES_PER_DAY
+    5. DIRECTION BIAS: Only trade in direction of UT Bot trailing stop
+    
+    Returns all_trades, daily_results, stats dict.
     """
+    # ── Optimization parameters ──
+    LOSS_THRESHOLD = 15.0       # Double qty after losing > this many pts
+    MAX_QTY = 3                 # Max qty multiplier (cap martingale)
+    RECOVERY_BUFFER = 7.0      # Reset qty when loss recovered within this buffer
+    COOLDOWN_CANDLES = 3        # Skip N candles after SL hit
+    MAX_DAILY_LOSS = -80.0      # Stop trading for day if daily P&L hits this
+    MAX_TRADES_PER_DAY = 8      # Max trades per day
+    
     close = df['Close'].astype(float)
     high_v = df['High'].astype(float)
     low_v = df['Low'].astype(float)
@@ -158,6 +178,29 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
     daily_results = {}
     prev_date = None
     
+    # ── Martingale state ──
+    qty = 1                     # Current lot multiplier
+    accumulated_loss = 0.0      # Tracks loss to recover
+    recovering = False          # True when in recovery mode
+    
+    # ── Cooldown state ──
+    cooldown_until = -1         # Skip entries until this candle index
+    
+    # ── Daily counters ──
+    daily_trade_count = 0
+    daily_pnl_running = 0.0
+    daily_stopped = False       # True if daily loss limit hit
+    
+    # ── Stats ──
+    stats = {
+        'martingale_activations': 0,
+        'martingale_recoveries': 0,
+        'cooldown_skips': 0,
+        'daily_stops': 0,
+        'max_trades_stops': 0,
+        'direction_filtered': 0,
+    }
+    
     for i in range(len(df)):
         t = df.iloc[i]['Time'].time()
         curr_date = df.iloc[i]['Time'].date()
@@ -165,17 +208,37 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
         h = float(high_v.iloc[i])
         l = float(low_v.iloc[i])
         curr_atr = float(atr_vals[i])
+        curr_dir = int(direction[i])  # 1 = bullish, -1 = bearish
 
         # ── Day boundary reset ──
         if prev_date and curr_date != prev_date:
             if pos:
                 prev_close = float(close.iloc[i-1])
-                trade = _make_trade(pos, prev_close, df.iloc[i-1]['Time'], "DAY_END")
+                pnl_raw = _pnl_raw(pos, prev_close)
+                trade = _make_trade_qty(pos, prev_close, df.iloc[i-1]['Time'], "DAY_END", qty)
                 all_trades.append(trade)
                 _add_daily(daily_results, prev_date, trade)
+                # Update martingale on day end
+                if pnl_raw < -LOSS_THRESHOLD and not recovering:
+                    qty = min(qty * 2, MAX_QTY)
+                    accumulated_loss += pnl_raw
+                    recovering = True
+                    stats['martingale_activations'] += 1
+                elif recovering:
+                    accumulated_loss += pnl_raw
+                    if accumulated_loss >= -RECOVERY_BUFFER:
+                        qty = 1
+                        accumulated_loss = 0.0
+                        recovering = False
+                        stats['martingale_recoveries'] += 1
                 pos = None
             if curr_date not in daily_results:
                 daily_results[curr_date] = {'trades': [], 'pnl': 0}
+            # Reset daily counters
+            daily_trade_count = 0
+            daily_pnl_running = 0.0
+            daily_stopped = False
+            cooldown_until = -1
         prev_date = curr_date
         
         if curr_date not in daily_results:
@@ -183,13 +246,33 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
         
         # ── Square off at 3:24 PM ──
         if pos and t >= SQUARE_OFF:
-            trade = _make_trade(pos, c, df.iloc[i]['Time'], "SQUARE_OFF")
+            pnl_raw = _pnl_raw(pos, c)
+            trade = _make_trade_qty(pos, c, df.iloc[i]['Time'], "SQUARE_OFF", qty)
             all_trades.append(trade)
             _add_daily(daily_results, curr_date, trade)
+            daily_pnl_running += trade['pnl']
+            daily_trade_count += 1
+            # Update martingale
+            if pnl_raw < -LOSS_THRESHOLD and not recovering:
+                qty = min(qty * 2, MAX_QTY)
+                accumulated_loss += pnl_raw
+                recovering = True
+                stats['martingale_activations'] += 1
+            elif recovering:
+                accumulated_loss += pnl_raw
+                if accumulated_loss >= -RECOVERY_BUFFER:
+                    qty = 1
+                    accumulated_loss = 0.0
+                    recovering = False
+                    stats['martingale_recoveries'] += 1
             pos = None
             continue
         
         in_window = ENTRY_START <= t <= ENTRY_END
+        
+        # ── Skip if daily stopped ──
+        if daily_stopped:
+            continue
         
         # ── SL check (trailing stop hit) ──
         if pos:
@@ -202,9 +285,36 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
                 exit_price = pos['sl']
             
             if sl_hit:
-                trade = _make_trade(pos, exit_price, df.iloc[i]['Time'], "TRAIL_SL")
+                pnl_raw = _pnl_raw(pos, exit_price)
+                trade = _make_trade_qty(pos, exit_price, df.iloc[i]['Time'], "TRAIL_SL", qty)
                 all_trades.append(trade)
                 _add_daily(daily_results, curr_date, trade)
+                daily_pnl_running += trade['pnl']
+                daily_trade_count += 1
+                
+                # ── Martingale: check if loss > threshold ──
+                if pnl_raw < -LOSS_THRESHOLD and not recovering:
+                    qty = min(qty * 2, MAX_QTY)
+                    accumulated_loss += pnl_raw
+                    recovering = True
+                    stats['martingale_activations'] += 1
+                elif recovering:
+                    accumulated_loss += pnl_raw
+                    if accumulated_loss >= -RECOVERY_BUFFER:
+                        # Recovered! Reset to 1x
+                        qty = 1
+                        accumulated_loss = 0.0
+                        recovering = False
+                        stats['martingale_recoveries'] += 1
+                
+                # ── Cooldown: set N candle skip ──
+                cooldown_until = i + COOLDOWN_CANDLES
+                
+                # ── Check daily loss limit ──
+                if daily_pnl_running <= MAX_DAILY_LOSS:
+                    daily_stopped = True
+                    stats['daily_stops'] += 1
+                
                 pos = None
         
         # ── Trailing SL update ──
@@ -224,47 +334,106 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
         
         # Opposite signal → close position
         if is_buy and pos and pos['dir'] == "SHORT":
-            trade = _make_trade(pos, c, df.iloc[i]['Time'], "OPPOSITE")
+            pnl_raw = _pnl_raw(pos, c)
+            trade = _make_trade_qty(pos, c, df.iloc[i]['Time'], "OPPOSITE", qty)
             all_trades.append(trade)
             _add_daily(daily_results, curr_date, trade)
+            daily_pnl_running += trade['pnl']
+            daily_trade_count += 1
+            if pnl_raw < -LOSS_THRESHOLD and not recovering:
+                qty = min(qty * 2, MAX_QTY)
+                accumulated_loss += pnl_raw
+                recovering = True
+                stats['martingale_activations'] += 1
+            elif recovering:
+                accumulated_loss += pnl_raw
+                if accumulated_loss >= -RECOVERY_BUFFER:
+                    qty = 1
+                    accumulated_loss = 0.0
+                    recovering = False
+                    stats['martingale_recoveries'] += 1
             pos = None
         elif is_sell and pos and pos['dir'] == "LONG":
-            trade = _make_trade(pos, c, df.iloc[i]['Time'], "OPPOSITE")
+            pnl_raw = _pnl_raw(pos, c)
+            trade = _make_trade_qty(pos, c, df.iloc[i]['Time'], "OPPOSITE", qty)
             all_trades.append(trade)
             _add_daily(daily_results, curr_date, trade)
+            daily_pnl_running += trade['pnl']
+            daily_trade_count += 1
+            if pnl_raw < -LOSS_THRESHOLD and not recovering:
+                qty = min(qty * 2, MAX_QTY)
+                accumulated_loss += pnl_raw
+                recovering = True
+                stats['martingale_activations'] += 1
+            elif recovering:
+                accumulated_loss += pnl_raw
+                if accumulated_loss >= -RECOVERY_BUFFER:
+                    qty = 1
+                    accumulated_loss = 0.0
+                    recovering = False
+                    stats['martingale_recoveries'] += 1
             pos = None
         
-        # ── New entry (only within window) ──
+        # ── New entry (only within window + all checks pass) ──
         if not pos and in_window and t <= ENTRY_END:
+            # Check cooldown
+            if i < cooldown_until:
+                stats['cooldown_skips'] += 1
+                continue
+            
+            # Check max trades per day
+            if daily_trade_count >= MAX_TRADES_PER_DAY:
+                stats['max_trades_stops'] += 1
+                continue
+            
+            # Check daily loss limit
+            if daily_pnl_running <= MAX_DAILY_LOSS:
+                daily_stopped = True
+                stats['daily_stops'] += 1
+                continue
+            
             if is_buy and curr_atr >= MIN_ATR:
-                sl = c - curr_atr * ATR_KEY_VALUE
-                pos = {'dir': 'LONG', 'entry': c, 'sl': sl,
-                       'entry_time': df.iloc[i]['Time'], 'entry_idx': i}
+                # DIRECTION BIAS: only buy if UT Bot direction is bullish
+                if curr_dir != 1:
+                    stats['direction_filtered'] += 1
+                else:
+                    sl = c - curr_atr * ATR_KEY_VALUE
+                    pos = {'dir': 'LONG', 'entry': c, 'sl': sl,
+                           'entry_time': df.iloc[i]['Time'], 'entry_idx': i}
             elif is_sell and curr_atr >= MIN_ATR:
-                sl = c + curr_atr * ATR_KEY_VALUE
-                pos = {'dir': 'SHORT', 'entry': c, 'sl': sl,
-                       'entry_time': df.iloc[i]['Time'], 'entry_idx': i}
+                # DIRECTION BIAS: only sell if UT Bot direction is bearish
+                if curr_dir != -1:
+                    stats['direction_filtered'] += 1
+                else:
+                    sl = c + curr_atr * ATR_KEY_VALUE
+                    pos = {'dir': 'SHORT', 'entry': c, 'sl': sl,
+                           'entry_time': df.iloc[i]['Time'], 'entry_idx': i}
     
-    return all_trades, daily_results
+    return all_trades, daily_results, stats
 
 
-def _pnl(pos, exit_price):
+def _pnl_raw(pos, exit_price):
+    """Raw P&L (1 qty) for internal calculations."""
     if pos['dir'] == "LONG":
         return exit_price - pos['entry']
     else:
         return pos['entry'] - exit_price
 
 
-def _make_trade(pos, exit_price, exit_time, reason):
-    pnl = _pnl(pos, exit_price)
+def _make_trade_qty(pos, exit_price, exit_time, reason, qty=1):
+    """Create trade record with qty-adjusted P&L."""
+    raw_pnl = _pnl_raw(pos, exit_price)
+    adj_pnl = raw_pnl * qty
     return {
         'dir': pos['dir'],
         'entry': pos['entry'],
         'exit': round(exit_price, 2),
         'entry_time': pos['entry_time'],
         'exit_time': exit_time,
-        'pnl': round(pnl, 2),
-        'pnl_pct': round(pnl / pos['entry'] * 100, 4),
+        'pnl': round(adj_pnl, 2),
+        'raw_pnl': round(raw_pnl, 2),
+        'qty': qty,
+        'pnl_pct': round(raw_pnl / pos['entry'] * 100, 4),
         'reason': reason,
     }
 
@@ -463,10 +632,11 @@ def main():
     print(f"Loaded {total_candles:,} candles | {total_days} days")
     print(f"Date range: {date_range}")
     
-    print(f"\n🤖 UT BOT ALERT BACKTEST (Pure)")
+    print(f"\n🤖 UT BOT ALERT BACKTEST (Optimized)")
     print(f"ATR: RMA({args.atr_period}) × {ATR_KEY_VALUE} | Min ATR: {MIN_ATR}")
     print(f"Window: {ENTRY_START.strftime('%H:%M')} - {ENTRY_END.strftime('%H:%M')} | Square off: {SQUARE_OFF.strftime('%H:%M')}")
-    print(f"{'='*60}")
+    print(f"Optimizations: Martingale recovery | Cooldown | Max daily loss | Direction bias")
+    print(f"{'='*70}")
     
     # Generate UT Bot signals
     print(f"\nComputing UT Bot signals...")
@@ -482,12 +652,26 @@ def main():
     print(f"  ATR range:           {atr_vals[~np.isnan(atr_vals)].min():.1f} - {atr_vals[~np.isnan(atr_vals)].max():.1f}")
     
     # Backtest
-    print(f"\n🚀 Running backtest...")
-    all_trades, daily_results = run_backtest(
-        df, buy_sig, sell_sig, trail_stop, atr_vals
+    print(f"\n🚀 Running optimized backtest...")
+    all_trades, daily_results, stats = run_backtest(
+        df, buy_sig, sell_sig, trail_stop, atr_vals, direction
     )
     
     print(f"  Total trades: {len(all_trades)}")
+    
+    # Print optimization stats
+    print(f"\n  ⚡ OPTIMIZATION STATS")
+    print(f"  Martingale activations:  {stats['martingale_activations']} (qty doubled)")
+    print(f"  Martingale recoveries:   {stats['martingale_recoveries']} (loss recovered, qty reset)")
+    print(f"  Cooldown skips:          {stats['cooldown_skips']} (entries skipped after SL)")
+    print(f"  Daily loss stops:        {stats['daily_stops']} (day stopped early)")
+    print(f"  Max trades/day stops:    {stats['max_trades_stops']} (trade limit hit)")
+    print(f"  Direction filtered:      {stats['direction_filtered']} (bias filter blocked)")
+    
+    # Check how many trades used elevated qty
+    if all_trades:
+        elevated = sum(1 for t in all_trades if t.get('qty', 1) > 1)
+        print(f"  Elevated qty trades:     {elevated} ({elevated/len(all_trades)*100:.1f}%)")
     
     # Daily results
     print_daily_results(daily_results)
