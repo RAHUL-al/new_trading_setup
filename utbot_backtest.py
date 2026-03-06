@@ -145,8 +145,6 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
     - New trades only 1:00 PM - 3:15 PM
     - Square off at 3:24 PM
     - Trail SL: if candle closes beyond previous SL → update SL
-    - RE-ENTRY: after SL hit, if candle closes above SL candle high (LONG)
-      or below SL candle low (SHORT), re-enter same direction
     - Close on: opposite signal, SL hit, or square off
     
     Returns list of daily results.
@@ -159,12 +157,6 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
     all_trades = []
     daily_results = {}
     prev_date = None
-    reentry_count = 0
-    
-    # Re-entry tracking: after SL hit, remember the SL candle for re-entry
-    last_sl_dir = None          # 'LONG' or 'SHORT' — direction of last SL'd trade
-    last_sl_candle_high = None  # High of candle where SL was hit
-    last_sl_candle_low = None   # Low of candle where SL was hit
     
     for i in range(len(df)):
         t = df.iloc[i]['Time'].time()
@@ -173,7 +165,6 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
         h = float(high_v.iloc[i])
         l = float(low_v.iloc[i])
         curr_atr = float(atr_vals[i])
-        curr_ts = float(trail_stop[i])
 
         # ── Day boundary reset ──
         if prev_date and curr_date != prev_date:
@@ -183,10 +174,6 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
                 all_trades.append(trade)
                 _add_daily(daily_results, prev_date, trade)
                 pos = None
-            # Reset re-entry state on new day
-            last_sl_dir = None
-            last_sl_candle_high = None
-            last_sl_candle_low = None
             if curr_date not in daily_results:
                 daily_results[curr_date] = {'trades': [], 'pnl': 0}
         prev_date = curr_date
@@ -200,7 +187,6 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
             all_trades.append(trade)
             _add_daily(daily_results, curr_date, trade)
             pos = None
-            last_sl_dir = None  # Reset re-entry on square off
             continue
         
         in_window = ENTRY_START <= t <= ENTRY_END
@@ -219,11 +205,6 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
                 trade = _make_trade(pos, exit_price, df.iloc[i]['Time'], "TRAIL_SL")
                 all_trades.append(trade)
                 _add_daily(daily_results, curr_date, trade)
-                
-                # ── Save SL candle info for re-entry ──
-                last_sl_dir = pos['dir']
-                last_sl_candle_high = h  # High of the candle where SL hit
-                last_sl_candle_low = l   # Low of the candle where SL hit
                 pos = None
         
         # ── Trailing SL update ──
@@ -241,65 +222,30 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
         is_buy = bool(buy_sig[i])
         is_sell = bool(sell_sig[i])
         
-        # Opposite signal → close position + clear re-entry
+        # Opposite signal → close position
         if is_buy and pos and pos['dir'] == "SHORT":
             trade = _make_trade(pos, c, df.iloc[i]['Time'], "OPPOSITE")
             all_trades.append(trade)
             _add_daily(daily_results, curr_date, trade)
             pos = None
-            last_sl_dir = None  # Clear re-entry on opposite signal
         elif is_sell and pos and pos['dir'] == "LONG":
             trade = _make_trade(pos, c, df.iloc[i]['Time'], "OPPOSITE")
             all_trades.append(trade)
             _add_daily(daily_results, curr_date, trade)
             pos = None
-            last_sl_dir = None
-        
-        # Opposite signal also clears re-entry state
-        if is_buy and last_sl_dir == "SHORT":
-            last_sl_dir = None
-        if is_sell and last_sl_dir == "LONG":
-            last_sl_dir = None
         
         # ── New entry (only within window) ──
         if not pos and in_window and t <= ENTRY_END:
-            entered = False
-            
-            # Normal UT Bot signal entry
             if is_buy and curr_atr >= MIN_ATR:
                 sl = c - curr_atr * ATR_KEY_VALUE
                 pos = {'dir': 'LONG', 'entry': c, 'sl': sl,
                        'entry_time': df.iloc[i]['Time'], 'entry_idx': i}
-                last_sl_dir = None  # Clear re-entry state on new entry
-                entered = True
             elif is_sell and curr_atr >= MIN_ATR:
                 sl = c + curr_atr * ATR_KEY_VALUE
                 pos = {'dir': 'SHORT', 'entry': c, 'sl': sl,
                        'entry_time': df.iloc[i]['Time'], 'entry_idx': i}
-                last_sl_dir = None
-                entered = True
-            
-            # ── RE-ENTRY after SL: strong candle in same direction ──
-            if not entered and last_sl_dir and curr_atr >= MIN_ATR:
-                if last_sl_dir == "LONG" and last_sl_candle_high is not None:
-                    # If candle closes ABOVE the SL candle's high → strong buy, re-enter LONG
-                    if c > last_sl_candle_high:
-                        sl = c - curr_atr * ATR_KEY_VALUE
-                        pos = {'dir': 'LONG', 'entry': c, 'sl': sl,
-                               'entry_time': df.iloc[i]['Time'], 'entry_idx': i}
-                        last_sl_dir = None
-                        reentry_count += 1
-                
-                elif last_sl_dir == "SHORT" and last_sl_candle_low is not None:
-                    # If candle closes BELOW the SL candle's low → strong sell, re-enter SHORT
-                    if c < last_sl_candle_low:
-                        sl = c + curr_atr * ATR_KEY_VALUE
-                        pos = {'dir': 'SHORT', 'entry': c, 'sl': sl,
-                               'entry_time': df.iloc[i]['Time'], 'entry_idx': i}
-                        last_sl_dir = None
-                        reentry_count += 1
     
-    return all_trades, daily_results, reentry_count
+    return all_trades, daily_results
 
 
 def _pnl(pos, exit_price):
@@ -537,12 +483,11 @@ def main():
     
     # Backtest
     print(f"\n🚀 Running backtest...")
-    all_trades, daily_results, reentry_count = run_backtest(
+    all_trades, daily_results = run_backtest(
         df, buy_sig, sell_sig, trail_stop, atr_vals
     )
     
     print(f"  Total trades: {len(all_trades)}")
-    print(f"  Re-entries after SL: {reentry_count}")
     
     # Daily results
     print_daily_results(daily_results)
