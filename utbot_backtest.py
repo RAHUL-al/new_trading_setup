@@ -286,14 +286,18 @@ def _pnl(pos, exit_price):
 
 def _make_trade(pos, exit_price, exit_time, reason, lots=2):
     raw_pnl = _pnl(pos, exit_price)
+    lot_multiplier = lots // BASE_LOTS   # 2 lots=1x, 4 lots=2x, 6 lots=3x
+    adj_pnl = raw_pnl * lot_multiplier
     return {
         'dir': pos['dir'],
         'entry': pos['entry'],
         'exit': round(exit_price, 2),
         'entry_time': pos['entry_time'],
         'exit_time': exit_time,
-        'pnl': round(raw_pnl, 2),
+        'pnl': round(adj_pnl, 2),
+        'raw_pnl': round(raw_pnl, 2),
         'lots': lots,
+        'multiplier': lot_multiplier,
         'qty': lots * LOT_SIZE,
         'pnl_pct': round(raw_pnl / pos['entry'] * 100, 4),
         'reason': reason,
