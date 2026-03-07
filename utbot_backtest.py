@@ -270,7 +270,7 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
             pos = None
         
         # ── New entry (only within window + allowed days) ──
-        if not pos and in_window and t <= ENTRY_END and is_trading_day:
+        if not pos and in_window and is_trading_day:
             if is_buy and curr_atr >= MIN_ATR:
                 sl = c - curr_atr * ATR_KEY_VALUE
                 pos = {'dir': 'LONG', 'entry': c, 'sl': sl,
