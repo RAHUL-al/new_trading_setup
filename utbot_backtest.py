@@ -40,7 +40,7 @@ ENTRY_END = dt_time(15, 3)       # 3:03 PM
 SQUARE_OFF = dt_time(15, 24)      # 3:24 PM
 
 # Day filter: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri
-TRADING_DAYS = {0, 1, 3}          # Monday, Tuesday, Thursday only
+TRADING_DAYS = {0, 1, 2, 3, 4}    # All weekdays (for analysis)
 
 
 # ─────────── UT Bot Indicators ───────────
@@ -528,7 +528,7 @@ def main():
     print(f"ATR: RMA({args.atr_period}) × {ATR_KEY_VALUE} | Min ATR: {MIN_ATR}")
     print(f"Window: {ENTRY_START.strftime('%H:%M')} - {ENTRY_END.strftime('%H:%M')} | Square off: {SQUARE_OFF.strftime('%H:%M')}")
     print(f"Lots: Start={BASE_LOTS} (qty={BASE_LOTS*LOT_SIZE}) | +{LOT_INCREMENT} lots on loss day | Lot size={LOT_SIZE}")
-    print(f"Days: Mon, Tue, Thu only")
+    print(f"Days: All weekdays (Mon-Fri)")
     print(f"{'='*70}")
     
     # Generate UT Bot signals
