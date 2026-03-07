@@ -40,7 +40,7 @@ ENTRY_START_1 = dt_time(9, 40)    # 9:40 AM
 ENTRY_END_1 = dt_time(11, 30)     # 11:30 AM
 
 # Window 2: Afternoon
-ENTRY_START_2 = dt_time(14, 0)    # 2:00 PM
+ENTRY_START_2 = dt_time(13, 45)   # 1:45 PM
 ENTRY_END_2 = dt_time(15, 3)      # 3:03 PM
 
 SQUARE_OFF = dt_time(15, 24)      # 3:24 PM
@@ -506,10 +506,26 @@ def main():
     parser.add_argument("--atr-period", type=int, default=ATR_PERIOD)
     parser.add_argument("--atr-key", type=float, default=ATR_KEY_VALUE, help="ATR multiplier (default: 1.0)")
     parser.add_argument("--min-atr", type=float, default=MIN_ATR, help="Min ATR threshold (default: 10)")
+    parser.add_argument("--w1-start", type=str, default="09:40", help="Window 1 start (HH:MM, default: 09:40)")
+    parser.add_argument("--w1-end", type=str, default="11:30", help="Window 1 end (HH:MM, default: 11:30)")
+    parser.add_argument("--w2-start", type=str, default="13:45", help="Window 2 start (HH:MM, default: 13:45)")
+    parser.add_argument("--w2-end", type=str, default="15:03", help="Window 2 end (HH:MM, default: 15:03)")
+    parser.add_argument("--square-off", type=str, default="15:24", help="Square off time (HH:MM, default: 15:24)")
     args = parser.parse_args()
     
     ATR_KEY_VALUE = args.atr_key
     MIN_ATR = args.min_atr
+    
+    # Parse time windows
+    def parse_time(s):
+        h, m = map(int, s.split(':'))
+        return dt_time(h, m)
+    
+    ENTRY_START_1 = parse_time(args.w1_start)
+    ENTRY_END_1 = parse_time(args.w1_end)
+    ENTRY_START_2 = parse_time(args.w2_start)
+    ENTRY_END_2 = parse_time(args.w2_end)
+    SQUARE_OFF = parse_time(args.square_off)
     
     # Load data
     print(f"Loading {args.file}...")
