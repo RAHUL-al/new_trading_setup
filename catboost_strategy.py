@@ -550,6 +550,7 @@ def main():
     parser.add_argument("--window-start", type=str, default="14:00", help="Entry window start (HH:MM, default: 14:00)")
     parser.add_argument("--window-end", type=str, default="15:03", help="Entry window end (HH:MM, default: 15:03)")
     parser.add_argument("--square-off", type=str, default="15:24", help="Square off time (HH:MM, default: 15:24)")
+    parser.add_argument("--test-from", type=str, default="2025-01-01", help="Test data start date (YYYY-MM-DD, default: 2025-01-01)")
     args = parser.parse_args()
 
     ATR_KEY_VALUE = args.atr_key
@@ -565,6 +566,8 @@ def main():
     ENTRY_START = parse_time(args.window_start)
     ENTRY_END = parse_time(args.window_end)
     SQUARE_OFF = parse_time(args.square_off)
+    
+    test_from_date = datetime.strptime(args.test_from, "%Y-%m-%d").date()
 
     # ── Load data ──
     print(f"Loading 1-min data: {args.file_1m}")
@@ -637,23 +640,22 @@ def main():
     features = features.fillna(0)
     features = features.replace([np.inf, -np.inf], 0)
 
-    # ── Train/Test split (by year, no leakage) ──
+    # ── Train/Test split (by date, no leakage) ──
     dates = df_1m['Time'].dt.date
-    years = df_1m['Time'].dt.year
     
-    train_mask = (years <= TRAIN_END_YEAR) & window_mask
-    test_mask = (years >= TEST_START_YEAR) & window_mask
+    train_mask = (dates < test_from_date) & window_mask
+    test_mask = (dates >= test_from_date) & window_mask
     
-    train_dates_set = set(dates[years <= TRAIN_END_YEAR].unique())
-    test_dates_set = set(dates[years >= TEST_START_YEAR].unique())
+    train_dates_set = set(dates[dates < test_from_date].unique())
+    test_dates_set = set(dates[dates >= test_from_date].unique())
 
     X_train = features[train_mask]
     y_train = labels[train_mask]
     X_test = features[test_mask]
     y_test = labels[test_mask]
 
-    print(f"\n  Train: {len(X_train)} samples ({len(train_dates_set)} days) [2019-{TRAIN_END_YEAR}]")
-    print(f"  Test:  {len(X_test)} samples ({len(test_dates_set)} days) [{TEST_START_YEAR}-2026]")
+    print(f"\n  Train: {len(X_train)} samples ({len(train_dates_set)} days) [up to {args.test_from}]")
+    print(f"  Test:  {len(X_test)} samples ({len(test_dates_set)} days) [{args.test_from} onwards]")
 
     # ── Train CatBoost ──
     print(f"\n🧠 Training CatBoost model...")
@@ -700,10 +702,10 @@ def main():
     atr_vals = calc_atr(df_1m, ATR_PERIOD).values
 
     # ── Backtest on test set ──
-    print(f"\n🚀 Running backtest on TEST data ({TEST_START_YEAR}-2026)...")
+    print(f"\n🚀 Running backtest on TEST data ({args.test_from} onwards)...")
     test_start = min(test_dates_set)
     test_end = max(test_dates_set)
-    test_df_mask = years >= TEST_START_YEAR
+    test_df_mask = dates >= test_from_date
     df_test = df_1m[test_df_mask].reset_index(drop=True)
     pred_test_full = full_predictions[test_df_mask]
     atr_test = atr_vals[test_df_mask]
