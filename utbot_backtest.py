@@ -35,13 +35,16 @@ ATR_PERIOD = 14
 ATR_KEY_VALUE = 1.0
 MIN_ATR = 10
 
-# Window 1: Morning
+# Window 1: Morning (Mon, Wed, Fri only)
 ENTRY_START_1 = dt_time(9, 40)    # 9:40 AM
 ENTRY_END_1 = dt_time(11, 30)     # 11:30 AM
 
-# Window 2: Afternoon
+# Window 2: Afternoon (all trading days)
 ENTRY_START_2 = dt_time(13, 45)   # 1:45 PM
 ENTRY_END_2 = dt_time(15, 3)      # 3:03 PM
+
+# Tue/Thu: only afternoon 2:00 PM - 3:03 PM
+TUE_THU_START = dt_time(14, 0)    # 2:00 PM
 
 SQUARE_OFF = dt_time(15, 24)      # 3:24 PM
 
@@ -223,8 +226,14 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
             pos = None
             continue
         
-        in_window = (ENTRY_START_1 <= t <= ENTRY_END_1) or (ENTRY_START_2 <= t <= ENTRY_END_2)
-        is_trading_day = curr_date.weekday() in TRADING_DAYS
+        # Tue(1) & Thu(3): only 2:00 PM - 3:03 PM
+        # Other days: both windows (9:40-11:30 + 1:45-3:03)
+        weekday = curr_date.weekday()
+        if weekday in (1, 3):  # Tuesday, Thursday
+            in_window = TUE_THU_START <= t <= ENTRY_END_2
+        else:
+            in_window = (ENTRY_START_1 <= t <= ENTRY_END_1) or (ENTRY_START_2 <= t <= ENTRY_END_2)
+        is_trading_day = weekday in TRADING_DAYS
         
         # ── SL check (trailing stop hit) ──
         if pos:
