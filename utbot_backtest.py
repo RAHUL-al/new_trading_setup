@@ -286,15 +286,13 @@ def _pnl(pos, exit_price):
 
 def _make_trade(pos, exit_price, exit_time, reason, lots=2):
     raw_pnl = _pnl(pos, exit_price)
-    adj_pnl = raw_pnl * lots * LOT_SIZE
     return {
         'dir': pos['dir'],
         'entry': pos['entry'],
         'exit': round(exit_price, 2),
         'entry_time': pos['entry_time'],
         'exit_time': exit_time,
-        'raw_pnl': round(raw_pnl, 2),
-        'pnl': round(adj_pnl, 2),
+        'pnl': round(raw_pnl, 2),
         'lots': lots,
         'qty': lots * LOT_SIZE,
         'pnl_pct': round(raw_pnl / pos['entry'] * 100, 4),
@@ -316,7 +314,7 @@ def print_daily_results(daily_results):
     sorted_days = sorted(daily_results.keys())
     
     print(f"\n{'='*100}")
-    print(f"  {'Date':>12} {'Lots':>5} {'Trades':>7} {'Wins':>5} {'Loss':>5} {'Win%':>6} {'P&L (₹)':>12} {'Status':>8}")
+    print(f"  {'Date':>12} {'Lots':>5} {'Trades':>7} {'Wins':>5} {'Loss':>5} {'Win%':>6} {'P&L':>10} {'Status':>8}")
     print(f"  {'-'*95}")
     
     cumulative_pnl = 0
