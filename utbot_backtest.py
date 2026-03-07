@@ -39,6 +39,9 @@ ENTRY_START = dt_time(14, 0)      # 2:00 PM
 ENTRY_END = dt_time(15, 3)       # 3:03 PM
 SQUARE_OFF = dt_time(15, 24)      # 3:24 PM
 
+# Day filter: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri
+TRADING_DAYS = {0, 1, 3}          # Monday, Tuesday, Thursday only
+
 
 # ─────────── UT Bot Indicators ───────────
 
@@ -175,6 +178,7 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
             continue
         
         in_window = ENTRY_START <= t <= ENTRY_END
+        is_trading_day = curr_date.weekday() in TRADING_DAYS
         
         # ── SL check (trailing stop hit) ──
         if pos:
@@ -219,8 +223,8 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
             _add_daily(daily_results, curr_date, trade)
             pos = None
         
-        # ── New entry (only within window) ──
-        if not pos and in_window and t <= ENTRY_END:
+        # ── New entry (only within window + allowed days) ──
+        if not pos and in_window and t <= ENTRY_END and is_trading_day:
             if is_buy and curr_atr >= MIN_ATR:
                 sl = c - curr_atr * ATR_KEY_VALUE
                 pos = {'dir': 'LONG', 'entry': c, 'sl': sl,
