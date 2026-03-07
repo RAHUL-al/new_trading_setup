@@ -48,7 +48,10 @@ BASE_LOTS = 2
 
 LOOKAHEAD = 5                     # N candles ahead for labeling
 THRESHOLD = 8.0                   # Min pts for buy/sell label
-TRAIN_RATIO = 0.7                 # 70% train, 30% test
+
+# Fixed train/test split by year
+TRAIN_END_YEAR = 2024             # Train: 2019-2024
+TEST_START_YEAR = 2025            # Test: 2025-2026
 
 
 # ─────────── Indicators ───────────
@@ -261,7 +264,7 @@ def backtest_predictions(df, predictions, atr_vals):
             if pos:
                 prev_close = float(close.iloc[i-1])
                 pnl = _pnl(pos, prev_close)
-                trade = _make_trade(pos, prev_close, df.iloc[i-1]['Time'], "DAY_END", current_lots)
+                trade = _make_trade(pos, prev_close, df.iloc[i-1]['Time'], "DAY_END", current_lots, pos.get('initial_sl'))
                 all_trades.append(trade)
                 _add_daily(daily_results, prev_date, trade)
                 pos = None
@@ -291,7 +294,7 @@ def backtest_predictions(df, predictions, atr_vals):
 
         # Square off
         if pos and t >= SQUARE_OFF:
-            trade = _make_trade(pos, c, df.iloc[i]['Time'], "SQUARE_OFF", current_lots)
+            trade = _make_trade(pos, c, df.iloc[i]['Time'], "SQUARE_OFF", current_lots, pos.get('initial_sl'))
             all_trades.append(trade)
             _add_daily(daily_results, curr_date, trade)
             pos = None
@@ -310,7 +313,7 @@ def backtest_predictions(df, predictions, atr_vals):
                 exit_price = pos['sl']
 
             if sl_hit:
-                trade = _make_trade(pos, exit_price, df.iloc[i]['Time'], "TRAIL_SL", current_lots)
+                trade = _make_trade(pos, exit_price, df.iloc[i]['Time'], "TRAIL_SL", current_lots, pos.get('initial_sl'))
                 all_trades.append(trade)
                 _add_daily(daily_results, curr_date, trade)
                 pos = None
@@ -331,12 +334,12 @@ def backtest_predictions(df, predictions, atr_vals):
 
         # Opposite signal close
         if pred == 1 and pos and pos['dir'] == "SHORT":
-            trade = _make_trade(pos, c, df.iloc[i]['Time'], "OPPOSITE", current_lots)
+            trade = _make_trade(pos, c, df.iloc[i]['Time'], "OPPOSITE", current_lots, pos.get('initial_sl'))
             all_trades.append(trade)
             _add_daily(daily_results, curr_date, trade)
             pos = None
         elif pred == -1 and pos and pos['dir'] == "LONG":
-            trade = _make_trade(pos, c, df.iloc[i]['Time'], "OPPOSITE", current_lots)
+            trade = _make_trade(pos, c, df.iloc[i]['Time'], "OPPOSITE", current_lots, pos.get('initial_sl'))
             all_trades.append(trade)
             _add_daily(daily_results, curr_date, trade)
             pos = None
@@ -345,11 +348,11 @@ def backtest_predictions(df, predictions, atr_vals):
         if not pos and in_window and curr_atr >= MIN_ATR:
             if pred == 1:
                 sl = c - curr_atr * ATR_KEY_VALUE
-                pos = {'dir': 'LONG', 'entry': c, 'sl': sl,
+                pos = {'dir': 'LONG', 'entry': c, 'sl': sl, 'initial_sl': sl,
                        'entry_time': df.iloc[i]['Time'], 'entry_idx': i}
             elif pred == -1:
                 sl = c + curr_atr * ATR_KEY_VALUE
-                pos = {'dir': 'SHORT', 'entry': c, 'sl': sl,
+                pos = {'dir': 'SHORT', 'entry': c, 'sl': sl, 'initial_sl': sl,
                        'entry_time': df.iloc[i]['Time'], 'entry_idx': i}
 
     return all_trades, daily_results
@@ -362,11 +365,11 @@ def _pnl(pos, exit_price):
         return pos['entry'] - exit_price
 
 
-def _make_trade(pos, exit_price, exit_time, reason, lots=2):
+def _make_trade(pos, exit_price, exit_time, reason, lots=2, sl=None):
     raw_pnl = _pnl(pos, exit_price)
     lot_multiplier = lots // BASE_LOTS
     adj_pnl = raw_pnl * lot_multiplier
-    return {
+    trade = {
         'dir': pos['dir'],
         'entry': pos['entry'],
         'exit': round(exit_price, 2),
@@ -380,6 +383,9 @@ def _make_trade(pos, exit_price, exit_time, reason, lots=2):
         'pnl_pct': round(raw_pnl / pos['entry'] * 100, 4),
         'reason': reason,
     }
+    if sl is not None:
+        trade['sl'] = round(sl, 2)
+    return trade
 
 
 def _add_daily(daily_results, date, trade):
@@ -463,6 +469,72 @@ def print_results(all_trades, daily_results, label=""):
     print(f"\n{'='*60}")
 
 
+def print_detailed_daily_log(all_trades, daily_results, log_file="catboost_detailed_log.txt"):
+    """Print AND save detailed per-trade explanation for each day."""
+    import sys
+    
+    sorted_days = sorted(daily_results.keys())
+    lines = []
+    
+    def out(s=""):
+        print(s)
+        lines.append(s)
+    
+    out(f"\n{'='*110}")
+    out(f"  📋 DETAILED TRADE LOG — EACH TRADE ON EACH DAY")
+    out(f"{'='*110}")
+    
+    day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+    cum_pnl = 0
+    
+    for day in sorted_days:
+        trades = daily_results[day]['trades']
+        day_pnl = daily_results[day]['pnl']
+        lots = daily_results[day].get('lots', BASE_LOTS)
+        
+        if len(trades) == 0:
+            continue
+        
+        cum_pnl += day_pnl
+        day_name = day_names[day.weekday()]
+        wins = sum(1 for t in trades if t['pnl'] > 0)
+        losses = len(trades) - wins
+        wr = wins / len(trades) * 100
+        icon = "✅" if day_pnl > 0 else "❌" if day_pnl < 0 else "➖"
+        
+        out(f"\n  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐")
+        out(f"  │ 📅 {day} ({day_name}) | Lots: {lots} (qty={lots*LOT_SIZE}) | Trades: {len(trades)} (W:{wins} L:{losses} {wr:.0f}%) | Day P&L: {day_pnl:+.2f} {icon} | Cum: {cum_pnl:+.2f}")
+        out(f"  ├───┬──────┬───────────┬───────────┬───────────┬───────────┬────────────┬──────────┬─────────────┤")
+        out(f"  │ # │ Dir  │ Entry Time│ Exit Time │ Entry Pr  │ Exit Pr   │ SL         │ P&L      │ Exit Reason │")
+        out(f"  ├───┼──────┼───────────┼───────────┼───────────┼───────────┼────────────┼──────────┼─────────────┤")
+        
+        for j, t in enumerate(trades, 1):
+            entry_t = t['entry_time'].strftime('%H:%M') if hasattr(t['entry_time'], 'strftime') else str(t['entry_time'])[-8:-3]
+            exit_t = t['exit_time'].strftime('%H:%M') if hasattr(t['exit_time'], 'strftime') else str(t['exit_time'])[-8:-3]
+            
+            # Calculate SL from entry and ATR
+            sl_str = "---"
+            if 'sl' in t:
+                sl_str = f"{t['sl']:.2f}"
+            
+            dir_icon = "🟢" if t['dir'] == 'LONG' else "🔴"
+            pnl_icon = "✅" if t['pnl'] > 0 else "❌" if t['pnl'] < 0 else "➖"
+            
+            out(f"  │{j:>2} │ {dir_icon}{t['dir']:>4} │ {entry_t:>9} │ {exit_t:>9} │ {t['entry']:>9.2f} │ {t['exit']:>9.2f} │ {sl_str:>10} │ {t['pnl']:>+7.2f}{pnl_icon}│ {t['reason']:<12}│")
+        
+        out(f"  └───┴──────┴───────────┴───────────┴───────────┴───────────┴────────────┴──────────┴─────────────┘")
+        out(f"  Day Summary: {day_pnl:+.2f} pts ({day_name}) | Raw trades: {len(trades)} | Multiplier: {lots // BASE_LOTS}x")
+    
+    out(f"\n{'='*110}")
+    out(f"  GRAND TOTAL: {cum_pnl:+.2f} pts")
+    out(f"{'='*110}")
+    
+    # Save to file
+    with open(log_file, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+    print(f"\n💾 Detailed log saved: {log_file}")
+
+
 # ─────────── Main ───────────
 
 def main():
@@ -475,7 +547,6 @@ def main():
     parser.add_argument("--min-atr", type=float, default=MIN_ATR)
     parser.add_argument("--lookahead", type=int, default=LOOKAHEAD, help="Candles to look ahead for labeling")
     parser.add_argument("--threshold", type=float, default=THRESHOLD, help="Min pts for buy/sell label")
-    parser.add_argument("--train-ratio", type=float, default=TRAIN_RATIO)
     args = parser.parse_args()
 
     ATR_KEY_VALUE = args.atr_key
@@ -518,7 +589,7 @@ def main():
     print(f"ATR: RMA({ATR_PERIOD}) × {ATR_KEY_VALUE} | Min ATR: {MIN_ATR}")
     print(f"Window: {ENTRY_START.strftime('%H:%M')} - {ENTRY_END.strftime('%H:%M')} | Square off: {SQUARE_OFF.strftime('%H:%M')}")
     print(f"Lookahead: {LOOKAHEAD} candles | Threshold: {THRESHOLD} pts")
-    print(f"Train: {args.train_ratio*100:.0f}% | Test: {(1-args.train_ratio)*100:.0f}%")
+    print(f"Train: 2019-{TRAIN_END_YEAR} | Test: {TEST_START_YEAR}-2026")
     print(f"{'='*60}")
 
     # ── Build features ──
@@ -554,23 +625,23 @@ def main():
     features = features.fillna(0)
     features = features.replace([np.inf, -np.inf], 0)
 
-    # ── Train/Test split (by date, no leakage) ──
+    # ── Train/Test split (by year, no leakage) ──
     dates = df_1m['Time'].dt.date
-    unique_dates = sorted(dates.unique())
-    split_idx = int(len(unique_dates) * args.train_ratio)
-    train_dates = set(unique_dates[:split_idx])
-    test_dates = set(unique_dates[split_idx:])
-
-    train_mask = dates.isin(train_dates) & window_mask
-    test_mask = dates.isin(test_dates) & window_mask
+    years = df_1m['Time'].dt.year
+    
+    train_mask = (years <= TRAIN_END_YEAR) & window_mask
+    test_mask = (years >= TEST_START_YEAR) & window_mask
+    
+    train_dates_set = set(dates[years <= TRAIN_END_YEAR].unique())
+    test_dates_set = set(dates[years >= TEST_START_YEAR].unique())
 
     X_train = features[train_mask]
     y_train = labels[train_mask]
     X_test = features[test_mask]
     y_test = labels[test_mask]
 
-    print(f"\n  Train: {len(X_train)} samples ({len(train_dates)} days)")
-    print(f"  Test:  {len(X_test)} samples ({len(test_dates)} days)")
+    print(f"\n  Train: {len(X_train)} samples ({len(train_dates_set)} days) [2019-{TRAIN_END_YEAR}]")
+    print(f"  Test:  {len(X_test)} samples ({len(test_dates_set)} days) [{TEST_START_YEAR}-2026]")
 
     # ── Train CatBoost ──
     print(f"\n🧠 Training CatBoost model...")
@@ -617,17 +688,20 @@ def main():
     atr_vals = calc_atr(df_1m, ATR_PERIOD).values
 
     # ── Backtest on test set ──
-    print(f"\n🚀 Running backtest on TEST data...")
-    test_start = min(test_dates)
-    test_end = max(test_dates)
-    test_df_mask = dates.isin(test_dates)
+    print(f"\n🚀 Running backtest on TEST data ({TEST_START_YEAR}-2026)...")
+    test_start = min(test_dates_set)
+    test_end = max(test_dates_set)
+    test_df_mask = years >= TEST_START_YEAR
     df_test = df_1m[test_df_mask].reset_index(drop=True)
-    pred_test = full_predictions[test_df_mask]
+    pred_test_full = full_predictions[test_df_mask]
     atr_test = atr_vals[test_df_mask]
 
-    all_trades, daily_results = backtest_predictions(df_test, pred_test, atr_test)
+    all_trades, daily_results = backtest_predictions(df_test, pred_test_full, atr_test)
 
     print_results(all_trades, daily_results, f"TEST ({test_start} → {test_end})")
+    
+    # ── Detailed per-trade daily log ──
+    print_detailed_daily_log(all_trades, daily_results)
 
     # ── Save ──
     if all_trades:
