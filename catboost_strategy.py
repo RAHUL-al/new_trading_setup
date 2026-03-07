@@ -538,7 +538,7 @@ def print_detailed_daily_log(all_trades, daily_results, log_file="catboost_detai
 # ─────────── Main ───────────
 
 def main():
-    global ATR_KEY_VALUE, MIN_ATR, LOOKAHEAD, THRESHOLD
+    global ATR_KEY_VALUE, MIN_ATR, LOOKAHEAD, THRESHOLD, ENTRY_START, ENTRY_END, SQUARE_OFF
 
     parser = argparse.ArgumentParser(description="CatBoost ML Strategy (NIFTY)")
     parser.add_argument("--file-1m", default="nifty_1min_data.csv", help="1-min data")
@@ -547,12 +547,24 @@ def main():
     parser.add_argument("--min-atr", type=float, default=MIN_ATR)
     parser.add_argument("--lookahead", type=int, default=LOOKAHEAD, help="Candles to look ahead for labeling")
     parser.add_argument("--threshold", type=float, default=THRESHOLD, help="Min pts for buy/sell label")
+    parser.add_argument("--window-start", type=str, default="14:00", help="Entry window start (HH:MM, default: 14:00)")
+    parser.add_argument("--window-end", type=str, default="15:03", help="Entry window end (HH:MM, default: 15:03)")
+    parser.add_argument("--square-off", type=str, default="15:24", help="Square off time (HH:MM, default: 15:24)")
     args = parser.parse_args()
 
     ATR_KEY_VALUE = args.atr_key
     MIN_ATR = args.min_atr
     LOOKAHEAD = args.lookahead
     THRESHOLD = args.threshold
+
+    # Parse time windows
+    def parse_time(s):
+        h, m = map(int, s.split(':'))
+        return dt_time(h, m)
+
+    ENTRY_START = parse_time(args.window_start)
+    ENTRY_END = parse_time(args.window_end)
+    SQUARE_OFF = parse_time(args.square_off)
 
     # ── Load data ──
     print(f"Loading 1-min data: {args.file_1m}")
