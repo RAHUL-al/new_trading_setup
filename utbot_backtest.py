@@ -35,8 +35,14 @@ ATR_PERIOD = 14
 ATR_KEY_VALUE = 1.0
 MIN_ATR = 10
 
-ENTRY_START = dt_time(14, 0)      # 2:00 PM
-ENTRY_END = dt_time(15, 3)       # 3:03 PM
+# Window 1: Morning
+ENTRY_START_1 = dt_time(9, 40)    # 9:40 AM
+ENTRY_END_1 = dt_time(11, 30)     # 11:30 AM
+
+# Window 2: Afternoon
+ENTRY_START_2 = dt_time(14, 0)    # 2:00 PM
+ENTRY_END_2 = dt_time(15, 3)      # 3:03 PM
+
 SQUARE_OFF = dt_time(15, 24)      # 3:24 PM
 
 # Day filter: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri
@@ -217,7 +223,7 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
             pos = None
             continue
         
-        in_window = ENTRY_START <= t <= ENTRY_END
+        in_window = (ENTRY_START_1 <= t <= ENTRY_END_1) or (ENTRY_START_2 <= t <= ENTRY_END_2)
         is_trading_day = curr_date.weekday() in TRADING_DAYS
         
         # ── SL check (trailing stop hit) ──
@@ -526,7 +532,7 @@ def main():
     
     print(f"\n🤖 UT BOT ALERT BACKTEST")
     print(f"ATR: RMA({args.atr_period}) × {ATR_KEY_VALUE} | Min ATR: {MIN_ATR}")
-    print(f"Window: {ENTRY_START.strftime('%H:%M')} - {ENTRY_END.strftime('%H:%M')} | Square off: {SQUARE_OFF.strftime('%H:%M')}")
+    print(f"Window 1: {ENTRY_START_1.strftime('%H:%M')} - {ENTRY_END_1.strftime('%H:%M')} | Window 2: {ENTRY_START_2.strftime('%H:%M')} - {ENTRY_END_2.strftime('%H:%M')} | Square off: {SQUARE_OFF.strftime('%H:%M')}")
     print(f"Lots: Start={BASE_LOTS} (qty={BASE_LOTS*LOT_SIZE}) | +{LOT_INCREMENT} lots on loss day | Lot size={LOT_SIZE}")
     print(f"Days: All weekdays (Mon-Fri)")
     print(f"{'='*70}")
