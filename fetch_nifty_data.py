@@ -217,15 +217,19 @@ def fetch_interval(smart_api, interval):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Fetch NIFTY historical candle data")
-    parser.add_argument("--interval", default="ONE_MINUTE",
-                        choices=["ONE_MINUTE"],
-                        help="Which interval to fetch (default: ONE_MINUTE)")
+    parser.add_argument("--interval", default="ALL",
+                        choices=["ONE_MINUTE", "TWO_MINUTE", "ALL"],
+                        help="Which interval to fetch (default: ALL = both 1-min and 2-min)")
     args = parser.parse_args()
 
     # Connect once
     smart_api = connect_api()
 
-    fetch_interval(smart_api, args.interval)
+    if args.interval == "ALL":
+        for interval in INTERVAL_CONFIG:
+            fetch_interval(smart_api, interval)
+    else:
+        fetch_interval(smart_api, args.interval)
 
     logger.info(f"\n{'='*60}")
     logger.info(f"ALL DONE!")
