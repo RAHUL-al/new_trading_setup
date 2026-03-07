@@ -39,9 +39,6 @@ ENTRY_START = dt_time(14, 0)      # 2:00 PM
 ENTRY_END = dt_time(15, 3)       # 3:03 PM
 SQUARE_OFF = dt_time(15, 24)      # 3:24 PM
 
-# Day filter: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri
-TRADING_DAYS = {0, 1, 3}          # Monday, Tuesday, Thursday only
-
 
 # ─────────── UT Bot Indicators ───────────
 
@@ -178,7 +175,6 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
             continue
         
         in_window = ENTRY_START <= t <= ENTRY_END
-        is_trading_day = curr_date.weekday() in TRADING_DAYS
         
         # ── SL check (trailing stop hit) ──
         if pos:
@@ -223,8 +219,8 @@ def run_backtest(df, buy_sig, sell_sig, trail_stop, atr_vals):
             _add_daily(daily_results, curr_date, trade)
             pos = None
         
-        # ── New entry (only within window + allowed days) ──
-        if not pos and in_window and t <= ENTRY_END and is_trading_day:
+        # ── New entry (only within window) ──
+        if not pos and in_window and t <= ENTRY_END:
             if is_buy and curr_atr >= MIN_ATR:
                 sl = c - curr_atr * ATR_KEY_VALUE
                 pos = {'dir': 'LONG', 'entry': c, 'sl': sl,
@@ -415,6 +411,30 @@ def print_summary(all_trades, daily_results):
         m_wr = d['wins'] / max(d['trades'], 1) * 100
         icon = "✅" if d['pnl'] > 0 else "❌"
         print(f"  {m:>10} {d['pnl']:>+9.2f} {d['trades']:>7} {m_wr:>5.0f}% {icon}")
+    
+    # ── Day-of-week breakdown ──
+    day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+    dow_stats = {i: {'pnl': 0, 'trades': 0, 'wins': 0} for i in range(5)}
+    for t in all_trades:
+        dow = t['entry_time'].weekday()
+        if dow < 5:
+            dow_stats[dow]['pnl'] += t['pnl']
+            dow_stats[dow]['trades'] += 1
+            if t['pnl'] > 0:
+                dow_stats[dow]['wins'] += 1
+    
+    print(f"\n  📅 DAY-OF-WEEK PERFORMANCE")
+    print(f"  {'Day':<12} {'P&L':>10} {'Trades':>7} {'Win%':>6} {'Avg P&L':>10}")
+    print(f"  {'-'*47}")
+    for i in range(5):
+        d = dow_stats[i]
+        if d['trades'] > 0:
+            d_wr = d['wins'] / d['trades'] * 100
+            avg = d['pnl'] / d['trades']
+            icon = "✅" if d['pnl'] > 0 else "❌"
+            print(f"  {day_names[i]:<12} {d['pnl']:>+9.2f} {d['trades']:>7} {d_wr:>5.0f}% {avg:>+9.2f} {icon}")
+        else:
+            print(f"  {day_names[i]:<12} {'---':>10} {'0':>7} {'---':>6} {'---':>10}")
     
     print(f"\n{'='*65}")
 
