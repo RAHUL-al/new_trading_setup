@@ -40,6 +40,23 @@ CLIENT_ID = os.environ.get("ANGELONE_CLIENT_ID", "A1079871")
 PWD = os.environ.get("ANGELONE_PASSWORD", "0465")
 CORRELATION_ID = f"user_{CLIENT_ID}"
 
+# ─────────── Credential Failover ───────────
+CREDENTIALS = [
+    {
+        "totp": "OIN6QBZAYV4I26Q55OYASIEQVY",
+        "api_key": "SsUDlNA9",
+        "client_id": "A1079871",
+        "pwd": "0465",
+    },
+    {
+        "totp": "33OUTDUE57WS3TUPHPLFUCGHFM",
+        "api_key": "Ytt1NkKD",
+        "client_id": "R865920",
+        "pwd": "7355",
+    },
+]
+current_cred_index = 0
+
 TRADING_SYMBOLS_KEY = f"{REDIS_PREFIX}Trading_symbol"
 OPTION_TOKENS_CHANNEL = f"{REDIS_PREFIX}option_tokens_updated"
 
@@ -48,6 +65,10 @@ INDIA_TZ = pytz.timezone("Asia/Kolkata")
 ltp_data = {}
 tokens = []
 symbol_map = {}
+
+# Heartbeat tracking
+last_data_received = time.time()
+HEARTBEAT_INTERVAL = 3  # seconds — stale if no data for 3s
 
 # Track currently subscribed option tokens
 current_option_tokens = {"CE": None, "PE": None}
@@ -63,12 +84,18 @@ def load_tokens_from_csv():
     logger.info(f"Loaded {len(tokens)} tokens with symbol names.")
 
 
-def connect_api():
-    totp = pyotp.TOTP(TOTP_TOKEN).now()
-    smartApi = SmartConnect(API_KEY)
-    smartApi.generateSession(CLIENT_ID, PWD, totp)
-    FEED_TOKEN = smartApi.getfeedToken()
-    return FEED_TOKEN
+def connect_api(cred=None):
+    """Login to AngelOne SmartAPI. Uses given credentials or defaults."""
+    if cred is None:
+        cred = CREDENTIALS[current_cred_index]
+    totp = pyotp.TOTP(cred['totp']).now()
+    smart_api = SmartConnect(cred['api_key'])
+    data = smart_api.generateSession(cred['client_id'], cred['pwd'], totp)
+    if not data or not data.get('data'):
+        raise Exception(f"Login failed for {cred['client_id']}: {data}")
+    feed_token = smart_api.getfeedToken()
+    logger.info(f"✅ Connected to AngelOne: {cred['client_id']}")
+    return feed_token, cred
 
 
 last_candle_time_map = {}
@@ -81,6 +108,8 @@ def run_websocket():
     """Main WebSocket process — handles index/stock ticks + option ticks."""
 
     def on_data(wsapp, message):
+        global last_data_received
+        last_data_received = time.time()  # Heartbeat update
         if message != b'\x00':
             try:
                 tick = message
@@ -216,18 +245,65 @@ def run_websocket():
 
     def on_error(wsapp, error):
         logger.error(f"WebSocket Error: {error}")
-        logger.info("Reconnecting in 3 seconds...")
-        time.sleep(3)
-        threading.Thread(target=run_websocket).start()
+        _reconnect_with_failover()
 
     def on_close(wsapp):
         logger.info("WebSocket Closed")
+        _reconnect_with_failover()
+
+    def _reconnect_with_failover():
+        """Try reconnect. On failure, switch to backup credentials."""
+        global current_cred_index
         logger.info("Reconnecting in 3 seconds...")
         time.sleep(3)
-        threading.Thread(target=run_websocket).start()
+        try:
+            threading.Thread(target=run_websocket).start()
+        except Exception as e:
+            logger.error(f"Reconnect failed: {e}")
+            # Switch credentials
+            current_cred_index = (current_cred_index + 1) % len(CREDENTIALS)
+            new_cred = CREDENTIALS[current_cred_index]
+            logger.info(f"🔄 Switching to backup credentials: {new_cred['client_id']}")
+            time.sleep(2)
+            threading.Thread(target=run_websocket).start()
 
-    FEED_TOKEN = connect_api()
-    sws = SmartWebSocketV2(TOTP_TOKEN, API_KEY, CLIENT_ID, FEED_TOKEN)
+    def _heartbeat_monitor():
+        """Monitor data freshness — if no data for 3s, reconnect."""
+        global last_data_received, current_cred_index
+        while True:
+            time.sleep(HEARTBEAT_INTERVAL)
+            now_time = datetime.datetime.now(INDIA_TZ).time()
+            # Only check during market hours (9:15 - 15:30)
+            if now_time < datetime.time(9, 15) or now_time > datetime.time(15, 30):
+                continue
+            
+            staleness = time.time() - last_data_received
+            if staleness > HEARTBEAT_INTERVAL:
+                logger.warning(f"💔 HEARTBEAT: No data for {staleness:.1f}s — connection may be stale")
+                if staleness > HEARTBEAT_INTERVAL * 2:  # 6+ seconds
+                    logger.error(f"💀 HEARTBEAT: Stale for {staleness:.1f}s — forcing reconnect")
+                    try:
+                        sws.close_connection()
+                    except:
+                        pass
+                    # Switch credentials
+                    current_cred_index = (current_cred_index + 1) % len(CREDENTIALS)
+                    new_cred = CREDENTIALS[current_cred_index]
+                    logger.info(f"🔄 Switching to credentials: {new_cred['client_id']}")
+                    time.sleep(2)
+                    threading.Thread(target=run_websocket).start()
+                    return  # Exit this heartbeat thread
+
+    # Connect with current credentials
+    try:
+        FEED_TOKEN, active_cred = connect_api(CREDENTIALS[current_cred_index])
+    except Exception as e:
+        logger.error(f"Login failed: {e}")
+        current_cred_index = (current_cred_index + 1) % len(CREDENTIALS)
+        logger.info(f"🔄 Trying backup: {CREDENTIALS[current_cred_index]['client_id']}")
+        FEED_TOKEN, active_cred = connect_api(CREDENTIALS[current_cred_index])
+
+    sws = SmartWebSocketV2(active_cred['totp'], active_cred['api_key'], active_cred['client_id'], FEED_TOKEN)
     sws.on_open = on_open
     sws.on_data = on_data
     sws.on_error = on_error
@@ -236,7 +312,11 @@ def run_websocket():
     token_update_thread = threading.Thread(target=_handle_token_update, daemon=True)
     token_update_thread.start()
 
-    logger.info("Connecting WebSocket...")
+    # Start heartbeat monitor
+    heartbeat_thread = threading.Thread(target=_heartbeat_monitor, daemon=True)
+    heartbeat_thread.start()
+
+    logger.info(f"Connecting WebSocket (cred: {active_cred['client_id']})...")
     sws.connect()
 
 
@@ -562,8 +642,11 @@ def run_signal_engine():
 if __name__ == "__main__":
     load_tokens_from_csv()
 
+    # Import CatBoost live engine
+    from catboost_live_engine import run_catboost_engine
+
     P0 = Process(target=run_websocket)
-    P1 = Process(target=run_signal_engine)
+    P1 = Process(target=run_catboost_engine)  # CatBoost ML (replaces UT Bot)
     P2 = Process(target=market_close_cleanup)
 
     P0.start()

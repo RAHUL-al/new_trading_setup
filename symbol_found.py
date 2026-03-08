@@ -36,8 +36,8 @@ TRADING_SYMBOLS_KEY = f"{REDIS_PREFIX}Trading_symbol"
 POSITIONS_KEY = f"{REDIS_PREFIX}active_positions"
 OPTION_TOKENS_CHANNEL = f"{REDIS_PREFIX}option_tokens_updated"
 
-PRICE_MIN = float(os.environ.get("PRICE_MIN", "110"))
-PRICE_MAX = float(os.environ.get("PRICE_MAX", "150"))
+PRICE_MIN = float(os.environ.get("PRICE_MIN", "200"))
+PRICE_MAX = float(os.environ.get("PRICE_MAX", "250"))
 REFRESH_INTERVAL = 38  # seconds
 
 INDIA_TZ = pytz.timezone("Asia/Kolkata")
