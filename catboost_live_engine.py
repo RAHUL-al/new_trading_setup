@@ -276,27 +276,74 @@ async def catboost_signal_engine():
         model_features = ALL_FEATURE_COLS
         logger.info(f"  Using default feature list: {len(model_features)}")
 
-    # ── Live position tracking ──
-    position = None  # {'dir': 'LONG'/'SHORT', 'entry': float, 'sl': float, 'entry_time': str}
-    trades = []  # completed trades
-    daily_pnl = 0.0
-    wins = 0
-    losses = 0
-    SQUARE_OFF_TIME = datetime.time(15, 24)
+    # ── Redis keys for state persistence ──
+    STATE_KEY = f"{REDIS_PREFIX}catboost_state"
+    TRADES_KEY = f"{REDIS_PREFIX}catboost_trades"
 
+    async def save_state():
+        """Save current state to Redis (survives restarts)."""
+        state = {
+            "position": position,
+            "daily_pnl": daily_pnl,
+            "wins": wins,
+            "losses": losses,
+            "prediction_count": prediction_count,
+            "last_prediction": last_prediction,
+            "date": datetime.date.today().strftime('%Y-%m-%d'),
+        }
+        await ar.set(STATE_KEY, json.dumps(state))
+        await ar.set(TRADES_KEY, json.dumps(trades))
+
+    async def load_state():
+        """Load previous state from Redis on startup."""
+        nonlocal position, daily_pnl, wins, losses, prediction_count, last_prediction, trades
+        try:
+            raw = await ar.get(STATE_KEY)
+            if raw:
+                state = json.loads(raw)
+                # Only load if same trading day
+                if state.get("date") == datetime.date.today().strftime('%Y-%m-%d'):
+                    position = state.get("position")
+                    daily_pnl = state.get("daily_pnl", 0)
+                    wins = state.get("wins", 0)
+                    losses = state.get("losses", 0)
+                    prediction_count = state.get("prediction_count", 0)
+                    last_prediction = state.get("last_prediction", 0)
+                    # Load trades
+                    trades_raw = await ar.get(TRADES_KEY)
+                    if trades_raw:
+                        trades = json.loads(trades_raw)
+                    if position:
+                        cname = position.get('contract', '')
+                        logger.info(
+                            f"  🔄 RECOVERED {position['dir']} @ {position['entry']:.2f} | "
+                            f"SL={position['sl']:.2f} | Contract={cname}"
+                        )
+                    logger.info(
+                        f"  🔄 Restored: {len(trades)} trades | W:{wins} L:{losses} | "
+                        f"Day P&L={daily_pnl:+.2f} | Predictions={prediction_count}"
+                    )
+                else:
+                    logger.info("  📅 New trading day — starting fresh")
+                    await ar.delete(STATE_KEY, TRADES_KEY)
+        except Exception as e:
+            logger.warning(f"  ⚠️ State load failed: {e}")
+
+    # Load previous state
+    await load_state()
+
+    # ── Live position tracking defaults (overridden by load_state if data exists) ──
+    SQUARE_OFF_TIME = datetime.time(15, 24)
     last_signal_time = 0
     last_candle_count = 0
-    last_prediction = 0
-    prediction_count = 0
+    last_status_log = 0
 
     logger.info(f"⚡ CatBoost signal engine started")
     logger.info(f"  Window: {WINDOW_START.strftime('%H:%M')} - {WINDOW_END.strftime('%H:%M')}")
     logger.info(f"  Min ATR: {MIN_ATR}")
     logger.info(f"  Signal cooldown: {SIGNAL_COOLDOWN}s")
 
-    last_status_log = 0
-
-    def close_position(exit_price, reason, exit_time_str):
+    async def do_close_position(exit_price, reason, exit_time_str):
         nonlocal position, daily_pnl, wins, losses
         if not position:
             return
@@ -324,6 +371,7 @@ async def catboost_signal_engine():
             f"P&L={pnl:+.2f} {icon} | Reason={reason}"
         )
         position = None
+        await save_state()
 
     while True:
         try:
@@ -334,7 +382,7 @@ async def catboost_signal_engine():
                 # Square off any open position
                 if position:
                     logger.info("🕐 Market close — squaring off")
-                    close_position(close_price, "MARKET_CLOSE", now.strftime('%H:%M'))
+                    await do_close_position(close_price, "MARKET_CLOSE", now.strftime('%H:%M'))
                 logger.info("Market closed. Stopping CatBoost engine.")
                 _print_daily_summary(trades, daily_pnl, wins, losses, prediction_count)
                 break
@@ -417,15 +465,15 @@ async def catboost_signal_engine():
 
             # ── Square off at 15:24 ──
             if position and now_time >= SQUARE_OFF_TIME:
-                close_position(close_price, "SQUARE_OFF", candle_time)
+                await do_close_position(close_price, "SQUARE_OFF", candle_time)
 
             # ── Trail SL check ──
             if position:
                 sl_hit = False
                 if position['dir'] == 'LONG' and low_price <= position['sl']:
-                    close_position(position['sl'], "TRAIL_SL", candle_time)
+                    await do_close_position(position['sl'], "TRAIL_SL", candle_time)
                 elif position['dir'] == 'SHORT' and high_price >= position['sl']:
-                    close_position(position['sl'], "TRAIL_SL", candle_time)
+                    await do_close_position(position['sl'], "TRAIL_SL", candle_time)
 
             # ── Update trailing SL ──
             if position:
@@ -440,9 +488,9 @@ async def catboost_signal_engine():
 
             # ── Opposite signal — close existing ──
             if pred == 1 and position and position['dir'] == 'SHORT':
-                close_position(close_price, "OPPOSITE", candle_time)
+                await do_close_position(close_price, "OPPOSITE", candle_time)
             elif pred == -1 and position and position['dir'] == 'LONG':
-                close_position(close_price, "OPPOSITE", candle_time)
+                await do_close_position(close_price, "OPPOSITE", candle_time)
 
             # ── New entry ──
             if not position and pred != 0 and in_window and atr_ok and now_time < SQUARE_OFF_TIME:
@@ -466,10 +514,12 @@ async def catboost_signal_engine():
                         sl = close_price - current_atr * ATR_KEY_VALUE
                         position = {'dir': 'LONG', 'entry': close_price, 'sl': sl, 'entry_time': candle_time, 'contract': contract_name}
                         logger.info(f"  🟢 ENTERED LONG @ {close_price:.2f} | SL={sl:.2f} | ATR={current_atr:.2f} | Contract={contract_name}")
+                        await save_state()
                     elif pred == -1:
                         sl = close_price + current_atr * ATR_KEY_VALUE
                         position = {'dir': 'SHORT', 'entry': close_price, 'sl': sl, 'entry_time': candle_time, 'contract': contract_name}
                         logger.info(f"  🔴 ENTERED SHORT @ {close_price:.2f} | SL={sl:.2f} | ATR={current_atr:.2f} | Contract={contract_name}")
+                        await save_state()
 
             # ── Publish signals via Redis (for pos_handle_wts) ──
             if pred != 0 and pred != last_prediction and in_window and atr_ok:
