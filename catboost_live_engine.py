@@ -447,14 +447,29 @@ async def catboost_signal_engine():
             # ── New entry ──
             if not position and pred != 0 and in_window and atr_ok and now_time < SQUARE_OFF_TIME:
                 if now_ts - last_signal_time > SIGNAL_COOLDOWN:
+                    # Read active contract from Redis
+                    contract_name = ""
+                    try:
+                        ts_raw = await ar.get(f"{REDIS_PREFIX}Trading_symbol")
+                        if ts_raw:
+                            ts_data = json.loads(ts_raw)
+                            if pred == 1:  # BUY → PE (sell put) or CE
+                                ce_info = ts_data.get("CE", [None])
+                                contract_name = ce_info[0] if ce_info and ce_info[0] else ""
+                            elif pred == -1:  # SELL → PE
+                                pe_info = ts_data.get("PE", [None])
+                                contract_name = pe_info[0] if pe_info and pe_info[0] else ""
+                    except:
+                        pass
+
                     if pred == 1:
                         sl = close_price - current_atr * ATR_KEY_VALUE
-                        position = {'dir': 'LONG', 'entry': close_price, 'sl': sl, 'entry_time': candle_time}
-                        logger.info(f"  🟢 ENTERED LONG @ {close_price:.2f} | SL={sl:.2f} | ATR={current_atr:.2f}")
+                        position = {'dir': 'LONG', 'entry': close_price, 'sl': sl, 'entry_time': candle_time, 'contract': contract_name}
+                        logger.info(f"  🟢 ENTERED LONG @ {close_price:.2f} | SL={sl:.2f} | ATR={current_atr:.2f} | Contract={contract_name}")
                     elif pred == -1:
                         sl = close_price + current_atr * ATR_KEY_VALUE
-                        position = {'dir': 'SHORT', 'entry': close_price, 'sl': sl, 'entry_time': candle_time}
-                        logger.info(f"  🔴 ENTERED SHORT @ {close_price:.2f} | SL={sl:.2f} | ATR={current_atr:.2f}")
+                        position = {'dir': 'SHORT', 'entry': close_price, 'sl': sl, 'entry_time': candle_time, 'contract': contract_name}
+                        logger.info(f"  🔴 ENTERED SHORT @ {close_price:.2f} | SL={sl:.2f} | ATR={current_atr:.2f} | Contract={contract_name}")
 
             # ── Publish signals via Redis (for pos_handle_wts) ──
             if pred != 0 and pred != last_prediction and in_window and atr_ok:
@@ -489,18 +504,26 @@ async def catboost_signal_engine():
                 unrealized = round(unrealized, 2)
                 sl_dist = round(abs(close_price - position['sl']), 2)
                 pos_icon = "🟢" if position['dir'] == 'LONG' else "🔴"
-                pos_str = f"{pos_icon}{position['dir']} @ {position['entry']:.2f}"
+                cname = position.get('contract', '')
+                pos_str = f"{pos_icon}{position['dir']} @ {position['entry']:.2f} [{cname}]" if cname else f"{pos_icon}{position['dir']} @ {position['entry']:.2f}"
 
             total_trades = wins + losses
             wr = (wins / total_trades * 100) if total_trades > 0 else 0
+            live_pnl = daily_pnl + unrealized  # realized + unrealized
+
+            if position:
+                pos_detail = (
+                    f"Unreal={unrealized:+.2f} | SL_dist={sl_dist:.2f} | "
+                )
+            else:
+                pos_detail = ""
 
             logger.info(
                 f"📊 {candle_time} | NIFTY={close_price:.2f} | "
                 f"Pred={signal_name} | ATR={current_atr:.2f} | "
-                f"Pos={pos_str} | "
-                f"{'Unreal=' + f'{unrealized:+.2f}' + ' | SL_dist=' + f'{sl_dist:.2f}' if position else ''}"
+                f"Pos={pos_str} | {pos_detail}"
                 f"Trades={total_trades} (W:{wins} L:{losses} {wr:.0f}%) | "
-                f"Day P&L={daily_pnl:+.2f} | {t_elapsed:.0f}ms"
+                f"Day P&L={live_pnl:+.2f} | {t_elapsed:.0f}ms"
             )
 
         except Exception as e:
