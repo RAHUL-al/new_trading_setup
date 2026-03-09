@@ -374,10 +374,21 @@ async def catboost_signal_engine():
         }
         trades.append(trade)
         icon = "✅" if pnl > 0 else "❌"
+        # Get contract exit price
+        opt_exit_str = ""
+        cname = position.get('contract', '')
+        opt_entry = position.get('contract_entry', 0)
+        if cname:
+            try:
+                opt_exit_raw = await ar.get(f"{REDIS_PREFIX}{cname}")
+                if opt_exit_raw:
+                    opt_exit_str = f" | OPT: {cname} Entry=₹{opt_entry:.2f} Exit=₹{float(opt_exit_raw):.2f}"
+            except:
+                pass
         logger.info(
             f"  {'🟢' if position['dir']=='LONG' else '🔴'} CLOSED {position['dir']} | "
             f"Entry={position['entry']:.2f} → Exit={exit_price:.2f} | "
-            f"P&L={pnl:+.2f} {icon} | Reason={reason}"
+            f"P&L={pnl:+.2f} {icon} | Reason={reason}{opt_exit_str}"
         )
         position = None
         await save_state()
@@ -439,9 +450,16 @@ async def catboost_signal_engine():
                             live_pnl = daily_pnl + unrealized
                             total_trades = wins + losses
                             wr = (wins / total_trades * 100) if total_trades > 0 else 0
+                            # Get contract live price
+                            opt_str = ""
+                            if cname:
+                                opt_ltp = await ar.get(f"{REDIS_PREFIX}{cname}")
+                                opt_entry = position.get('contract_entry', 0)
+                                if opt_ltp:
+                                    opt_str = f" | OPT: Entry={opt_entry:.2f} Now={float(opt_ltp):.2f}"
                             logger.info(
                                 f"📊 {now.strftime('%H:%M:%S')} | NIFTY={live_price:.2f} | "
-                                f"Pos={pos_icon}{position['dir']} @ {position['entry']:.2f} [{cname}] | "
+                                f"Pos={pos_icon}{position['dir']} @ {position['entry']:.2f} [{cname}]{opt_str} | "
                                 f"Unreal={unrealized:+.2f} | SL={position['sl']:.2f} (dist={sl_dist:.2f}) | "
                                 f"Trades={total_trades} (W:{wins} L:{losses} {wr:.0f}%) | "
                                 f"Day P&L={live_pnl:+.2f} | LIVE"
@@ -550,15 +568,25 @@ async def catboost_signal_engine():
                     except:
                         pass
 
+                    # Get contract entry price from Redis
+                    contract_entry_price = 0
+                    if contract_name:
+                        try:
+                            cep = await ar.get(f"{REDIS_PREFIX}{contract_name}")
+                            if cep:
+                                contract_entry_price = float(cep)
+                        except:
+                            pass
+
                     if pred == 1:
                         sl = close_price - current_atr * ATR_KEY_VALUE
-                        position = {'dir': 'LONG', 'entry': close_price, 'sl': sl, 'entry_time': candle_time, 'contract': contract_name}
-                        logger.info(f"  🟢 ENTERED LONG @ {close_price:.2f} | SL={sl:.2f} | ATR={current_atr:.2f} | Contract={contract_name}")
+                        position = {'dir': 'LONG', 'entry': close_price, 'sl': sl, 'entry_time': candle_time, 'contract': contract_name, 'contract_entry': contract_entry_price}
+                        logger.info(f"  🟢 ENTERED LONG @ {close_price:.2f} | SL={sl:.2f} | ATR={current_atr:.2f} | Contract={contract_name} @ ₹{contract_entry_price:.2f}")
                         await save_state()
                     elif pred == -1:
                         sl = close_price + current_atr * ATR_KEY_VALUE
-                        position = {'dir': 'SHORT', 'entry': close_price, 'sl': sl, 'entry_time': candle_time, 'contract': contract_name}
-                        logger.info(f"  🔴 ENTERED SHORT @ {close_price:.2f} | SL={sl:.2f} | ATR={current_atr:.2f} | Contract={contract_name}")
+                        position = {'dir': 'SHORT', 'entry': close_price, 'sl': sl, 'entry_time': candle_time, 'contract': contract_name, 'contract_entry': contract_entry_price}
+                        logger.info(f"  🔴 ENTERED SHORT @ {close_price:.2f} | SL={sl:.2f} | ATR={current_atr:.2f} | Contract={contract_name} @ ₹{contract_entry_price:.2f}")
                         await save_state()
 
             # ── Publish signals via Redis (for pos_handle_wts) ──
