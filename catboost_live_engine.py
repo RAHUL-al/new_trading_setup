@@ -276,6 +276,14 @@ async def catboost_signal_engine():
         model_features = ALL_FEATURE_COLS
         logger.info(f"  Using default feature list: {len(model_features)}")
 
+    # ── Live position tracking ──
+    position = None  # {'dir': 'LONG'/'SHORT', 'entry': float, 'sl': float, 'entry_time': str}
+    trades = []  # completed trades
+    daily_pnl = 0.0
+    wins = 0
+    losses = 0
+    SQUARE_OFF_TIME = datetime.time(15, 24)
+
     last_signal_time = 0
     last_candle_count = 0
     last_prediction = 0
@@ -286,7 +294,36 @@ async def catboost_signal_engine():
     logger.info(f"  Min ATR: {MIN_ATR}")
     logger.info(f"  Signal cooldown: {SIGNAL_COOLDOWN}s")
 
-    last_status_log = 0  # track last status log time
+    last_status_log = 0
+
+    def close_position(exit_price, reason, exit_time_str):
+        nonlocal position, daily_pnl, wins, losses
+        if not position:
+            return
+        if position['dir'] == 'LONG':
+            pnl = exit_price - position['entry']
+        else:
+            pnl = position['entry'] - exit_price
+        pnl = round(pnl, 2)
+        daily_pnl += pnl
+        if pnl > 0:
+            wins += 1
+        else:
+            losses += 1
+        trade = {
+            'dir': position['dir'], 'entry': position['entry'],
+            'exit': exit_price, 'sl': position['sl'],
+            'entry_time': position['entry_time'], 'exit_time': exit_time_str,
+            'pnl': pnl, 'reason': reason,
+        }
+        trades.append(trade)
+        icon = "✅" if pnl > 0 else "❌"
+        logger.info(
+            f"  {'🟢' if position['dir']=='LONG' else '🔴'} CLOSED {position['dir']} | "
+            f"Entry={position['entry']:.2f} → Exit={exit_price:.2f} | "
+            f"P&L={pnl:+.2f} {icon} | Reason={reason}"
+        )
+        position = None
 
     while True:
         try:
@@ -294,7 +331,12 @@ async def catboost_signal_engine():
             now_time = now.time()
 
             if now_time >= datetime.time(15, 30):
+                # Square off any open position
+                if position:
+                    logger.info("🕐 Market close — squaring off")
+                    close_position(close_price, "MARKET_CLOSE", now.strftime('%H:%M'))
                 logger.info("Market closed. Stopping CatBoost engine.")
+                _print_daily_summary(trades, daily_pnl, wins, losses, prediction_count)
                 break
 
             if now_time < datetime.time(9, 20):
@@ -309,16 +351,15 @@ async def catboost_signal_engine():
             history_key = f"{REDIS_PREFIX}HISTORY:{NIFTY_SYMBOL}:{date_key}"
             candle_count = await ar.llen(history_key)
 
-            if candle_count < 20:  # Need enough history for features
+            if candle_count < 20:
                 if time.time() - last_status_log > 10:
                     logger.info(f"⏳ Waiting for candles: {candle_count}/20 in Redis ({history_key})")
                     last_status_log = time.time()
                 await asyncio.sleep(0.1)
                 continue
 
-            # Skip if no new candle
             if candle_count == last_candle_count:
-                await asyncio.sleep(0.05)  # 50ms poll
+                await asyncio.sleep(0.05)
                 continue
 
             last_candle_count = candle_count
@@ -335,65 +376,87 @@ async def catboost_signal_engine():
             for col in ["Open", "High", "Low", "Close"]:
                 df_1m[col] = df_1m[col].astype(float)
 
-            # Resample to 2-min
             df_2m = resample_to_2min(df_1m)
-
-            # Build features
             features, current_atr, trail_stop = build_all_features(df_1m, df_2m)
 
-            # Store ATR in Redis (for pos_handle_wts)
             await ar.set(f"{REDIS_PREFIX}ATR_value", str(round(current_atr, 2)))
 
-            # Store last candle in Redis
             last_row = df_1m.iloc[-1]
+            close_price = float(last_row["Close"])
+            high_price = float(last_row["High"])
+            low_price = float(last_row["Low"])
+            candle_time = str(last_row.get("timestamp", ""))[-8:-3]  # HH:MM
+
             last_candle_data = json.dumps({
                 "timestamp": str(last_row.get("timestamp", "")),
                 "open": float(last_row["Open"]),
                 "high": float(last_row["High"]),
                 "low": float(last_row["Low"]),
-                "close": float(last_row["Close"]),
+                "close": close_price,
             })
             await ar.set(f"{REDIS_PREFIX}last_candle", last_candle_data)
-
-            # Publish candle close
             await ar.publish(f"{REDIS_PREFIX}candle:close", last_candle_data)
 
-            # Build feature vector in correct order
+            # Build feature vector
             if model_features and len(model_features) > 0:
                 feature_vector = [features.get(f, 0) for f in model_features]
             else:
                 feature_vector = [features.get(f, 0) for f in ALL_FEATURE_COLS]
-
-            # Replace NaN/inf
             feature_vector = [0 if (v != v or abs(v) == float('inf')) else v for v in feature_vector]
 
-            # Predict
             pred = model.predict([feature_vector]).flatten()[0].item()
             prediction_count += 1
+            t_elapsed = (time.perf_counter() - t_start) * 1000
 
-            t_elapsed = (time.perf_counter() - t_start) * 1000  # ms
-
-            # Check trading window
             in_window = WINDOW_START <= now_time <= WINDOW_END
             atr_ok = current_atr > MIN_ATR
             now_ts = time.time()
 
-            close_price = float(last_row["Close"])
-
-            # Signal labels
             signal_map = {1: "BUY", -1: "SELL", 0: "HOLD"}
             signal_name = signal_map.get(pred, "HOLD")
 
-            # Log every prediction
-            if pred != 0:
-                logger.info(
-                    f"🤖 CatBoost: {signal_name} | NIFTY={close_price:.2f} | "
-                    f"ATR={current_atr:.2f} | Trail={trail_stop:.2f} | "
-                    f"Window={'✅' if in_window else '❌'} | "
-                    f"Latency={t_elapsed:.1f}ms | #{prediction_count}"
-                )
+            # ── Square off at 15:24 ──
+            if position and now_time >= SQUARE_OFF_TIME:
+                close_position(close_price, "SQUARE_OFF", candle_time)
 
-            # Only publish signals within window + ATR ok + cooldown
+            # ── Trail SL check ──
+            if position:
+                sl_hit = False
+                if position['dir'] == 'LONG' and low_price <= position['sl']:
+                    close_position(position['sl'], "TRAIL_SL", candle_time)
+                elif position['dir'] == 'SHORT' and high_price >= position['sl']:
+                    close_position(position['sl'], "TRAIL_SL", candle_time)
+
+            # ── Update trailing SL ──
+            if position:
+                if position['dir'] == 'LONG':
+                    new_sl = close_price - current_atr * ATR_KEY_VALUE
+                    if new_sl > position['sl']:
+                        position['sl'] = new_sl
+                elif position['dir'] == 'SHORT':
+                    new_sl = close_price + current_atr * ATR_KEY_VALUE
+                    if new_sl < position['sl']:
+                        position['sl'] = new_sl
+
+            # ── Opposite signal — close existing ──
+            if pred == 1 and position and position['dir'] == 'SHORT':
+                close_position(close_price, "OPPOSITE", candle_time)
+            elif pred == -1 and position and position['dir'] == 'LONG':
+                close_position(close_price, "OPPOSITE", candle_time)
+
+            # ── New entry ──
+            if not position and pred != 0 and in_window and atr_ok and now_time < SQUARE_OFF_TIME:
+                if now_ts - last_signal_time > SIGNAL_COOLDOWN:
+                    if pred == 1:
+                        sl = close_price - current_atr * ATR_KEY_VALUE
+                        position = {'dir': 'LONG', 'entry': close_price, 'sl': sl, 'entry_time': candle_time}
+                        logger.info(f"  🟢 ENTERED LONG @ {close_price:.2f} | SL={sl:.2f} | ATR={current_atr:.2f}")
+                    elif pred == -1:
+                        sl = close_price + current_atr * ATR_KEY_VALUE
+                        position = {'dir': 'SHORT', 'entry': close_price, 'sl': sl, 'entry_time': candle_time}
+                        logger.info(f"  🔴 ENTERED SHORT @ {close_price:.2f} | SL={sl:.2f} | ATR={current_atr:.2f}")
+
+            # ── Publish signals via Redis (for pos_handle_wts) ──
             if pred != 0 and pred != last_prediction and in_window and atr_ok:
                 if now_ts - last_signal_time > SIGNAL_COOLDOWN:
                     signal_data = json.dumps({
@@ -403,26 +466,73 @@ async def catboost_signal_engine():
                         "prediction": pred,
                         "latency_ms": round(t_elapsed, 1),
                     })
-
                     if pred == 1:
                         await ar.publish(f"{REDIS_PREFIX}signal:buy", signal_data)
                         await ar.set(f"{REDIS_PREFIX}buy_signal", "true")
                         await ar.set(f"{REDIS_PREFIX}sell_signal", "false")
-                        logger.info(f"🟢 BUY SIGNAL PUBLISHED | NIFTY={close_price:.2f} | ATR={current_atr:.2f}")
                     elif pred == -1:
                         await ar.publish(f"{REDIS_PREFIX}signal:sell", signal_data)
                         await ar.set(f"{REDIS_PREFIX}sell_signal", "true")
                         await ar.set(f"{REDIS_PREFIX}buy_signal", "false")
-                        logger.info(f"🔴 SELL SIGNAL PUBLISHED | NIFTY={close_price:.2f} | ATR={current_atr:.2f}")
-
                     last_signal_time = now_ts
                     last_prediction = pred
+
+            # ── Live Dashboard ──
+            unrealized = 0
+            pos_str = "FLAT"
+            sl_dist = 0
+            if position:
+                if position['dir'] == 'LONG':
+                    unrealized = close_price - position['entry']
+                else:
+                    unrealized = position['entry'] - close_price
+                unrealized = round(unrealized, 2)
+                sl_dist = round(abs(close_price - position['sl']), 2)
+                pos_icon = "🟢" if position['dir'] == 'LONG' else "🔴"
+                pos_str = f"{pos_icon}{position['dir']} @ {position['entry']:.2f}"
+
+            total_trades = wins + losses
+            wr = (wins / total_trades * 100) if total_trades > 0 else 0
+
+            logger.info(
+                f"📊 {candle_time} | NIFTY={close_price:.2f} | "
+                f"Pred={signal_name} | ATR={current_atr:.2f} | "
+                f"Pos={pos_str} | "
+                f"{'Unreal=' + f'{unrealized:+.2f}' + ' | SL_dist=' + f'{sl_dist:.2f}' if position else ''}"
+                f"Trades={total_trades} (W:{wins} L:{losses} {wr:.0f}%) | "
+                f"Day P&L={daily_pnl:+.2f} | {t_elapsed:.0f}ms"
+            )
 
         except Exception as e:
             logger.error(f"CatBoost engine error: {e}")
             import traceback
             traceback.print_exc()
             await asyncio.sleep(1)
+
+
+def _print_daily_summary(trades, daily_pnl, wins, losses, predictions):
+    """Print end-of-day summary."""
+    total = wins + losses
+    wr = (wins / total * 100) if total > 0 else 0
+    logger.info(f"\n{'='*70}")
+    logger.info(f"  📋 DAILY SUMMARY")
+    logger.info(f"{'='*70}")
+    logger.info(f"  Total trades:    {total}")
+    logger.info(f"  Wins: {wins} | Losses: {losses} | Win rate: {wr:.0f}%")
+    logger.info(f"  Day P&L:         {daily_pnl:+.2f} pts")
+    logger.info(f"  Predictions:     {predictions}")
+    if trades:
+        logger.info(f"\n  {'#':>3} {'Dir':<6} {'Entry':>10} {'Exit':>10} {'SL':>10} {'P&L':>8} {'Reason':<12}")
+        logger.info(f"  {'-'*62}")
+        for i, t in enumerate(trades, 1):
+            icon = "✅" if t['pnl'] > 0 else "❌"
+            logger.info(
+                f"  {i:>3} {t['dir']:<6} {t['entry']:>10.2f} {t['exit']:>10.2f} "
+                f"{t['sl']:>10.2f} {t['pnl']:>+7.2f}{icon} {t['reason']:<12}"
+            )
+        logger.info(f"  {'-'*62}")
+        logger.info(f"  {'':>3} {'':>6} {'':>10} {'':>10} {'TOTAL':>10} {daily_pnl:>+7.2f}")
+    logger.info(f"{'='*70}")
 
 
 def run_catboost_engine():
