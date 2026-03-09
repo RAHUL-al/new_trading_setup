@@ -106,6 +106,7 @@ last_candle_map = {}
 
 def run_websocket():
     """Main WebSocket process — handles index/stock ticks + option ticks."""
+    global current_cred_index
 
     def on_data(wsapp, message):
         global last_data_received
