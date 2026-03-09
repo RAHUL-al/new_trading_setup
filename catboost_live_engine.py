@@ -416,7 +416,38 @@ async def catboost_signal_engine():
                 continue
 
             if candle_count == last_candle_count:
-                await asyncio.sleep(0.05)
+                # ── Between candles: poll live price every 1s for SL + dashboard ──
+                if position:
+                    live_ltp = await ar.get(f"{REDIS_PREFIX}NIFTY")
+                    if live_ltp:
+                        live_price = float(live_ltp)
+                        # Check SL hit on live tick
+                        if position['dir'] == 'LONG' and live_price <= position['sl']:
+                            await do_close_position(position['sl'], "TRAIL_SL", now.strftime('%H:%M:%S'))
+                        elif position['dir'] == 'SHORT' and live_price >= position['sl']:
+                            await do_close_position(position['sl'], "TRAIL_SL", now.strftime('%H:%M:%S'))
+
+                        # Live dashboard (every 1s)
+                        if position and time.time() - last_status_log > 1:
+                            if position['dir'] == 'LONG':
+                                unrealized = round(live_price - position['entry'], 2)
+                            else:
+                                unrealized = round(position['entry'] - live_price, 2)
+                            sl_dist = round(abs(live_price - position['sl']), 2)
+                            pos_icon = "🟢" if position['dir'] == 'LONG' else "🔴"
+                            cname = position.get('contract', '')
+                            live_pnl = daily_pnl + unrealized
+                            total_trades = wins + losses
+                            wr = (wins / total_trades * 100) if total_trades > 0 else 0
+                            logger.info(
+                                f"📊 {now.strftime('%H:%M:%S')} | NIFTY={live_price:.2f} | "
+                                f"Pos={pos_icon}{position['dir']} @ {position['entry']:.2f} [{cname}] | "
+                                f"Unreal={unrealized:+.2f} | SL={position['sl']:.2f} (dist={sl_dist:.2f}) | "
+                                f"Trades={total_trades} (W:{wins} L:{losses} {wr:.0f}%) | "
+                                f"Day P&L={live_pnl:+.2f} | LIVE"
+                            )
+                            last_status_log = time.time()
+                await asyncio.sleep(0.5)
                 continue
 
             last_candle_count = candle_count
