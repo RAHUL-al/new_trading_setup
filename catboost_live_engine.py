@@ -276,6 +276,15 @@ async def catboost_signal_engine():
         model_features = ALL_FEATURE_COLS
         logger.info(f"  Using default feature list: {len(model_features)}")
 
+    # ── Live position tracking ──
+    position = None
+    trades = []
+    daily_pnl = 0.0
+    wins = 0
+    losses = 0
+    prediction_count = 0
+    last_prediction = 0
+
     # ── Redis keys for state persistence ──
     STATE_KEY = f"{REDIS_PREFIX}catboost_state"
     TRADES_KEY = f"{REDIS_PREFIX}catboost_trades"
