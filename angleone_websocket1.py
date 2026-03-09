@@ -253,21 +253,37 @@ def run_websocket():
 
     def on_close(wsapp):
         if _reconnecting:
-            return  # Suppress during planned reconnect
-        logger.info("WebSocket Closed")
-        _reconnect_with_failover("on_close")
+            return
+        logger.info("WebSocket Closed — switching credentials and reconnecting")
+        _force_credential_switch("on_close")
 
     _reconnecting = False
 
+    def _force_credential_switch(source="unknown"):
+        """Force switch to other credentials and reconnect (used when current cred is dead)."""
+        nonlocal _reconnecting
+        global current_cred_index, last_data_received
+        _reconnecting = True
+        current_cred_index = (current_cred_index + 1) % len(CREDENTIALS)
+        new_cred = CREDENTIALS[current_cred_index]
+        logger.info(f"🔄 Force switching to {new_cred['client_id']} (triggered by {source})")
+        try:
+            sws.MAX_RETRY_ATTEMPT = 0
+            sws.close_connection()
+        except:
+            pass
+        time.sleep(3)
+        last_data_received = time.time()
+        threading.Thread(target=run_websocket, daemon=True).start()
+
     def _reconnect_with_failover(source="unknown"):
-        """Try reconnect. On failure, switch to backup credentials."""
+        """Try reconnect with same credentials first. On failure, switch."""
         nonlocal _reconnecting
         global current_cred_index, last_data_received
         if _reconnecting:
-            return  # silent skip — no more log spam
+            return
         _reconnecting = True
         logger.info(f"🔄 Reconnecting in 3s... (triggered by {source})")
-        # Kill old websocket's retry mechanism
         try:
             sws.MAX_RETRY_ATTEMPT = 0
             sws.close_connection()
@@ -278,13 +294,8 @@ def run_websocket():
         try:
             threading.Thread(target=run_websocket, daemon=True).start()
         except Exception as e:
-            logger.error(f"Reconnect failed: {e}")
-            current_cred_index = (current_cred_index + 1) % len(CREDENTIALS)
-            new_cred = CREDENTIALS[current_cred_index]
-            logger.info(f"🔄 Switching to backup credentials: {new_cred['client_id']}")
-            time.sleep(2)
-            last_data_received = time.time()
-            threading.Thread(target=run_websocket, daemon=True).start()
+            logger.error(f"Reconnect failed: {e} — switching credentials")
+            _force_credential_switch(source)
 
     def _heartbeat_monitor():
         """Monitor data freshness — warn at 10s, force reconnect at 20s."""
