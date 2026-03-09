@@ -646,6 +646,19 @@ if __name__ == "__main__":
     # Import CatBoost live engine
     from catboost_live_engine import run_catboost_engine
 
+    # Wait until 9:14 AM (1 min before market open) if started early
+    now = datetime.datetime.now(INDIA_TZ)
+    market_ready = now.replace(hour=9, minute=14, second=0, microsecond=0)
+    if now < market_ready:
+        wait_secs = (market_ready - now).total_seconds()
+        logger.info(f"⏳ Market opens at 09:15. Waiting {wait_secs/60:.0f} min until 09:14...")
+        while datetime.datetime.now(INDIA_TZ) < market_ready:
+            remaining = (market_ready - datetime.datetime.now(INDIA_TZ)).total_seconds()
+            if int(remaining) % 60 == 0 and remaining > 5:
+                logger.info(f"⏳ {remaining/60:.0f} min to market open...")
+            time.sleep(5)
+        logger.info("🔔 Starting all processes — market about to open!")
+
     P0 = Process(target=run_websocket)
     P1 = Process(target=run_catboost_engine)  # CatBoost ML (replaces UT Bot)
     P2 = Process(target=market_close_cleanup)
