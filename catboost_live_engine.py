@@ -286,6 +286,8 @@ async def catboost_signal_engine():
     logger.info(f"  Min ATR: {MIN_ATR}")
     logger.info(f"  Signal cooldown: {SIGNAL_COOLDOWN}s")
 
+    last_status_log = 0  # track last status log time
+
     while True:
         try:
             now = datetime.datetime.now(INDIA_TZ)
@@ -296,6 +298,9 @@ async def catboost_signal_engine():
                 break
 
             if now_time < datetime.time(9, 20):
+                if time.time() - last_status_log > 10:
+                    logger.info(f"⏳ Waiting for 09:20 (now: {now_time.strftime('%H:%M:%S')})...")
+                    last_status_log = time.time()
                 await asyncio.sleep(0.5)
                 continue
 
@@ -305,6 +310,9 @@ async def catboost_signal_engine():
             candle_count = await ar.llen(history_key)
 
             if candle_count < 20:  # Need enough history for features
+                if time.time() - last_status_log > 10:
+                    logger.info(f"⏳ Waiting for candles: {candle_count}/20 in Redis ({history_key})")
+                    last_status_log = time.time()
                 await asyncio.sleep(0.1)
                 continue
 
