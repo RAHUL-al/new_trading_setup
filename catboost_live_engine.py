@@ -45,12 +45,12 @@ SIGNAL_COOLDOWN = 2  # seconds between signals (fast for ML)
 
 # Trading window (configurable via env)
 WINDOW_START = datetime.time(
-    int(os.environ.get("WINDOW_START_H", "14")),
-    int(os.environ.get("WINDOW_START_M", "0"))
+    int(os.environ.get("WINDOW_START_H", "9")),
+    int(os.environ.get("WINDOW_START_M", "20"))
 )
 WINDOW_END = datetime.time(
     int(os.environ.get("WINDOW_END_H", "15")),
-    int(os.environ.get("WINDOW_END_M", "3"))
+    int(os.environ.get("WINDOW_END_M", "13"))
 )
 
 INDIA_TZ = pytz.timezone("Asia/Kolkata")
@@ -295,7 +295,7 @@ async def catboost_signal_engine():
                 logger.info("Market closed. Stopping CatBoost engine.")
                 break
 
-            if now_time < datetime.time(9, 16):
+            if now_time < datetime.time(9, 20):
                 await asyncio.sleep(0.5)
                 continue
 
