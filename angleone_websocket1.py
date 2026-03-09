@@ -245,10 +245,15 @@ def run_websocket():
                 logger.error(f"Error handling token update: {e}")
 
     def on_error(wsapp, error):
+        err_str = str(error)
+        if "Connection closed" in err_str and _reconnecting:
+            return  # Suppress noisy errors during planned reconnect
         logger.error(f"WebSocket Error: {error}")
         _reconnect_with_failover("on_error")
 
     def on_close(wsapp):
+        if _reconnecting:
+            return  # Suppress during planned reconnect
         logger.info("WebSocket Closed")
         _reconnect_with_failover("on_close")
 
@@ -259,14 +264,19 @@ def run_websocket():
         nonlocal _reconnecting
         global current_cred_index, last_data_received
         if _reconnecting:
-            logger.info(f"  ↳ Skipping duplicate reconnect from {source}")
-            return
+            return  # silent skip — no more log spam
         _reconnecting = True
-        logger.info(f"Reconnecting in 3 seconds... (triggered by {source})")
-        time.sleep(3)
-        last_data_received = time.time()  # Reset heartbeat timer
+        logger.info(f"🔄 Reconnecting in 3s... (triggered by {source})")
+        # Kill old websocket's retry mechanism
         try:
-            threading.Thread(target=run_websocket).start()
+            sws.MAX_RETRY_ATTEMPT = 0
+            sws.close_connection()
+        except:
+            pass
+        time.sleep(3)
+        last_data_received = time.time()
+        try:
+            threading.Thread(target=run_websocket, daemon=True).start()
         except Exception as e:
             logger.error(f"Reconnect failed: {e}")
             current_cred_index = (current_cred_index + 1) % len(CREDENTIALS)
@@ -274,27 +284,27 @@ def run_websocket():
             logger.info(f"🔄 Switching to backup credentials: {new_cred['client_id']}")
             time.sleep(2)
             last_data_received = time.time()
-            threading.Thread(target=run_websocket).start()
+            threading.Thread(target=run_websocket, daemon=True).start()
 
     def _heartbeat_monitor():
-        """Monitor data freshness — if no data for 3s, reconnect."""
+        """Monitor data freshness — warn at 10s, force reconnect at 20s."""
         nonlocal _reconnecting
         global last_data_received, current_cred_index
         while True:
-            time.sleep(HEARTBEAT_INTERVAL)
+            time.sleep(5)
             now_time = datetime.datetime.now(INDIA_TZ).time()
             if now_time < datetime.time(9, 15) or now_time > datetime.time(15, 30):
                 continue
             
             staleness = time.time() - last_data_received
-            if staleness > HEARTBEAT_INTERVAL:
-                logger.warning(f"💔 HEARTBEAT: No data for {staleness:.1f}s — connection may be stale")
-                if staleness > HEARTBEAT_INTERVAL * 2:  # 6+ seconds
+            if staleness > 10:
+                logger.warning(f"💔 HEARTBEAT: No data for {staleness:.0f}s — connection may be stale")
+                if staleness > 20:
                     if _reconnecting:
-                        logger.info("  ↳ Reconnect already in progress, skipping")
                         continue
-                    logger.error(f"💀 HEARTBEAT: Stale for {staleness:.1f}s — forcing reconnect")
+                    logger.error(f"💀 HEARTBEAT: Stale for {staleness:.0f}s — forcing reconnect")
                     try:
+                        sws.MAX_RETRY_ATTEMPT = 0
                         sws.close_connection()
                     except:
                         pass
@@ -302,9 +312,9 @@ def run_websocket():
                     new_cred = CREDENTIALS[current_cred_index]
                     logger.info(f"🔄 Switching to credentials: {new_cred['client_id']}")
                     _reconnecting = True
-                    time.sleep(2)
+                    time.sleep(3)
                     last_data_received = time.time()
-                    threading.Thread(target=run_websocket).start()
+                    threading.Thread(target=run_websocket, daemon=True).start()
                     return
 
     # Connect with current credentials
@@ -316,7 +326,8 @@ def run_websocket():
         logger.info(f"🔄 Trying backup: {CREDENTIALS[current_cred_index]['client_id']}")
         FEED_TOKEN, active_cred = connect_api(CREDENTIALS[current_cred_index])
 
-    sws = SmartWebSocketV2(active_cred['totp'], active_cred['api_key'], active_cred['client_id'], FEED_TOKEN)
+    sws = SmartWebSocketV2(active_cred['totp'], active_cred['api_key'], active_cred['client_id'], FEED_TOKEN,
+                           max_retry_attempt=1)  # Minimal internal retries
     sws.on_open = on_open
     sws.on_data = on_data
     sws.on_error = on_error
@@ -325,7 +336,6 @@ def run_websocket():
     token_update_thread = threading.Thread(target=_handle_token_update, daemon=True)
     token_update_thread.start()
 
-    # Start heartbeat monitor
     heartbeat_thread = threading.Thread(target=_heartbeat_monitor, daemon=True)
     heartbeat_thread.start()
 
