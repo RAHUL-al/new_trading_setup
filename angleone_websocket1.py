@@ -304,7 +304,7 @@ def run_websocket():
         while True:
             time.sleep(5)
             now_time = datetime.datetime.now(INDIA_TZ).time()
-            if now_time < datetime.time(9, 15) or now_time > datetime.time(15, 30):
+            if now_time < datetime.time(14, 00) or now_time > datetime.time(15, 30):
                 continue
             
             staleness = time.time() - last_data_received
