@@ -368,7 +368,7 @@ async def catboost_signal_engine():
             feature_vector = [0 if (v != v or abs(v) == float('inf')) else v for v in feature_vector]
 
             # Predict
-            pred = int(model.predict([feature_vector])[0])
+            pred = model.predict([feature_vector]).flatten()[0].item()
             prediction_count += 1
 
             t_elapsed = (time.perf_counter() - t_start) * 1000  # ms
