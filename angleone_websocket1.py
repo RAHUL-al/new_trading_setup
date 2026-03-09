@@ -246,35 +246,43 @@ def run_websocket():
 
     def on_error(wsapp, error):
         logger.error(f"WebSocket Error: {error}")
-        _reconnect_with_failover()
+        _reconnect_with_failover("on_error")
 
     def on_close(wsapp):
         logger.info("WebSocket Closed")
-        _reconnect_with_failover()
+        _reconnect_with_failover("on_close")
 
-    def _reconnect_with_failover():
+    _reconnecting = False
+
+    def _reconnect_with_failover(source="unknown"):
         """Try reconnect. On failure, switch to backup credentials."""
-        global current_cred_index
-        logger.info("Reconnecting in 3 seconds...")
+        nonlocal _reconnecting
+        global current_cred_index, last_data_received
+        if _reconnecting:
+            logger.info(f"  ↳ Skipping duplicate reconnect from {source}")
+            return
+        _reconnecting = True
+        logger.info(f"Reconnecting in 3 seconds... (triggered by {source})")
         time.sleep(3)
+        last_data_received = time.time()  # Reset heartbeat timer
         try:
             threading.Thread(target=run_websocket).start()
         except Exception as e:
             logger.error(f"Reconnect failed: {e}")
-            # Switch credentials
             current_cred_index = (current_cred_index + 1) % len(CREDENTIALS)
             new_cred = CREDENTIALS[current_cred_index]
             logger.info(f"🔄 Switching to backup credentials: {new_cred['client_id']}")
             time.sleep(2)
+            last_data_received = time.time()
             threading.Thread(target=run_websocket).start()
 
     def _heartbeat_monitor():
         """Monitor data freshness — if no data for 3s, reconnect."""
+        nonlocal _reconnecting
         global last_data_received, current_cred_index
         while True:
             time.sleep(HEARTBEAT_INTERVAL)
             now_time = datetime.datetime.now(INDIA_TZ).time()
-            # Only check during market hours (9:15 - 15:30)
             if now_time < datetime.time(9, 15) or now_time > datetime.time(15, 30):
                 continue
             
@@ -282,18 +290,22 @@ def run_websocket():
             if staleness > HEARTBEAT_INTERVAL:
                 logger.warning(f"💔 HEARTBEAT: No data for {staleness:.1f}s — connection may be stale")
                 if staleness > HEARTBEAT_INTERVAL * 2:  # 6+ seconds
+                    if _reconnecting:
+                        logger.info("  ↳ Reconnect already in progress, skipping")
+                        continue
                     logger.error(f"💀 HEARTBEAT: Stale for {staleness:.1f}s — forcing reconnect")
                     try:
                         sws.close_connection()
                     except:
                         pass
-                    # Switch credentials
                     current_cred_index = (current_cred_index + 1) % len(CREDENTIALS)
                     new_cred = CREDENTIALS[current_cred_index]
                     logger.info(f"🔄 Switching to credentials: {new_cred['client_id']}")
+                    _reconnecting = True
                     time.sleep(2)
+                    last_data_received = time.time()
                     threading.Thread(target=run_websocket).start()
-                    return  # Exit this heartbeat thread
+                    return
 
     # Connect with current credentials
     try:
