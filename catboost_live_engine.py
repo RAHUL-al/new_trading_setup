@@ -1,11 +1,10 @@
 """
 catboost_live_engine.py — Live CatBoost ML Signal Engine for NIFTY
 
-Replaces UT Bot signal engine. Loads trained CatBoost model and generates
-BUY/SELL signals from live 1-min candle data via Redis.
-
 Architecture:
-  Redis HISTORY:NIFTY → build features (incremental) → CatBoost predict → Redis pub/sub
+  1. Pre-market: Sync CSV data (fill missing days via AngelOne API)
+  2. Trading: Hybrid prediction (cached history + live websocket candle)
+  3. Background: Cross-check Redis candles vs API every minute until close
 
 Same Redis interface as UT Bot engine — pos_handle_wts.py works unchanged.
 """
@@ -14,6 +13,7 @@ import asyncio
 import datetime
 import time
 import os
+import threading
 import numpy as np
 import pandas as pd
 import ujson as json
@@ -28,6 +28,22 @@ except ImportError:
     exit(1)
 
 from redis.asyncio import Redis as AsyncRedis
+import redis
+
+# Import incremental fetch functions
+try:
+    from fetch_nifty_incremental import (
+        connect_api as api_connect,
+        fetch_candles as api_fetch_candles,
+        get_last_date_in_csv,
+        filter_market_hours,
+        get_date_chunks,
+        INTERVAL_CONFIG,
+    )
+    HAS_FETCH_MODULE = True
+except ImportError:
+    HAS_FETCH_MODULE = False
+    logger.warning("⚠️ fetch_nifty_incremental.py not found — pre-market sync disabled")
 
 # ─────────── Config ───────────
 REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
@@ -243,6 +259,204 @@ def resample_to_2min(df_1m):
 
     return resampled
 
+# ─────────── Pre-Market CSV Sync ───────────
+
+def pre_market_csv_sync():
+    """
+    Sync CSV data before trading starts.
+    Checks last date in CSV → fetches missing days → saves.
+    Returns cached DataFrame from CSV (last N candles for warm-up).
+    """
+    if not HAS_FETCH_MODULE:
+        logger.warning("⚠️ Pre-market sync skipped — fetch module not available")
+        return None
+
+    logger.info("=" * 60)
+    logger.info("📡 PRE-MARKET CSV SYNC")
+    logger.info("=" * 60)
+
+    try:
+        smart_api = api_connect()
+    except Exception as e:
+        logger.error(f"❌ API login failed for pre-market sync: {e}")
+        return None
+
+    # Sync 1-min data
+    config_1m = INTERVAL_CONFIG["ONE_MINUTE"]
+    output_file = config_1m["output_file"]
+
+    last_date = get_last_date_in_csv(output_file)
+    today = datetime.date.today()
+
+    if last_date and last_date >= today:
+        logger.info(f"  ✅ CSV already up to date (last: {last_date})")
+    else:
+        if last_date:
+            start_date = datetime.datetime.combine(last_date, datetime.datetime.min.time())
+            days_missing = (today - last_date).days
+            logger.info(f"  📅 Missing ~{days_missing} days (last: {last_date})")
+        else:
+            start_date = datetime.datetime.strptime(config_1m["from_date"], "%Y-%m-%d")
+            logger.info(f"  📅 No CSV — fetching from {config_1m['from_date']}")
+
+        # Fetch missing chunks
+        end_date = datetime.datetime.now()
+        chunks = get_date_chunks(start_date, end_date, config_1m["chunk_days"])
+        logger.info(f"  📥 Fetching {len(chunks)} chunk(s)...")
+
+        new_data = []
+        for i, (from_d, to_d) in enumerate(chunks):
+            logger.info(f"  [{i+1}/{len(chunks)}] {from_d} → {to_d}...")
+            df = api_fetch_candles(smart_api, from_d, to_d, config_1m["api_interval"])
+            if not df.empty:
+                new_data.append(df)
+                logger.info(f"    ✓ {len(df)} candles")
+            if i < len(chunks) - 1:
+                time.sleep(2)
+
+        if new_data:
+            new_combined = pd.concat(new_data, ignore_index=True)
+            new_combined["Time"] = pd.to_datetime(new_combined["Time"])
+            new_combined = filter_market_hours(new_combined)
+
+            # Merge with existing
+            if last_date and os.path.exists(output_file):
+                existing_df = pd.read_csv(output_file)
+                existing_df["Time"] = pd.to_datetime(existing_df["Time"])
+                existing_df = existing_df[existing_df["Time"].dt.date < last_date]
+                combined = pd.concat([existing_df, new_combined], ignore_index=True)
+            else:
+                combined = new_combined
+
+            combined = combined.drop_duplicates(subset=["Time"]).sort_values("Time").reset_index(drop=True)
+            combined.to_csv(output_file, index=False)
+            logger.info(f"  ✅ CSV synced: {len(combined):,} candles → {output_file}")
+        else:
+            logger.info("  ℹ️ No new data to sync")
+
+    # Load last 100 candles from CSV as warm-up cache
+    cached_df = None
+    if os.path.exists(output_file):
+        try:
+            full_csv = pd.read_csv(output_file)
+            full_csv["Time"] = pd.to_datetime(full_csv["Time"])
+            # Take last 100 candles for feature warm-up
+            tail = full_csv.tail(100).copy()
+            cached_df = tail.rename(columns={"Time": "timestamp"})
+            for col in ["Open", "High", "Low", "Close"]:
+                cached_df[col] = cached_df[col].astype(float)
+            logger.info(f"  📦 Loaded {len(cached_df)} candles from CSV for warm-up")
+        except Exception as e:
+            logger.warning(f"  ⚠️ Could not load CSV cache: {e}")
+
+    logger.info("=" * 60)
+    return cached_df
+
+
+# ─────────── Background Cross-Check ───────────
+
+_cross_check_api = None  # Cached API connection for cross-checks
+
+def _ensure_cross_check_api():
+    """Get or create API connection for cross-checks (sync, runs in thread)."""
+    global _cross_check_api
+    if _cross_check_api is None:
+        try:
+            _cross_check_api = api_connect()
+        except Exception as e:
+            logger.warning(f"  ⚠️ Cross-check API login failed: {e}")
+            return None
+    return _cross_check_api
+
+
+def _do_cross_check(date_str, redis_prefix):
+    """
+    Cross-check today's Redis candles vs API (runs in thread).
+    Fetches today's 1-min data from API, compares with Redis HISTORY,
+    fixes any mismatches.
+    """
+    if not HAS_FETCH_MODULE:
+        return
+
+    smart_api = _ensure_cross_check_api()
+    if not smart_api:
+        return
+
+    r = redis.Redis(
+        host=REDIS_HOST, port=int(REDIS_PORT),
+        password=REDIS_PASSWORD, db=0, decode_responses=True
+    )
+
+    try:
+        # Fetch today's data from API
+        api_df = api_fetch_candles(smart_api, date_str, date_str, "ONE_MINUTE")
+        if api_df.empty:
+            logger.info(f"  🔄 Cross-check: No API data for {date_str} (market may not have started)")
+            return
+
+        api_df["Time"] = pd.to_datetime(api_df["Time"])
+        # Filter market hours
+        market_open = datetime.time(9, 15)
+        market_close = datetime.time(15, 30)
+        api_df = api_df[
+            (api_df["Time"].dt.time >= market_open) &
+            (api_df["Time"].dt.time <= market_close)
+        ]
+
+        # Get Redis HISTORY candles
+        history_key = f"{redis_prefix}HISTORY:NIFTY:{date_str}"
+        redis_raw = r.lrange(history_key, 0, -1)
+        if not redis_raw:
+            logger.info(f"  🔄 Cross-check: No Redis candles yet for {date_str}")
+            return
+
+        redis_candles = [json.loads(x) for x in redis_raw]
+
+        # Compare counts
+        api_count = len(api_df)
+        redis_count = len(redis_candles)
+
+        mismatches = 0
+        # Compare each candle that exists in both
+        for i, (_, api_row) in enumerate(api_df.iterrows()):
+            if i >= redis_count:
+                break
+            rc = redis_candles[i]
+            # Check close price mismatch (> 0.5 points = significant)
+            api_close = float(api_row["Close"])
+            redis_close = float(rc.get("close", 0))
+            if abs(api_close - redis_close) > 0.5:
+                mismatches += 1
+                # Fix Redis candle with API data
+                fixed = {
+                    "timestamp": rc.get("timestamp", ""),
+                    "open": float(api_row["Open"]),
+                    "high": float(api_row["High"]),
+                    "low": float(api_row["Low"]),
+                    "close": api_close,
+                    "volume": int(api_row.get("Volume", 0)),
+                }
+                r.lset(history_key, i, json.dumps(fixed))
+
+        if mismatches > 0:
+            logger.info(f"  🔧 Cross-check: Fixed {mismatches}/{min(api_count, redis_count)} mismatches | API={api_count} Redis={redis_count}")
+        else:
+            logger.info(f"  ✅ Cross-check: OK ({min(api_count, redis_count)} candles match) | API={api_count} Redis={redis_count}")
+
+    except Exception as e:
+        logger.warning(f"  ⚠️ Cross-check error: {e}")
+    finally:
+        try:
+            r.close()
+        except:
+            pass
+
+
+async def trigger_cross_check(date_str, redis_prefix):
+    """Run cross-check in background thread (non-blocking)."""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _do_cross_check, date_str, redis_prefix)
+
 
 # ─────────── Main Engine ───────────
 
@@ -346,6 +560,10 @@ async def catboost_signal_engine():
     last_signal_time = 0
     last_candle_count = 0
     last_status_log = 0
+    cached_df_1m = None      # Cached history DataFrame (refreshed on candle close)
+    last_live_predict = 0    # Throttle for live predictions (every 1s)
+    pre_market_synced = False # Pre-market CSV sync done?
+    cross_check_task = None  # Background cross-check task
 
     logger.info(f"⚡ CatBoost signal engine started")
     logger.info(f"  Window: {WINDOW_START.strftime('%H:%M')} - {WINDOW_END.strftime('%H:%M')}")
@@ -408,6 +626,16 @@ async def catboost_signal_engine():
                 break
 
             if now_time < datetime.time(9, 20):
+                # ── Pre-market CSV sync (run once at ~9:17) ──
+                if not pre_market_synced and now_time >= datetime.time(9, 17):
+                    logger.info("🚀 Starting pre-market CSV sync...")
+                    csv_cache = await asyncio.get_event_loop().run_in_executor(None, pre_market_csv_sync)
+                    if csv_cache is not None:
+                        cached_df_1m = csv_cache
+                        logger.info(f"  📦 CSV warm-up cache loaded: {len(cached_df_1m)} candles")
+                    pre_market_synced = True
+                    logger.info("  ✅ Pre-market sync complete. Waiting for 09:20...")
+
                 if time.time() - last_status_log > 10:
                     logger.info(f"⏳ Waiting for 09:20 (now: {now_time.strftime('%H:%M:%S')})...")
                     last_status_log = time.time()
@@ -427,51 +655,171 @@ async def catboost_signal_engine():
                 continue
 
             if candle_count == last_candle_count:
-                # ── Between candles: poll live price every 1s for SL + dashboard ──
-                if position:
-                    live_ltp = await ar.get(f"{REDIS_PREFIX}NIFTY")
-                    if live_ltp:
-                        live_price = float(live_ltp)
-                        # Check SL hit on live tick
-                        if position['dir'] == 'LONG' and live_price <= position['sl']:
-                            await do_close_position(position['sl'], "TRAIL_SL", now.strftime('%H:%M:%S'))
-                        elif position['dir'] == 'SHORT' and live_price >= position['sl']:
-                            await do_close_position(position['sl'], "TRAIL_SL", now.strftime('%H:%M:%S'))
+                # ── Between candles: HYBRID prediction (cached history + live candle) ──
+                live_ltp = await ar.get(f"{REDIS_PREFIX}NIFTY")
+                if not live_ltp:
+                    await asyncio.sleep(0.5)
+                    continue
+                live_price = float(live_ltp)
 
-                        # Live dashboard (every 1s)
-                        if position and time.time() - last_status_log > 1:
-                            if position['dir'] == 'LONG':
-                                unrealized = round(live_price - position['entry'], 2)
+                # SL check on live tick (always — risk management)
+                if position:
+                    if position['dir'] == 'LONG' and live_price <= position['sl']:
+                        await do_close_position(position['sl'], "TRAIL_SL", now.strftime('%H:%M:%S'))
+                    elif position['dir'] == 'SHORT' and live_price >= position['sl']:
+                        await do_close_position(position['sl'], "TRAIL_SL", now.strftime('%H:%M:%S'))
+
+                # Predict using cached history + live candle (every 1s)
+                if cached_df_1m is not None and len(cached_df_1m) >= 20 and time.time() - last_live_predict > 1:
+                    # Read live candle from Redis
+                    candle_minute = now.replace(second=0, microsecond=0)
+                    live_candle_key = f"{REDIS_PREFIX}CANDLE:{NIFTY_SYMBOL}:{candle_minute.strftime('%Y-%m-%d %H:%M')}"
+                    live_candle_raw = await ar.get(live_candle_key)
+
+                    if live_candle_raw:
+                        try:
+                            live_candle = json.loads(live_candle_raw)
+                            # Build combined: history + live candle
+                            live_row = pd.DataFrame([{
+                                'Open': float(live_candle['open']),
+                                'High': float(live_candle['high']),
+                                'Low': float(live_candle['low']),
+                                'Close': float(live_candle['close']),
+                                'timestamp': live_candle.get('timestamp', ''),
+                            }])
+                            combined_df = pd.concat([cached_df_1m, live_row], ignore_index=True)
+
+                            # Build features & predict
+                            t_start_live = time.perf_counter()
+                            df_2m = resample_to_2min(combined_df)
+                            features, current_atr, trail_stop = build_all_features(combined_df, df_2m)
+
+                            if model_features and len(model_features) > 0:
+                                fv = [features.get(f, 0) for f in model_features]
                             else:
-                                unrealized = round(position['entry'] - live_price, 2)
-                            sl_dist = round(abs(live_price - position['sl']), 2)
-                            pos_icon = "🟢" if position['dir'] == 'LONG' else "🔴"
-                            cname = position.get('contract', '')
-                            live_pnl = daily_pnl + unrealized
-                            total_trades = wins + losses
-                            wr = (wins / total_trades * 100) if total_trades > 0 else 0
-                            # Get contract live price
-                            opt_str = ""
-                            if cname:
-                                opt_ltp = await ar.get(f"{REDIS_PREFIX}{cname}")
-                                opt_entry = position.get('contract_entry', 0)
-                                if opt_ltp:
-                                    opt_str = f" | OPT: Entry={opt_entry:.2f} Now={float(opt_ltp):.2f}"
-                            logger.info(
-                                f"📊 {now.strftime('%H:%M:%S')} | NIFTY={live_price:.2f} | "
-                                f"Pos={pos_icon}{position['dir']} @ {position['entry']:.2f} [{cname}]{opt_str} | "
-                                f"Unreal={unrealized:+.2f} | SL={position['sl']:.2f} (dist={sl_dist:.2f}) | "
-                                f"Trades={total_trades} (W:{wins} L:{losses} {wr:.0f}%) | "
-                                f"Day P&L={live_pnl:+.2f} | LIVE"
-                            )
-                            last_status_log = time.time()
+                                fv = [features.get(f, 0) for f in ALL_FEATURE_COLS]
+                            fv = [0 if (v != v or abs(v) == float('inf')) else v for v in fv]
+
+                            pred = model.predict([fv]).flatten()[0].item()
+                            prediction_count += 1
+                            t_live_ms = (time.perf_counter() - t_start_live) * 1000
+
+                            close_price = float(live_candle['close'])
+                            candle_time = now.strftime('%H:%M:%S')
+                            in_window = WINDOW_START <= now_time <= WINDOW_END
+                            atr_ok = current_atr > MIN_ATR
+                            now_ts = time.time()
+
+                            # Square off
+                            if position and now_time >= SQUARE_OFF_TIME:
+                                await do_close_position(close_price, "SQUARE_OFF", candle_time)
+
+                            # Opposite signal close
+                            if pred == 1 and position and position['dir'] == 'SHORT':
+                                await do_close_position(close_price, "OPPOSITE", candle_time)
+                            elif pred == -1 and position and position['dir'] == 'LONG':
+                                await do_close_position(close_price, "OPPOSITE", candle_time)
+
+                            # New entry
+                            if not position and pred != 0 and in_window and atr_ok and now_time < SQUARE_OFF_TIME:
+                                if now_ts - last_signal_time > SIGNAL_COOLDOWN:
+                                    contract_name = ""
+                                    try:
+                                        ts_raw = await ar.get(f"{REDIS_PREFIX}Trading_symbol")
+                                        if ts_raw:
+                                            ts_data = json.loads(ts_raw)
+                                            if pred == 1:
+                                                ce_info = ts_data.get("CE", [None])
+                                                contract_name = ce_info[0] if ce_info and ce_info[0] else ""
+                                            elif pred == -1:
+                                                pe_info = ts_data.get("PE", [None])
+                                                contract_name = pe_info[0] if pe_info and pe_info[0] else ""
+                                    except:
+                                        pass
+
+                                    contract_entry_price = 0
+                                    if contract_name:
+                                        try:
+                                            cep = await ar.get(f"{REDIS_PREFIX}{contract_name}")
+                                            if cep:
+                                                contract_entry_price = float(cep)
+                                        except:
+                                            pass
+
+                                    if pred == 1:
+                                        sl = close_price - current_atr * ATR_KEY_VALUE
+                                        position = {'dir': 'LONG', 'entry': close_price, 'sl': sl, 'entry_time': candle_time, 'contract': contract_name, 'contract_entry': contract_entry_price}
+                                        logger.info(f"  🟢 ENTERED LONG @ {close_price:.2f} | SL={sl:.2f} | ATR={current_atr:.2f} | Contract={contract_name} @ ₹{contract_entry_price:.2f} | LIVE_CANDLE")
+                                        await save_state()
+                                    elif pred == -1:
+                                        sl = close_price + current_atr * ATR_KEY_VALUE
+                                        position = {'dir': 'SHORT', 'entry': close_price, 'sl': sl, 'entry_time': candle_time, 'contract': contract_name, 'contract_entry': contract_entry_price}
+                                        logger.info(f"  🔴 ENTERED SHORT @ {close_price:.2f} | SL={sl:.2f} | ATR={current_atr:.2f} | Contract={contract_name} @ ₹{contract_entry_price:.2f} | LIVE_CANDLE")
+                                        await save_state()
+
+                                    # Publish signal
+                                    if pred != 0 and pred != last_prediction and in_window and atr_ok:
+                                        signal_data = json.dumps({
+                                            "signal": "buy" if pred == 1 else "sell",
+                                            "atr": round(current_atr, 2),
+                                            "source": "catboost_live",
+                                            "prediction": pred,
+                                            "latency_ms": round(t_live_ms, 1),
+                                        })
+                                        if pred == 1:
+                                            await ar.publish(f"{REDIS_PREFIX}signal:buy", signal_data)
+                                            await ar.set(f"{REDIS_PREFIX}buy_signal", "true")
+                                            await ar.set(f"{REDIS_PREFIX}sell_signal", "false")
+                                        elif pred == -1:
+                                            await ar.publish(f"{REDIS_PREFIX}signal:sell", signal_data)
+                                            await ar.set(f"{REDIS_PREFIX}sell_signal", "true")
+                                            await ar.set(f"{REDIS_PREFIX}buy_signal", "false")
+                                        last_signal_time = now_ts
+                                        last_prediction = pred
+
+                            last_live_predict = time.time()
+                        except Exception as e:
+                            logger.warning(f"  ⚠️ Live candle predict error: {e}")
+
+                # Live dashboard (every 1s)
+                if position and time.time() - last_status_log > 1:
+                    if position['dir'] == 'LONG':
+                        unrealized = round(live_price - position['entry'], 2)
+                    else:
+                        unrealized = round(position['entry'] - live_price, 2)
+                    sl_dist = round(abs(live_price - position['sl']), 2)
+                    pos_icon = "🟢" if position['dir'] == 'LONG' else "🔴"
+                    cname = position.get('contract', '')
+                    live_pnl = daily_pnl + unrealized
+                    total_trades = wins + losses
+                    wr = (wins / total_trades * 100) if total_trades > 0 else 0
+                    opt_str = ""
+                    if cname:
+                        opt_ltp = await ar.get(f"{REDIS_PREFIX}{cname}")
+                        opt_entry = position.get('contract_entry', 0)
+                        if opt_ltp:
+                            opt_str = f" | OPT: Entry={opt_entry:.2f} Now={float(opt_ltp):.2f}"
+                    signal_map = {1: "BUY", -1: "SELL", 0: "HOLD"}
+                    logger.info(
+                        f"📊 {now.strftime('%H:%M:%S')} | NIFTY={live_price:.2f} | "
+                        f"Pos={pos_icon}{position['dir']} @ {position['entry']:.2f} [{cname}]{opt_str} | "
+                        f"Unreal={unrealized:+.2f} | SL={position['sl']:.2f} (dist={sl_dist:.2f}) | "
+                        f"Trades={total_trades} (W:{wins} L:{losses} {wr:.0f}%) | "
+                        f"Day P&L={live_pnl:+.2f} | LIVE"
+                    )
+                    last_status_log = time.time()
+
                 await asyncio.sleep(0.5)
                 continue
 
             last_candle_count = candle_count
             t_start = time.perf_counter()
 
-            # Load candles
+            # ── Trigger background cross-check (runs in thread, non-blocking) ──
+            if cross_check_task is None or cross_check_task.done():
+                cross_check_task = asyncio.create_task(trigger_cross_check(date_key, REDIS_PREFIX))
+
+            # Load candles (and cache for between-candle live predictions)
             history_data = await ar.lrange(history_key, 0, -1)
             candles = [json.loads(x) for x in history_data]
             df_1m = pd.DataFrame(candles)
@@ -481,6 +829,7 @@ async def catboost_signal_engine():
             })
             for col in ["Open", "High", "Low", "Close"]:
                 df_1m[col] = df_1m[col].astype(float)
+            cached_df_1m = df_1m.copy()  # Cache for hybrid live predictions
 
             df_2m = resample_to_2min(df_1m)
             features, current_atr, trail_stop = build_all_features(df_1m, df_2m)
