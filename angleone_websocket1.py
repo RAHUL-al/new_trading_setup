@@ -681,10 +681,10 @@ if __name__ == "__main__":
 
     # Wait until 9:14 AM (1 min before market open) if started early
     now = datetime.datetime.now(INDIA_TZ)
-    market_ready = now.replace(hour=9, minute=14, second=0, microsecond=0)
+    market_ready = now.replace(hour=14, minute=0, second=0, microsecond=0)
     if now < market_ready:
         wait_secs = (market_ready - now).total_seconds()
-        logger.info(f"⏳ Market opens at 09:15. Waiting {wait_secs/60:.0f} min until 09:14...")
+        logger.info(f"⏳ Market opens at 02:00. Waiting {wait_secs/60:.0f} min until 02:00...")
         while datetime.datetime.now(INDIA_TZ) < market_ready:
             remaining = (market_ready - datetime.datetime.now(INDIA_TZ)).total_seconds()
             if int(remaining) % 60 == 0 and remaining > 5:
