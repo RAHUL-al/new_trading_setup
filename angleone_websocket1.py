@@ -6,8 +6,8 @@ angleone_websocket1.py — WebSocket feeder with:
 - Market close cleanup at 3:30 PM (archive candles, clear Redis)
 """
 
-from SmartApi.smartWebSocketV2 import SmartWebSocketV2
-from SmartApi import SmartConnect
+from smartapi.smartWebSocketV2 import SmartWebSocketV2
+from smartapi import SmartConnect
 from logzero import logger
 import pyotp
 import pandas as pd
