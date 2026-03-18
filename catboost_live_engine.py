@@ -66,7 +66,7 @@ WINDOW_START = datetime.time(
 )
 WINDOW_END = datetime.time(
     int(os.environ.get("WINDOW_END_H", "15")),
-    int(os.environ.get("WINDOW_END_M", "13"))
+    int(os.environ.get("WINDOW_END_M", "15"))
 )
 
 INDIA_TZ = pytz.timezone("Asia/Kolkata")
