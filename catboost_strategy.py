@@ -39,8 +39,8 @@ ATR_PERIOD = 14
 ATR_KEY_VALUE = 1.0
 MIN_ATR = 6.5
 
-ENTRY_START = dt_time(14, 0)      # 2:00 PM
-ENTRY_END = dt_time(15, 3)        # 3:03 PM
+ENTRY_START = dt_time(9, 20)      # 9:20 AM
+ENTRY_END = dt_time(15, 15)       # 3:15 PM
 SQUARE_OFF = dt_time(15, 24)      # 3:24 PM
 
 LOT_SIZE = 65
