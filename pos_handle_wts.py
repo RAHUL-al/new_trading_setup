@@ -40,6 +40,7 @@ KEY_SELL_SIGNAL = f"{REDIS_PREFIX}sell_signal"
 
 INDEX_TOKEN = "99926000"
 TRAILING_OFFSET = 0
+ATR_KEY_VALUE = 1.0  # Trailing SL multiplier (matching backtest)
 ATR_MIN_THRESHOLD = 6.5  # Minimum ATR to take new positions (matched to backtest)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -335,36 +336,30 @@ class TradingBot:
 
         pos = self.open_pos
         current_close = candle.close
+        current_atr = await self.get_current_atr()
+        nloss = current_atr * ATR_KEY_VALUE
 
         if pos.option_type == "CE":
-            # Trail when close exceeds the HIGH of the previous SL candle
-            if current_close > pos.highest_high:
-                pos.highest_high = candle.high
-                new_stop_loss = candle.low
-                
-                logger.info(f"CE: Close {current_close:.2f} > prev high {pos.highest_high:.2f}, proposed SL: {new_stop_loss:.2f}, current SL: {pos.stop_loss:.2f}")
-                
-                if new_stop_loss > pos.stop_loss:
-                    pos.stop_loss = new_stop_loss
-                    logger.info(f"✅ Trailing SL updated for CE: {pos.stop_loss:.2f}")
-                    await self.save_position(pos)
-                else:
-                    logger.info(f"ℹ️ CE: New SL {new_stop_loss:.2f} not higher than current SL {pos.stop_loss:.2f}")
+            new_stop_loss = current_close - nloss
+            logger.info(f"CE: NIFTY Close {current_close:.2f}, ATR {current_atr:.2f}, proposed SL: {new_stop_loss:.2f}, current SL: {pos.stop_loss:.2f}")
+            
+            if new_stop_loss > pos.stop_loss:
+                pos.stop_loss = new_stop_loss
+                logger.info(f"✅ Trailing SL updated for CE: {pos.stop_loss:.2f}")
+                await self.save_position(pos)
+            else:
+                logger.info(f"ℹ️ CE: New SL {new_stop_loss:.2f} not higher than current SL {pos.stop_loss:.2f}")
 
         elif pos.option_type == "PE":
-            # Trail when close drops below the LOW of the previous SL candle
-            if current_close < pos.lowest_low or pos.lowest_low == 0:
-                pos.lowest_low = candle.low
-                new_stop_loss = candle.high
-                
-                logger.info(f"PE: Close {current_close:.2f} < prev low {pos.lowest_low:.2f}, proposed SL: {new_stop_loss:.2f}, current SL: {pos.stop_loss:.2f}")
-                
-                if new_stop_loss < pos.stop_loss or pos.stop_loss == 0:
-                    pos.stop_loss = new_stop_loss
-                    logger.info(f"✅ Trailing SL updated for PE: {pos.stop_loss:.2f}")
-                    await self.save_position(pos)
-                else:
-                    logger.info(f"ℹ️ PE: New SL {new_stop_loss:.2f} not lower than current SL {pos.stop_loss:.2f}")
+            new_stop_loss = current_close + nloss
+            logger.info(f"PE: NIFTY Close {current_close:.2f}, ATR {current_atr:.2f}, proposed SL: {new_stop_loss:.2f}, current SL: {pos.stop_loss:.2f}")
+            
+            if new_stop_loss < pos.stop_loss or pos.stop_loss == 0:
+                pos.stop_loss = new_stop_loss
+                logger.info(f"✅ Trailing SL updated for PE: {pos.stop_loss:.2f}")
+                await self.save_position(pos)
+            else:
+                logger.info(f"ℹ️ PE: New SL {new_stop_loss:.2f} not lower than current SL {pos.stop_loss:.2f}")
 
     async def handle_candle_close(self, candle_data: Dict[str, Any]):
         """Handle new candle close event for trailing stop loss"""
@@ -395,14 +390,15 @@ class TradingBot:
             logger.error(f"Invalid price for CE token {self.ce_token}: {price}")
             return False
 
+        current_atr = await self.get_current_atr()
         if signal_candle is None:
-            high, low = await self.get_candle()
-            if low is None:
+            c_data = await self.load_last_complete_candle()
+            if c_data is None:
                 logger.error("No candle data available for SL")
                 return False
-            initial_sl = low - TRAILING_OFFSET
+            initial_sl = c_data.close - (current_atr * ATR_KEY_VALUE)
         else:
-            initial_sl = signal_candle.low - TRAILING_OFFSET
+            initial_sl = signal_candle.close - (current_atr * ATR_KEY_VALUE)
         
         pos = Position(
             token=str(self.ce_token),
@@ -430,14 +426,15 @@ class TradingBot:
             logger.error(f"Invalid price for PE token {self.pe_token}: {price}")
             return False
         
+        current_atr = await self.get_current_atr()
         if signal_candle is None:
-            high, low = await self.get_candle()
-            if high is None:
+            c_data = await self.load_last_complete_candle()
+            if c_data is None:
                 logger.error("No candle data available for SL")
                 return False
-            initial_sl = high + TRAILING_OFFSET
+            initial_sl = c_data.close + (current_atr * ATR_KEY_VALUE)
         else:
-            initial_sl = signal_candle.high + TRAILING_OFFSET
+            initial_sl = signal_candle.close + (current_atr * ATR_KEY_VALUE)
         
         pos = Position(
             token=str(self.pe_token),
