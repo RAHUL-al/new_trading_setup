@@ -40,7 +40,7 @@ KEY_SELL_SIGNAL = f"{REDIS_PREFIX}sell_signal"
 
 INDEX_TOKEN = "99926000"
 TRAILING_OFFSET = 0
-ATR_MIN_THRESHOLD = 6.9  # Minimum ATR to take new positions
+ATR_MIN_THRESHOLD = 6.5  # Minimum ATR to take new positions (matched to backtest)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("TradingBot")
@@ -144,8 +144,8 @@ class TradingBot:
         
         now = datetime.now()
         self.market_open_time = now.replace(hour=9, minute=15, second=0, microsecond=0)
-        self.trading_start_time = now.replace(hour=12, minute=57, second=0, microsecond=0)
-        self.trading_end_time = now.replace(hour=15, minute=10, second=0, microsecond=0)
+        self.trading_start_time = now.replace(hour=9, minute=20, second=0, microsecond=0)
+        self.trading_end_time = now.replace(hour=15, minute=15, second=0, microsecond=0)
         self.square_off_time = now.replace(hour=15, minute=24, second=0, microsecond=0)
         self.market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
     
@@ -852,7 +852,7 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Error recovering state: {e}")
         
-        logger.info(f"⏰ Trading window: 12:30 PM - 3:10 PM | Square off: 3:24 PM")
+        logger.info(f"⏰ Trading window: 9:20 AM - 3:15 PM | Square off: 3:24 PM")
         logger.info(f"📊 Market data flows all the time — trades only in trading window")
         
         # Create tasks

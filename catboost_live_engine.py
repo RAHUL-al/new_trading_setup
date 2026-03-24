@@ -82,6 +82,7 @@ WINDOW_END = datetime.time(
     int(os.environ.get("WINDOW_END_H", "15")),
     int(os.environ.get("WINDOW_END_M", "15"))
 )
+SQUARE_OFF_TIME = datetime.time(15, 24)
 
 INDIA_TZ = pytz.timezone("Asia/Kolkata")
 
@@ -678,13 +679,6 @@ async def catboost_signal_engine():
                     continue
                 live_price = float(live_ltp)
 
-                # SL check on live tick (risk management only)
-                if position:
-                    if position['dir'] == 'LONG' and live_price <= position['sl']:
-                        await do_close_position(position['sl'], "TRAIL_SL", now.strftime('%H:%M:%S'))
-                    elif position['dir'] == 'SHORT' and live_price >= position['sl']:
-                        await do_close_position(position['sl'], "TRAIL_SL", now.strftime('%H:%M:%S'))
-
                 # Live dashboard (every 1s)
                 if position and time.time() - last_status_log > 1:
                     if position['dir'] == 'LONG':
@@ -846,7 +840,7 @@ async def catboost_signal_engine():
             t_elapsed = (time.perf_counter() - t_start) * 1000
 
             in_window = WINDOW_START <= now_time <= WINDOW_END
-            atr_ok = current_atr > MIN_ATR
+            atr_ok = current_atr >= MIN_ATR
             now_ts = time.time()
 
             signal_map = {1: "BUY", -1: "SELL", 0: "HOLD"}
