@@ -63,6 +63,11 @@ REDIS_PREFIX = os.environ.get("REDIS_PREFIX", "")
 NIFTY_SYMBOL = "NIFTY"
 MODEL_PATH = os.environ.get("CATBOOST_MODEL", "catboost_nifty_model.cbm")
 
+# CSV paths for warm-up data (must match what backtest uses)
+CSV_1M = os.environ.get("CSV_1M", "nifty_1min_data.csv")
+CSV_2M = os.environ.get("CSV_2M", "nifty_2min_data.csv")
+WARMUP_CANDLES = 500  # Load last N candles from CSV for EWM convergence
+
 ATR_PERIOD = 14
 ATR_KEY_VALUE = 1.0
 MIN_ATR = float(os.environ.get("MIN_ATR", "6.5"))
@@ -569,10 +574,12 @@ async def catboost_signal_engine():
     last_signal_time = 0
     last_candle_count = 0
     last_status_log = 0
-    cached_df_1m = None      # Cached history DataFrame (refreshed on candle close)
-    last_live_predict = 0    # Throttle for live predictions (every 1s)
-    pre_market_synced = False # Pre-market CSV sync done?
-    cross_check_task = None  # Background cross-check task
+    cached_df_1m = None          # Cached today's DataFrame
+    cached_df_1m_warmup = None   # CSV warm-up data (loaded once)
+    cached_df_2m_warmup = None   # CSV 2-min warm-up data (loaded once)
+    last_live_predict = 0
+    pre_market_synced = False
+    cross_check_task = None
 
     logger.info(f"⚡ CatBoost signal engine started")
     logger.info(f"  Window: {WINDOW_START.strftime('%H:%M')} - {WINDOW_END.strftime('%H:%M')}")
@@ -715,57 +722,100 @@ async def catboost_signal_engine():
             if cross_check_task is None or cross_check_task.done():
                 cross_check_task = asyncio.create_task(trigger_cross_check(date_key, REDIS_PREFIX))
 
-            # Load candles from Redis HISTORY
+            # Load candles from Redis HISTORY (today's data)
             history_data = await ar.lrange(history_key, 0, -1)
             candles = [json.loads(x) for x in history_data]
-            df_1m = pd.DataFrame(candles)
-            df_1m = df_1m.rename(columns={
+            df_today = pd.DataFrame(candles)
+            df_today = df_today.rename(columns={
                 "open": "Open", "high": "High",
                 "low": "Low", "close": "Close",
             })
             for col in ["Open", "High", "Low", "Close"]:
-                df_1m[col] = df_1m[col].astype(float)
+                df_today[col] = df_today[col].astype(float)
 
-            # Add Time column for backtest feature builders (needed for merge_asof)
-            if 'timestamp' in df_1m.columns:
-                df_1m['Time'] = pd.to_datetime(df_1m['timestamp'])
+            # Add Time column
+            if 'timestamp' in df_today.columns:
+                df_today['Time'] = pd.to_datetime(df_today['timestamp'])
             else:
-                df_1m['Time'] = pd.date_range(end=pd.Timestamp.now(), periods=len(df_1m), freq='1min')
+                df_today['Time'] = pd.date_range(end=pd.Timestamp.now(), periods=len(df_today), freq='1min')
 
-            cached_df_1m = df_1m.copy()
+            cached_df_1m = df_today.copy()
 
-            # ── Build features using BACKTEST-IDENTICAL functions ──
+            # ── Load CSV warm-up data (once, then cache) ──
+            if cached_df_1m_warmup is None and os.path.exists(CSV_1M):
+                try:
+                    csv_full = pd.read_csv(CSV_1M)
+                    csv_full['Time'] = pd.to_datetime(csv_full['Time'])
+                    csv_full = csv_full.sort_values('Time').reset_index(drop=True)
+                    # Take last WARMUP_CANDLES rows (prior days' data for EWM convergence)
+                    cached_df_1m_warmup = csv_full.tail(WARMUP_CANDLES).reset_index(drop=True)
+                    logger.info(f"  📦 CSV warm-up loaded: {len(cached_df_1m_warmup)} candles from {CSV_1M}")
+                except Exception as e:
+                    logger.warning(f"  ⚠️ CSV warm-up load failed: {e}")
+                    cached_df_1m_warmup = pd.DataFrame()
+
+            if cached_df_2m_warmup is None and os.path.exists(CSV_2M):
+                try:
+                    csv_2m = pd.read_csv(CSV_2M)
+                    csv_2m['Time'] = pd.to_datetime(csv_2m['Time'])
+                    csv_2m = csv_2m.sort_values('Time').reset_index(drop=True)
+                    cached_df_2m_warmup = csv_2m.tail(WARMUP_CANDLES).reset_index(drop=True)
+                    logger.info(f"  📦 CSV 2-min warm-up loaded: {len(cached_df_2m_warmup)} candles from {CSV_2M}")
+                except Exception as e:
+                    logger.warning(f"  ⚠️ CSV 2-min warm-up load failed: {e}")
+                    cached_df_2m_warmup = pd.DataFrame()
+
+            # ── Build features using BACKTEST-IDENTICAL approach ──
             if HAS_BACKTEST_FEATURES:
-                # Use exact same feature builders as catboost_strategy.py
-                feat_1m = build_features_1min(df_1m)
+                # Prepend warm-up candles → EWM converges to same state as backtest
+                if cached_df_1m_warmup is not None and len(cached_df_1m_warmup) > 0:
+                    # Filter out any warm-up rows that overlap with today
+                    today_start = df_today['Time'].iloc[0]
+                    warmup_filtered = cached_df_1m_warmup[cached_df_1m_warmup['Time'] < today_start]
+                    df_combined = pd.concat([warmup_filtered, df_today], ignore_index=True)
+                else:
+                    df_combined = df_today.copy()
 
-                # Resample to 2-min (same method as backtest)
-                df_2m_bt = df_1m.set_index('Time').resample('2min', label='left', closed='left').agg({
-                    'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
-                }).dropna().reset_index()
-                df_2m_bt.rename(columns={'Time': 'Time'}, inplace=True)
+                # Build 1-min features on COMBINED data (warm-up + today)
+                feat_1m = build_features_1min(df_combined)
+                n_combined = len(df_combined)
+                n_today = len(df_today)
 
-                feat_2m = build_features_2min(df_2m_bt, df_1m)
+                # Build 2-min features using CSV warm-up + today's resampled
+                if cached_df_2m_warmup is not None and len(cached_df_2m_warmup) > 0:
+                    # Resample only today's data to 2-min
+                    df_2m_today = df_today.set_index('Time').resample('2min', label='left', closed='left').agg({
+                        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
+                    }).dropna().reset_index()
 
-                # Combine 1-min + 2-min features (last row = current candle)
+                    # Filter warm-up 2-min rows before today
+                    warmup_2m_filtered = cached_df_2m_warmup[cached_df_2m_warmup['Time'] < today_start]
+                    df_2m_combined = pd.concat([warmup_2m_filtered, df_2m_today], ignore_index=True)
+                else:
+                    # No 2-min CSV → resample from combined 1-min
+                    df_2m_combined = df_combined.set_index('Time').resample('2min', label='left', closed='left').agg({
+                        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
+                    }).dropna().reset_index()
+
+                feat_2m = build_features_2min(df_2m_combined, df_combined)
+
+                # Combine features and take ONLY the last row (= current candle)
                 all_features = pd.concat([feat_1m, feat_2m], axis=1)
                 last_feat = all_features.iloc[-1]
 
-                # Get ATR from the features
                 current_atr = float(last_feat.get('atr_1m', 0))
 
-                # Build feature vector (same column order as model)
                 if model_features and len(model_features) > 0:
                     feature_vector = [float(last_feat.get(f, 0)) for f in model_features]
                 else:
                     feature_vector = [float(last_feat.get(f, 0)) for f in ALL_FEATURE_COLS]
                 feature_vector = [0 if (v != v or abs(v) == float('inf')) else v for v in feature_vector]
 
-                logger.info(f"  📐 Features: backtest-identical | ATR={current_atr:.2f} | candles={len(df_1m)}")
+                logger.info(f"  📐 Features: backtest-identical | ATR={current_atr:.2f} | warmup={n_combined - n_today} + today={n_today}")
             else:
-                # Fallback: use built-in feature builder
-                df_2m = resample_to_2min(df_1m)
-                features, current_atr, trail_stop = build_all_features(df_1m, df_2m)
+                # Fallback: use built-in feature builder (no warm-up)
+                df_2m = resample_to_2min(df_today)
+                features, current_atr, trail_stop = build_all_features(df_today, df_2m)
 
                 if model_features and len(model_features) > 0:
                     feature_vector = [features.get(f, 0) for f in model_features]
@@ -775,7 +825,7 @@ async def catboost_signal_engine():
 
             await ar.set(f"{REDIS_PREFIX}ATR_value", str(round(current_atr, 2)))
 
-            last_row = df_1m.iloc[-1]
+            last_row = df_today.iloc[-1]
             close_price = float(last_row["Close"])
             high_price = float(last_row["High"])
             low_price = float(last_row["Low"])
