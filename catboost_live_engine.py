@@ -739,7 +739,7 @@ async def catboost_signal_engine():
             if cached_df_1m_warmup is None and os.path.exists(CSV_1M):
                 try:
                     csv_full = pd.read_csv(CSV_1M)
-                    csv_full['Time'] = pd.to_datetime(csv_full['Time'])
+                    csv_full['Time'] = pd.to_datetime(csv_full['Time']).dt.tz_localize(None)
                     csv_full = csv_full.sort_values('Time').reset_index(drop=True)
                     # Take last WARMUP_CANDLES rows (prior days' data for EWM convergence)
                     cached_df_1m_warmup = csv_full.tail(WARMUP_CANDLES).reset_index(drop=True)
@@ -751,7 +751,7 @@ async def catboost_signal_engine():
             if cached_df_2m_warmup is None and os.path.exists(CSV_2M):
                 try:
                     csv_2m = pd.read_csv(CSV_2M)
-                    csv_2m['Time'] = pd.to_datetime(csv_2m['Time'])
+                    csv_2m['Time'] = pd.to_datetime(csv_2m['Time']).dt.tz_localize(None)
                     csv_2m = csv_2m.sort_values('Time').reset_index(drop=True)
                     cached_df_2m_warmup = csv_2m.tail(WARMUP_CANDLES).reset_index(drop=True)
                     logger.info(f"  📦 CSV 2-min warm-up loaded: {len(cached_df_2m_warmup)} candles from {CSV_2M}")

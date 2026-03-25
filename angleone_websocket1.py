@@ -539,7 +539,7 @@ async def nifty_signal_engine():
                 logger.info("Market closed. Stopping signal engine.")
                 break
 
-            if now_time < datetime.time(9, 16):
+            if now_time < datetime.time(9, 14):
                 await asyncio.sleep(0.5)
                 continue
 
