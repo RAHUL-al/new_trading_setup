@@ -4,6 +4,9 @@ simulator.py — Market Replay Simulator
 Replays historical CSV candle data through the CatBoost model one-by-one,
 simulating live trading. Designed to work with the dashboard via callbacks.
 
+CRITICAL: Features and predictions are pre-computed before the replay loop
+to guarantee exact parity with catboost_strategy.py backtest results.
+
 Usage (standalone test):
     python simulator.py --date 2026-03-20 --speed 60
 
@@ -52,7 +55,6 @@ MODEL_PATH = os.environ.get("CATBOOST_MODEL", os.path.join(PROJECT_ROOT, "catboo
 ATR_PERIOD = 14
 ATR_KEY_VALUE = 1.0
 MIN_ATR = 6.5
-WARMUP_CANDLES = 500
 
 WINDOW_START = dt_time(9, 20)
 WINDOW_END = dt_time(15, 15)
@@ -100,6 +102,9 @@ class MarketSimulator:
     """
     Replays historical candles through the CatBoost model,
     streaming results via an async callback.
+
+    IMPORTANT: Features & predictions are pre-computed BEFORE the
+    replay loop to guarantee identical results to catboost_strategy.py.
     """
 
     def __init__(self, on_event: Optional[Callable] = None):
@@ -188,7 +193,10 @@ class MarketSimulator:
     async def run_simulation(self, start_date: str, end_date: str, speed: int = 10):
         """
         Main simulation loop. Replays candles between start_date and end_date.
-        Speed = candles per second (1 = real-time, 60 = fast).
+        Speed = candles per second (1 = real-time, 60 = fast, 0 = instant).
+
+        PARITY GUARANTEE: Features and predictions are pre-computed over the
+        entire dataset in a single pass — identical to catboost_strategy.py.
         """
         if not self.load_data():
             await self.emit("error", {"message": "CSV data not found"})
@@ -213,39 +221,80 @@ class MarketSimulator:
         start_dt = pd.Timestamp(start_date)
         end_dt = pd.Timestamp(end_date) + pd.Timedelta(days=1)
 
-        # Get simulation candles
-        sim_mask = (self.df_1m_full['Time'] >= start_dt) & (self.df_1m_full['Time'] < end_dt)
-        df_sim = self.df_1m_full[sim_mask].reset_index(drop=True)
+        # ══════════════════════════════════════════════════════
+        #  PRE-COMPUTE features & predictions  (backtest-identical)
+        # ══════════════════════════════════════════════════════
+        t_precompute = time.perf_counter()
 
-        if len(df_sim) == 0:
+        # 1) Build 1-min features over the FULL dataset
+        feat_1m = build_features_1min(self.df_1m_full)
+
+        # 2) Build 2-min features using the ACTUAL 2-min CSV + merge_asof
+        if self.df_2m_full is not None and len(self.df_2m_full) > 0:
+            feat_2m = build_features_2min(self.df_2m_full, self.df_1m_full)
+            all_features = pd.concat([feat_1m, feat_2m], axis=1)
+        else:
+            all_features = feat_1m
+
+        # 3) Clean features
+        all_features = all_features.fillna(0)
+        all_features = all_features.replace([np.inf, -np.inf], 0)
+
+        # 4) Pre-compute ATR for the full dataset
+        atr_all = calc_atr(self.df_1m_full, ATR_PERIOD).values
+
+        # 5) Make predictions ONLY for window candles (like backtest)
+        times_all = self.df_1m_full['Time'].dt.time
+        window_mask = (times_all >= WINDOW_START) & (times_all <= WINDOW_END)
+
+        full_predictions = np.zeros(len(self.df_1m_full), dtype=int)
+
+        if self.model_features and len(self.model_features) > 0:
+            feature_cols = self.model_features
+        else:
+            feature_cols = ALL_FEATURE_COLS
+
+        X_window = all_features.loc[window_mask, [c for c in feature_cols if c in all_features.columns]]
+        # Fill any missing columns with 0
+        for col in feature_cols:
+            if col not in X_window.columns:
+                X_window[col] = 0
+        X_window = X_window[feature_cols]
+
+        if len(X_window) > 0:
+            window_preds = self.model.predict(X_window).flatten().astype(int)
+            full_predictions[window_mask] = window_preds
+
+        precompute_ms = (time.perf_counter() - t_precompute) * 1000
+
+        # ══════════════════════════════════════════════════════
+        #  Slice to simulation date range
+        # ══════════════════════════════════════════════════════
+        sim_mask = (self.df_1m_full['Time'] >= start_dt) & (self.df_1m_full['Time'] < end_dt)
+        sim_indices = self.df_1m_full.index[sim_mask].tolist()
+
+        if len(sim_indices) == 0:
             await self.emit("error", {"message": f"No data for {start_date} to {end_date}"})
             self.state.running = False
             return
 
-        # Get warm-up candles (WARMUP_CANDLES before start_date)
-        warmup_mask = self.df_1m_full['Time'] < start_dt
-        df_warmup = self.df_1m_full[warmup_mask].tail(WARMUP_CANDLES).reset_index(drop=True)
-
-        # Get 2-min warm-up
-        df_2m_warmup = pd.DataFrame()
-        if self.df_2m_full is not None:
-            warmup_2m_mask = self.df_2m_full['Time'] < start_dt
-            df_2m_warmup = self.df_2m_full[warmup_2m_mask].tail(WARMUP_CANDLES).reset_index(drop=True)
-
-        self.state.total_candles = len(df_sim)
+        self.state.total_candles = len(sim_indices)
 
         await self.emit("sim_start", {
             "start_date": start_date,
             "end_date": end_date,
-            "total_candles": len(df_sim),
-            "warmup_candles": len(df_warmup),
+            "total_candles": len(sim_indices),
+            "warmup_candles": 0,
             "speed": speed,
+            "precompute_ms": round(precompute_ms, 0),
         })
 
         prev_date = None
 
-        # ── Main candle-by-candle loop ──
-        for i in range(len(df_sim)):
+        # ══════════════════════════════════════════════════════
+        #  CANDLE-BY-CANDLE REPLAY (using pre-computed values)
+        # ══════════════════════════════════════════════════════
+        for loop_i, df_idx in enumerate(sim_indices):
             if self._stop_requested:
                 break
 
@@ -254,9 +303,9 @@ class MarketSimulator:
                 await asyncio.sleep(0.1)
 
             t_candle_start = time.perf_counter()
-            self.state.current_index = i
+            self.state.current_index = loop_i
 
-            row = df_sim.iloc[i]
+            row = self.df_1m_full.iloc[df_idx]
             candle_time = row['Time']
             t = candle_time.time()
             curr_date = candle_time.date()
@@ -265,13 +314,21 @@ class MarketSimulator:
             low_price = float(row['Low'])
             time_str = candle_time.strftime('%H:%M')
 
+            # Read pre-computed values
+            pred = int(full_predictions[df_idx])
+            curr_atr = float(atr_all[df_idx])
+            feat_row = all_features.iloc[df_idx]
+            current_rsi = float(feat_row.get('rsi_1m', 50))
+            ut_dir = float(feat_row.get('ut_dir_1m', 0))
+
             # ── Day boundary ──
             if prev_date and curr_date != prev_date:
                 if self.state.position:
+                    prev_idx = sim_indices[loop_i - 1] if loop_i > 0 else df_idx
                     trade = self._close_position(
-                        float(df_sim.iloc[i - 1]['Close']),
+                        float(self.df_1m_full.iloc[prev_idx]['Close']),
                         "DAY_END",
-                        df_sim.iloc[i - 1]['Time'].strftime('%H:%M')
+                        self.df_1m_full.iloc[prev_idx]['Time'].strftime('%H:%M')
                     )
                     await self.emit("trade_close", trade)
 
@@ -287,59 +344,8 @@ class MarketSimulator:
             self.state.current_date = str(curr_date)
             prev_date = curr_date
 
-            # ── Build features using warm-up + candles seen so far ──
-            t_feat_start = time.perf_counter()
-
-            df_today_so_far = df_sim.iloc[:i + 1].copy()
-            df_combined = pd.concat([df_warmup, df_today_so_far], ignore_index=True)
-
-            feat_1m = build_features_1min(df_combined)
-
-            # Build 2-min features
-            if len(df_2m_warmup) > 0:
-                today_start = df_today_so_far['Time'].iloc[0]
-                df_2m_today = df_today_so_far.set_index('Time').resample(
-                    '2min', label='left', closed='left'
-                ).agg({
-                    'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
-                }).dropna().reset_index()
-
-                warmup_2m_filtered = df_2m_warmup[df_2m_warmup['Time'] < today_start]
-                df_2m_combined = pd.concat([warmup_2m_filtered, df_2m_today], ignore_index=True)
-            else:
-                df_2m_combined = df_combined.set_index('Time').resample(
-                    '2min', label='left', closed='left'
-                ).agg({
-                    'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
-                }).dropna().reset_index()
-
-            feat_2m = build_features_2min(df_2m_combined, df_combined)
-
-            all_features = pd.concat([feat_1m, feat_2m], axis=1)
-            last_feat = all_features.iloc[-1]
-
-            current_atr = float(last_feat.get('atr_1m', 0))
-            current_rsi = float(last_feat.get('rsi_1m', 50))
-            ut_dir = float(last_feat.get('ut_dir_1m', 0))
-
-            if self.model_features and len(self.model_features) > 0:
-                feature_vector = [float(last_feat.get(f, 0)) for f in self.model_features]
-            else:
-                feature_vector = [float(last_feat.get(f, 0)) for f in ALL_FEATURE_COLS]
-            feature_vector = [0 if (v != v or abs(v) == float('inf')) else v for v in feature_vector]
-
-            t_feat_elapsed = (time.perf_counter() - t_feat_start) * 1000
-
-            # ── Predict ──
-            t_pred_start = time.perf_counter()
-            pred = self.model.predict([feature_vector]).flatten()[0].item()
-            t_pred_elapsed = (time.perf_counter() - t_pred_start) * 1000
-
-            signal_map = {1: "BUY", -1: "SELL", 0: "HOLD"}
-            signal_name = signal_map.get(pred, "HOLD")
-
             in_window = WINDOW_START <= t <= WINDOW_END
-            atr_ok = current_atr >= MIN_ATR
+            atr_ok = curr_atr >= MIN_ATR
 
             # ── Square off at 15:24 ──
             if self.state.position and t >= SQUARE_OFF_TIME:
@@ -360,11 +366,11 @@ class MarketSimulator:
             if self.state.position:
                 pos = self.state.position
                 if pos['dir'] == 'LONG':
-                    new_sl = close_price - current_atr * ATR_KEY_VALUE
+                    new_sl = close_price - curr_atr * ATR_KEY_VALUE
                     if new_sl > pos['sl']:
                         pos['sl'] = new_sl
                 elif pos['dir'] == 'SHORT':
-                    new_sl = close_price + current_atr * ATR_KEY_VALUE
+                    new_sl = close_price + curr_atr * ATR_KEY_VALUE
                     if new_sl < pos['sl']:
                         pos['sl'] = new_sl
 
@@ -377,27 +383,31 @@ class MarketSimulator:
                 await self.emit("trade_close", trade)
 
             # ── New entry ──
-            if not self.state.position and pred != 0 and in_window and atr_ok and t < SQUARE_OFF_TIME:
+            if not self.state.position and in_window and atr_ok and t < SQUARE_OFF_TIME:
                 if pred == 1:
-                    sl = close_price - current_atr * ATR_KEY_VALUE
+                    sl = close_price - curr_atr * ATR_KEY_VALUE
                     self.state.position = {
                         'dir': 'LONG', 'entry': close_price,
                         'sl': sl, 'entry_time': time_str,
                     }
                 elif pred == -1:
-                    sl = close_price + current_atr * ATR_KEY_VALUE
+                    sl = close_price + curr_atr * ATR_KEY_VALUE
                     self.state.position = {
                         'dir': 'SHORT', 'entry': close_price,
                         'sl': sl, 'entry_time': time_str,
                     }
 
-                await self.emit("trade_open", {
-                    "dir": self.state.position['dir'],
-                    "entry": close_price,
-                    "sl": round(self.state.position['sl'], 2),
-                    "time": time_str,
-                    "atr": round(current_atr, 2),
-                })
+                if self.state.position:
+                    await self.emit("trade_open", {
+                        "dir": self.state.position['dir'],
+                        "entry": close_price,
+                        "sl": round(self.state.position['sl'], 2),
+                        "time": time_str,
+                        "atr": round(curr_atr, 2),
+                    })
+
+            signal_map = {1: "BUY", -1: "SELL", 0: "HOLD"}
+            signal_name = signal_map.get(pred, "HOLD")
 
             # ── Calculate unrealized P&L ──
             unrealized = 0
@@ -413,15 +423,15 @@ class MarketSimulator:
             # ── Feature dict for dashboard ──
             feature_data = {}
             for col in ALL_FEATURE_COLS:
-                val = float(last_feat.get(col, 0))
+                val = float(feat_row.get(col, 0))
                 if val != val or abs(val) == float('inf'):
                     val = 0
                 feature_data[col] = round(val, 4)
 
             # ── Emit candle event ──
             await self.emit("candle", {
-                "index": i,
-                "total": len(df_sim),
+                "index": loop_i,
+                "total": len(sim_indices),
                 "time": candle_time.isoformat(),
                 "time_str": time_str,
                 "date": str(curr_date),
@@ -431,7 +441,7 @@ class MarketSimulator:
                 "close": close_price,
                 "signal": signal_name,
                 "prediction": int(pred),
-                "atr": round(current_atr, 2),
+                "atr": round(curr_atr, 2),
                 "rsi": round(current_rsi, 2),
                 "ut_dir": int(ut_dir),
                 "in_window": in_window,
@@ -447,8 +457,8 @@ class MarketSimulator:
                 "wins": self.state.wins,
                 "losses": self.state.losses,
                 "timing": {
-                    "features_ms": round(t_feat_elapsed, 1),
-                    "predict_ms": round(t_pred_elapsed, 1),
+                    "features_ms": round(t_candle_elapsed, 1),
+                    "predict_ms": 0,
                     "total_ms": round(t_candle_elapsed, 1),
                 },
                 "features": feature_data,
@@ -461,8 +471,9 @@ class MarketSimulator:
 
         # ── Simulation complete ──
         if self.state.position:
-            last_close = float(df_sim.iloc[-1]['Close'])
-            trade = self._close_position(last_close, "SIM_END", df_sim.iloc[-1]['Time'].strftime('%H:%M'))
+            last_idx = sim_indices[-1]
+            last_close = float(self.df_1m_full.iloc[last_idx]['Close'])
+            trade = self._close_position(last_close, "SIM_END", self.df_1m_full.iloc[last_idx]['Time'].strftime('%H:%M'))
             await self.emit("trade_close", trade)
 
         total_trades = self.state.wins + self.state.losses
@@ -478,6 +489,7 @@ class MarketSimulator:
             "trades": self.state.trades,
             "avg_candle_ms": round(avg_timing, 1),
             "stopped": self._stop_requested,
+            "precompute_ms": round(precompute_ms, 0),
         })
 
         self.state.running = False
@@ -526,6 +538,9 @@ if __name__ == "__main__":
         elif event_type == "trade_close":
             icon = "✅" if data['pnl'] > 0 else "❌"
             print(f"  {icon} CLOSED {data['dir']} | Entry={data['entry']:.2f} Exit={data['exit']:.2f} | P&L={data['pnl']:+.2f} | {data['reason']}")
+        elif event_type == "sim_start":
+            precomp = data.get('precompute_ms', 0)
+            print(f"\n🚀 Simulation started: {data['start_date']} → {data['end_date']} | {data['total_candles']} candles | Speed: {data['speed']}x | Pre-compute: {precomp:.0f}ms")
         elif event_type == "sim_end":
             print(f"\n{'='*60}")
             print(f"  SIMULATION COMPLETE")
