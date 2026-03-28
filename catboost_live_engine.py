@@ -66,8 +66,8 @@ MODEL_PATH = os.environ.get("CATBOOST_MODEL", "catboost_nifty_model.cbm")
 # CSV paths for full historical data (must match what backtest uses)
 CSV_1M = os.environ.get("CSV_1M", "nifty_1min_data.csv")
 CSV_2M = os.environ.get("CSV_2M", "nifty_2min_data.csv")
-# Load ENTIRE CSV history to guarantee mathematical parity with backtester's EMA/RMA values
-WARMUP_CANDLES = None
+# Use exact 1 year (365 days) for walk-forward EMA parity
+WARMUP_DAYS = 365
 
 ATR_PERIOD = 14
 ATR_KEY_VALUE = 1.0
@@ -742,9 +742,10 @@ async def catboost_signal_engine():
                     csv_full = pd.read_csv(CSV_1M)
                     csv_full['Time'] = pd.to_datetime(csv_full['Time']).dt.tz_localize(None)
                     csv_full = csv_full.sort_values('Time').reset_index(drop=True)
-                    # Use full history for exact EMA convergence parity with backtester
-                    cached_df_1m_warmup = csv_full.reset_index(drop=True)
-                    logger.info(f"  📦 Full 1-min history loaded: {len(cached_df_1m_warmup)} candles from {CSV_1M}")
+                    # Filter exactly 1 year of history for Walk-Forward Parity
+                    one_year_ago = df_today['Time'].min() - pd.Timedelta(days=WARMUP_DAYS)
+                    cached_df_1m_warmup = csv_full[csv_full['Time'] >= one_year_ago].reset_index(drop=True)
+                    logger.info(f"  📦 1-Year history loaded: {len(cached_df_1m_warmup)} candles from {CSV_1M}")
                 except Exception as e:
                     logger.warning(f"  ⚠️ CSV history load failed: {e}")
                     cached_df_1m_warmup = pd.DataFrame()
@@ -754,8 +755,9 @@ async def catboost_signal_engine():
                     csv_2m = pd.read_csv(CSV_2M)
                     csv_2m['Time'] = pd.to_datetime(csv_2m['Time']).dt.tz_localize(None)
                     csv_2m = csv_2m.sort_values('Time').reset_index(drop=True)
-                    cached_df_2m_warmup = csv_2m.reset_index(drop=True)
-                    logger.info(f"  📦 Full 2-min history loaded: {len(cached_df_2m_warmup)} candles from {CSV_2M}")
+                    one_year_ago = df_today['Time'].min() - pd.Timedelta(days=WARMUP_DAYS)
+                    cached_df_2m_warmup = csv_2m[csv_2m['Time'] >= one_year_ago].reset_index(drop=True)
+                    logger.info(f"  📦 1-Year 2-min history loaded: {len(cached_df_2m_warmup)} candles from {CSV_2M}")
                 except Exception as e:
                     logger.warning(f"  ⚠️ CSV 2-min history load failed: {e}")
                     cached_df_2m_warmup = pd.DataFrame()

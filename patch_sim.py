@@ -1,29 +1,10 @@
-"""
-simulator.py — Market Replay Simulator
+import re
+import sys
 
-Replays historical CSV candle data through the CatBoost model one-by-one,
-simulating live trading. Designed to work with the dashboard via callbacks.
+with open("simulator.py", "r", encoding="utf-8") as f:
+    text = f.read()
 
-CRITICAL: Features and predictions are pre-computed before the replay loop
-to guarantee exact parity with catboost_strategy.py backtest results.
-
-Usage (standalone test):
-    python simulator.py --date 2026-03-20 --speed 60
-
-Usage (via FastAPI):
-    Imported by backend/routes/simulator_routes.py
-"""
-
-import pandas as pd
-import numpy as np
-import os
-import time
-import json
-import asyncio
-from datetime import datetime, time as dt_time
-from typing import Optional, Callable, Dict, Any, List
-
-# Import backtest-identical feature builders
+new_imports = """
 try:
     from catboost_strategy import (
         build_features_1min,
@@ -39,166 +20,14 @@ try:
 except ImportError:
     HAS_BACKTEST = False
     print("⚠️  catboost_strategy.py not importable — features will be limited")
+"""
 
-try:
-    from catboost import CatBoostClassifier
-    HAS_CATBOOST = True
-except ImportError:
-    HAS_CATBOOST = False
-    print("⚠️  CatBoost not installed")
+# Replace imports
+text = re.sub(r"try:\n    from catboost_strategy import \([\s\S]*?print\(\"⚠️  catboost_strategy.py not importable — features will be limited\"\)", new_imports.strip(), text)
 
 
-# ─────────── Config ───────────
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-CSV_1M = os.environ.get("CSV_1M", os.path.join(PROJECT_ROOT, "nifty_1min_data.csv"))
-CSV_2M = os.environ.get("CSV_2M", os.path.join(PROJECT_ROOT, "nifty_2min_data.csv"))
-MODEL_PATH = os.environ.get("CATBOOST_MODEL", os.path.join(PROJECT_ROOT, "catboost_nifty_model.cbm"))
-
-ATR_PERIOD = 14
-ATR_KEY_VALUE = 1.0
-MIN_ATR = 6.5
-
-WINDOW_START = dt_time(9, 20)
-WINDOW_END = dt_time(15, 15)
-SQUARE_OFF_TIME = dt_time(15, 24)
-
-FEATURE_COLS_1M = [
-    'atr_1m', 'rsi_1m', 'ut_dir_1m', 'close_vs_trail_1m',
-    'mom_3', 'mom_5', 'mom_10',
-    'body_1m', 'body_pct_1m', 'upper_wick_1m', 'lower_wick_1m', 'range_1m',
-    'std_5', 'std_10',
-    'sma_5', 'sma_10', 'sma_20',
-    'close_vs_sma5', 'close_vs_sma10', 'sma5_vs_sma10',
-    'high_5', 'low_5', 'close_vs_high5', 'close_vs_low5',
-]
-
-FEATURE_COLS_2M = [
-    'atr_2m', 'rsi_2m', 'ut_dir_2m', 'close_vs_trail_2m',
-    'mom_3_2m', 'mom_5_2m', 'range_2m', 'body_2m',
-]
-
-ALL_FEATURE_COLS = FEATURE_COLS_1M + FEATURE_COLS_2M
-
-
-class SimulationState:
-    """Holds the current state of a running simulation."""
-
-    def __init__(self):
-        self.running = False
-        self.paused = False
-        self.speed = 10  # candles per second
-        self.current_index = 0
-        self.total_candles = 0
-        self.position = None
-        self.trades: List[Dict] = []
-        self.daily_pnl = 0.0
-        self.wins = 0
-        self.losses = 0
-        self.current_date = ""
-        self.start_date = ""
-        self.end_date = ""
-        self.candle_times: List[float] = []  # timing per candle
-
-        # Lot management strictly matching backtest
-        self.current_lots = 2  # BASE_LOTS
-        self.accumulated_loss = 0.0
-        self.recovering = False
-
-
-class MarketSimulator:
-    """
-    Replays historical candles through the CatBoost model,
-    streaming results via an async callback.
-
-    IMPORTANT: Features & predictions are pre-computed BEFORE the
-    replay loop to guarantee identical results to catboost_strategy.py.
-    """
-
-    def __init__(self, on_event: Optional[Callable] = None):
-        self.state = SimulationState()
-        self.on_event = on_event  # async callback(event_type, data)
-        self.model = None
-        self.model_features = None
-        self.df_1m_full = None
-        self.df_2m_full = None
-        self._stop_requested = False
-
-    def load_data(self):
-        """Load CSV data and model."""
-        if self.df_1m_full is not None:
-            return True  # Already loaded
-
-        if not os.path.exists(CSV_1M):
-            return False
-
-        self.df_1m_full = pd.read_csv(CSV_1M)
-        self.df_1m_full['Time'] = pd.to_datetime(self.df_1m_full['Time']).dt.tz_localize(None)
-        self.df_1m_full = self.df_1m_full.sort_values('Time').reset_index(drop=True)
-
-        if os.path.exists(CSV_2M):
-            self.df_2m_full = pd.read_csv(CSV_2M)
-            self.df_2m_full['Time'] = pd.to_datetime(self.df_2m_full['Time']).dt.tz_localize(None)
-            self.df_2m_full = self.df_2m_full.sort_values('Time').reset_index(drop=True)
-
-        # Load model
-        if HAS_CATBOOST and os.path.exists(MODEL_PATH):
-            self.model = CatBoostClassifier()
-            self.model.load_model(MODEL_PATH)
-            try:
-                self.model_features = self.model.feature_names_
-            except Exception:
-                self.model_features = None
-
-        return True
-
-    def get_available_dates(self) -> List[str]:
-        """Return list of unique trading dates in the CSV."""
-        if self.df_1m_full is None:
-            self.load_data()
-        if self.df_1m_full is None:
-            return []
-        dates = self.df_1m_full['Time'].dt.date.unique()
-        return [str(d) for d in sorted(dates)]
-
-    async def emit(self, event_type: str, data: Dict[str, Any]):
-        """Send event to the dashboard."""
-        if self.on_event:
-            await self.on_event(event_type, data)
-
-    def _close_position(self, exit_price: float, reason: str, exit_time: str) -> Dict:
-        """Close current position, multiply by lots, and return trade record."""
-        pos = self.state.position
-        if not pos:
-            return {}
-
-        if pos['dir'] == 'LONG':
-            raw_pnl = exit_price - pos['entry']
-        else:
-            raw_pnl = pos['entry'] - exit_price
-            
-        pnl = round(raw_pnl * self.state.current_lots, 2)
-
-        self.state.daily_pnl += pnl
-        if pnl > 0:
-            self.state.wins += 1
-        else:
-            self.state.losses += 1
-
-        trade = {
-            'dir': pos['dir'],
-            'entry': pos['entry'],
-            'exit': round(exit_price, 2),
-            'entry_time': pos['entry_time'],
-            'exit_time': exit_time,
-            'sl': round(pos['sl'], 2),
-            'pnl': pnl,
-            'reason': reason,
-        }
-        self.state.trades.append(trade)
-        self.state.position = None
-        return trade
-
-
+# Replace run_simulation
+new_run_sim = '''
     async def run_simulation(self, start_date: str, end_date: str, speed: int = 10):
         """
         True Walk-Forward Simulation loop.
@@ -530,64 +359,11 @@ class MarketSimulator:
         })
 
         self.state.running = False
-    def stop(self):
-        """Request simulation stop."""
-        self._stop_requested = True
+'''
+start_idx = text.find("    async def run_simulation")
+end_idx = text.find("    def stop(self):")
+text = text[:start_idx] + new_run_sim + text[end_idx:]
 
-    def pause(self):
-        """Toggle pause state."""
-        self.state.paused = not self.state.paused
-        return self.state.paused
-
-    def set_speed(self, speed: int):
-        """Change replay speed mid-simulation."""
-        self.state.speed = speed
-
-
-# ─────────── Standalone test ───────────
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Market Replay Simulator")
-    parser.add_argument("--date", default="2026-03-20", help="Simulation date (YYYY-MM-DD)")
-    parser.add_argument("--end-date", default=None, help="End date (default: same as --date)")
-    parser.add_argument("--speed", type=int, default=0, help="Candles/sec (0=instant)")
-    args = parser.parse_args()
-
-    end = args.end_date or args.date
-
-    async def print_event(event_type, data):
-        if event_type == "candle":
-            pos_str = ""
-            if data.get("position"):
-                p = data["position"]
-                pos_str = f" | {p['dir']} @ {p['entry']:.2f} SL={p['sl']:.2f} Unreal={p['unrealized']:+.2f}"
-            print(
-                f"[{data['time_str']}] NIFTY={data['close']:.2f} | "
-                f"{data['signal']} | ATR={data['atr']:.2f} | "
-                f"RSI={data['rsi']:.1f}{pos_str} | "
-                f"P&L={data['daily_pnl']:+.2f} | "
-                f"{data['timing']['total_ms']:.0f}ms"
-            )
-        elif event_type == "trade_open":
-            print(f"  🟢 OPENED {data['dir']} @ {data['entry']:.2f} | SL={data['sl']:.2f}")
-        elif event_type == "trade_close":
-            icon = "✅" if data['pnl'] > 0 else "❌"
-            print(f"  {icon} CLOSED {data['dir']} | Entry={data['entry']:.2f} Exit={data['exit']:.2f} | P&L={data['pnl']:+.2f} | {data['reason']}")
-        elif event_type == "sim_start":
-            precomp = data.get('precompute_ms', 0)
-            print(f"\n🚀 Simulation started: {data['start_date']} → {data['end_date']} | {data['total_candles']} candles | Speed: {data['speed']}x | Pre-compute: {precomp:.0f}ms")
-        elif event_type == "sim_end":
-            print(f"\n{'='*60}")
-            print(f"  SIMULATION COMPLETE")
-            print(f"  Trades: {data['total_trades']} | Win rate: {data['win_rate']:.1f}%")
-            print(f"  Total P&L: {data['total_pnl']:+.2f} pts")
-            print(f"  Avg candle: {data['avg_candle_ms']:.1f}ms")
-            print(f"{'='*60}")
-        elif event_type == "day_change":
-            print(f"\n📅 Day: {data['date']} | P&L: {data['daily_pnl']:+.2f}")
-        elif event_type == "error":
-            print(f"❌ {data['message']}")
-
-    sim = MarketSimulator(on_event=print_event)
-    asyncio.run(sim.run_simulation(args.date, end, speed=args.speed))
+with open("simulator.py", "w", encoding="utf-8") as f:
+    f.write(text)
+print("SUCCESS!")
