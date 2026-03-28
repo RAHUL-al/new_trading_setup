@@ -572,6 +572,10 @@
         <input type="range" id="speedSlider" class="speed-slider" min="1" max="120" value="10">
         <span id="speedValue" class="speed-value">10x</span>
     </div>
+    <div class="control-group">
+        <label>Cache</label>
+        <input type="number" id="warmup" value="500" min="50" max="5000" step="50" style="width: 70px;">
+    </div>
 
     <button id="btnPlay" class="btn btn-primary" onclick="startSim()">▶ Play</button>
     <button id="btnPause" class="btn btn-warning" onclick="pauseSim()" style="display:none">⏸ Pause</button>
@@ -1005,6 +1009,7 @@ function startSim() {
     const start = document.getElementById('startDate').value;
     const end = document.getElementById('endDate').value;
     const speed = parseInt(document.getElementById('speedSlider').value);
+    const warmup = parseInt(document.getElementById('warmup').value) || 500;
 
     if (!start || !end) {
         addLog('⚠️ Please select start and end dates', 'warn');
@@ -1030,8 +1035,9 @@ function startSim() {
                 start_date: start,
                 end_date: end,
                 speed: speed,
+                warmup: warmup,
             }));
-            addLog(`⏳ Starting simulation ${start} → ${end} at ${speed}x...`, 'info');
+            addLog(`⏳ Starting simulation ${start} → ${end} at ${speed}x (Cache: ${warmup})...`, 'info');
         }
     }, 100);
 

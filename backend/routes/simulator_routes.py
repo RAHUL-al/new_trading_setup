@@ -148,6 +148,7 @@ async def start_simulation(
     start_date: str = Query(..., description="Start date YYYY-MM-DD"),
     end_date: str = Query(None, description="End date YYYY-MM-DD (default: same as start)"),
     speed: int = Query(10, description="Candles per second"),
+    warmup: int = Query(500, description="Number of warm-up cache candles"),
 ):
     """Start a market replay simulation."""
     global _simulator, _sim_task
@@ -164,7 +165,7 @@ async def start_simulation(
 
     # Run simulation in background task
     _sim_task = asyncio.create_task(
-        _simulator.run_simulation(start_date, end_date, speed)
+        _simulator.run_simulation(start_date, end_date, speed, warmup_candles=warmup)
     )
 
     return {
@@ -284,6 +285,7 @@ async def simulator_websocket(ws: WebSocket):
                         start_date=data["start_date"],
                         end_date=data.get("end_date", data["start_date"]),
                         speed=data.get("speed", 10),
+                        warmup=data.get("warmup", 500),
                     )
                 elif data.get("action") == "stop":
                     await stop_simulation()

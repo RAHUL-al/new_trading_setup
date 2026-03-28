@@ -52,7 +52,6 @@ MODEL_PATH = os.environ.get("CATBOOST_MODEL", os.path.join(PROJECT_ROOT, "catboo
 ATR_PERIOD = 14
 ATR_KEY_VALUE = 1.0
 MIN_ATR = 6.5
-WARMUP_CANDLES = 500
 
 WINDOW_START = dt_time(9, 20)
 WINDOW_END = dt_time(15, 15)
@@ -185,7 +184,7 @@ class MarketSimulator:
         self.state.position = None
         return trade
 
-    async def run_simulation(self, start_date: str, end_date: str, speed: int = 10):
+    async def run_simulation(self, start_date: str, end_date: str, speed: int = 10, warmup_candles: int = 500):
         """
         Main simulation loop. Replays candles between start_date and end_date.
         Speed = candles per second (1 = real-time, 60 = fast).
@@ -222,15 +221,15 @@ class MarketSimulator:
             self.state.running = False
             return
 
-        # Get warm-up candles (WARMUP_CANDLES before start_date)
+        # Get warm-up candles
         warmup_mask = self.df_1m_full['Time'] < start_dt
-        df_warmup = self.df_1m_full[warmup_mask].tail(WARMUP_CANDLES).reset_index(drop=True)
+        df_warmup = self.df_1m_full[warmup_mask].tail(warmup_candles).reset_index(drop=True)
 
         # Get 2-min warm-up
         df_2m_warmup = pd.DataFrame()
         if self.df_2m_full is not None:
             warmup_2m_mask = self.df_2m_full['Time'] < start_dt
-            df_2m_warmup = self.df_2m_full[warmup_2m_mask].tail(WARMUP_CANDLES).reset_index(drop=True)
+            df_2m_warmup = self.df_2m_full[warmup_2m_mask].tail(warmup_candles).reset_index(drop=True)
 
         self.state.total_candles = len(df_sim)
 
