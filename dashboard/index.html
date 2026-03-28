@@ -859,8 +859,8 @@ function handleEvent(type, data) {
 }
 
 function handleCandle(d) {
-    // Parse time for chart (Unix timestamp in seconds)
-    const ts = Math.floor(new Date(d.time).getTime() / 1000);
+    // Force JS to parse the time as UTC so Lightweight Charts (which displays in UTC by default) shows exactly the NIFTY IST hours
+    const ts = Math.floor(new Date(d.time.replace(' ', 'T') + 'Z').getTime() / 1000);
 
     candleSeries.update({
         time: ts,
