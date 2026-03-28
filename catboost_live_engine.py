@@ -63,10 +63,11 @@ REDIS_PREFIX = os.environ.get("REDIS_PREFIX", "")
 NIFTY_SYMBOL = "NIFTY"
 MODEL_PATH = os.environ.get("CATBOOST_MODEL", "catboost_nifty_model.cbm")
 
-# CSV paths for warm-up data (must match what backtest uses)
+# CSV paths for full historical data (must match what backtest uses)
 CSV_1M = os.environ.get("CSV_1M", "nifty_1min_data.csv")
 CSV_2M = os.environ.get("CSV_2M", "nifty_2min_data.csv")
-WARMUP_CANDLES = 500  # Load last N candles from CSV for EWM convergence
+# Load ENTIRE CSV history to guarantee mathematical parity with backtester's EMA/RMA values
+WARMUP_CANDLES = None
 
 ATR_PERIOD = 14
 ATR_KEY_VALUE = 1.0
@@ -735,17 +736,17 @@ async def catboost_signal_engine():
 
             cached_df_1m = df_today.copy()
 
-            # ── Load CSV warm-up data (once, then cache) ──
+            # ── Load CSV historical data (once, then cache) ──
             if cached_df_1m_warmup is None and os.path.exists(CSV_1M):
                 try:
                     csv_full = pd.read_csv(CSV_1M)
                     csv_full['Time'] = pd.to_datetime(csv_full['Time']).dt.tz_localize(None)
                     csv_full = csv_full.sort_values('Time').reset_index(drop=True)
-                    # Take last WARMUP_CANDLES rows (prior days' data for EWM convergence)
-                    cached_df_1m_warmup = csv_full.tail(WARMUP_CANDLES).reset_index(drop=True)
-                    logger.info(f"  📦 CSV warm-up loaded: {len(cached_df_1m_warmup)} candles from {CSV_1M}")
+                    # Use full history for exact EMA convergence parity with backtester
+                    cached_df_1m_warmup = csv_full.reset_index(drop=True)
+                    logger.info(f"  📦 Full 1-min history loaded: {len(cached_df_1m_warmup)} candles from {CSV_1M}")
                 except Exception as e:
-                    logger.warning(f"  ⚠️ CSV warm-up load failed: {e}")
+                    logger.warning(f"  ⚠️ CSV history load failed: {e}")
                     cached_df_1m_warmup = pd.DataFrame()
 
             if cached_df_2m_warmup is None and os.path.exists(CSV_2M):
@@ -753,10 +754,10 @@ async def catboost_signal_engine():
                     csv_2m = pd.read_csv(CSV_2M)
                     csv_2m['Time'] = pd.to_datetime(csv_2m['Time']).dt.tz_localize(None)
                     csv_2m = csv_2m.sort_values('Time').reset_index(drop=True)
-                    cached_df_2m_warmup = csv_2m.tail(WARMUP_CANDLES).reset_index(drop=True)
-                    logger.info(f"  📦 CSV 2-min warm-up loaded: {len(cached_df_2m_warmup)} candles from {CSV_2M}")
+                    cached_df_2m_warmup = csv_2m.reset_index(drop=True)
+                    logger.info(f"  📦 Full 2-min history loaded: {len(cached_df_2m_warmup)} candles from {CSV_2M}")
                 except Exception as e:
-                    logger.warning(f"  ⚠️ CSV 2-min warm-up load failed: {e}")
+                    logger.warning(f"  ⚠️ CSV 2-min history load failed: {e}")
                     cached_df_2m_warmup = pd.DataFrame()
 
             # ── Build features using BACKTEST-IDENTICAL approach ──

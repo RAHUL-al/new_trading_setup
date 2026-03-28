@@ -97,6 +97,11 @@ class SimulationState:
         self.end_date = ""
         self.candle_times: List[float] = []  # timing per candle
 
+        # Lot management strictly matching backtest
+        self.current_lots = 2  # BASE_LOTS
+        self.accumulated_loss = 0.0
+        self.recovering = False
+
 
 class MarketSimulator:
     """
@@ -159,16 +164,17 @@ class MarketSimulator:
             await self.on_event(event_type, data)
 
     def _close_position(self, exit_price: float, reason: str, exit_time: str) -> Dict:
-        """Close current position and return trade record."""
+        """Close current position, multiply by lots, and return trade record."""
         pos = self.state.position
         if not pos:
             return {}
 
         if pos['dir'] == 'LONG':
-            pnl = exit_price - pos['entry']
+            raw_pnl = exit_price - pos['entry']
         else:
-            pnl = pos['entry'] - exit_price
-        pnl = round(pnl, 2)
+            raw_pnl = pos['entry'] - exit_price
+            
+        pnl = round(raw_pnl * self.state.current_lots, 2)
 
         self.state.daily_pnl += pnl
         if pnl > 0:
@@ -332,12 +338,25 @@ class MarketSimulator:
                     )
                     await self.emit("trade_close", trade)
 
+                # Exactly mirror backtest lot management on day close
+                if self.state.daily_pnl < 0:
+                    self.state.accumulated_loss += self.state.daily_pnl
+                    self.state.recovering = True
+                    self.state.current_lots += 2
+                elif self.state.daily_pnl > 0 and self.state.recovering:
+                    self.state.accumulated_loss += self.state.daily_pnl
+                    if self.state.accumulated_loss >= 0:
+                        self.state.current_lots = 2  # Baseline lots
+                        self.state.accumulated_loss = 0.0
+                        self.state.recovering = False
+
                 await self.emit("day_change", {
                     "date": str(curr_date),
                     "daily_pnl": round(self.state.daily_pnl, 2),
                     "trades": len(self.state.trades),
                     "wins": self.state.wins,
                     "losses": self.state.losses,
+                    "lots": self.state.current_lots,
                 })
                 self.state.daily_pnl = 0.0
 
@@ -413,9 +432,10 @@ class MarketSimulator:
             unrealized = 0
             if self.state.position:
                 if self.state.position['dir'] == 'LONG':
-                    unrealized = close_price - self.state.position['entry']
+                    raw_unrealized = close_price - self.state.position['entry']
                 else:
-                    unrealized = self.state.position['entry'] - close_price
+                    raw_unrealized = self.state.position['entry'] - close_price
+                unrealized = raw_unrealized * self.state.current_lots
 
             t_candle_elapsed = (time.perf_counter() - t_candle_start) * 1000
             self.state.candle_times.append(t_candle_elapsed)
