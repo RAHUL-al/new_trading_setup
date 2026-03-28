@@ -44,9 +44,10 @@ except ImportError:
 
 
 # ─────────── Config ───────────
-CSV_1M = os.environ.get("CSV_1M", "nifty_1min_data.csv")
-CSV_2M = os.environ.get("CSV_2M", "nifty_2min_data.csv")
-MODEL_PATH = os.environ.get("CATBOOST_MODEL", "catboost_nifty_model.cbm")
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+CSV_1M = os.environ.get("CSV_1M", os.path.join(PROJECT_ROOT, "nifty_1min_data.csv"))
+CSV_2M = os.environ.get("CSV_2M", os.path.join(PROJECT_ROOT, "nifty_2min_data.csv"))
+MODEL_PATH = os.environ.get("CATBOOST_MODEL", os.path.join(PROJECT_ROOT, "catboost_nifty_model.cbm"))
 
 ATR_PERIOD = 14
 ATR_KEY_VALUE = 1.0
