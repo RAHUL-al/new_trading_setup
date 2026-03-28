@@ -1,0 +1,45 @@
+server {
+    listen 80;
+    server_name YOUR_DOMAIN_OR_SERVER_IP; # Replace with your IP or domain
+    
+    # ── Serve Dashboard Interface (optional if served by FastAPI, but faster via Nginx) ──
+    # If you prefer Nginx to serve static files, uncomment below:
+    # location /dashboard/ {
+    #     alias /root/Trading_setup_code/dashboard/;
+    #     index index.html;
+    # }
+
+    # ── API and WebSocket Proxy ──
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # ── WebSocket specific proxy handling ──
+    location /ws/ {
+        proxy_pass http://127.0.0.1:8000/ws/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 86400s; # keep websockets open for long simulation sessions
+        proxy_send_timeout 86400s;
+    }
+
+    location /api/ws/ {
+        proxy_pass http://127.0.0.1:8000/api/ws/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+}

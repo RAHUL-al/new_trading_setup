@@ -5,10 +5,13 @@ load_dotenv(dotenv_path="../.env")  # Load from project root
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 import logging
+import os
 
 from database import init_db
-from routes import auth_routes, trading_routes, ws_routes
+from routes import auth_routes, trading_routes, ws_routes, simulator_routes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
@@ -20,7 +23,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000", "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -29,6 +32,7 @@ app.add_middleware(
 app.include_router(auth_routes.router)
 app.include_router(trading_routes.router)
 app.include_router(ws_routes.router)
+app.include_router(simulator_routes.router)
 
 
 @app.on_event("startup")
@@ -39,3 +43,13 @@ def startup():
 @app.get("/api/health")
 def health_check():
     return {"status": "ok", "message": "Trading Platform API is running"}
+
+
+# Serve dashboard at /dashboard
+DASHBOARD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "dashboard")
+if os.path.isdir(DASHBOARD_DIR):
+    @app.get("/dashboard")
+    def serve_dashboard():
+        return FileResponse(os.path.join(DASHBOARD_DIR, "index.html"))
+
+    app.mount("/dashboard", StaticFiles(directory=DASHBOARD_DIR), name="dashboard")
