@@ -1,8 +1,23 @@
 """
-catboost_strategy.py — CatBoost ML Strategy for NIFTY (Pure 2-Minute Timeframe)
+catboost_strategy.py — CatBoost ML Strategy for NIFTY (Multi-Timeframe)
 
-Uses strictly 2-minute OHLCV data to train a CatBoost model
+Uses 1-minute AND 2-minute OHLCV data to train a CatBoost model
 that predicts BUY/SELL signals for the 2:00 PM - 3:03 PM window.
+
+FEATURES (per candle):
+  From 1-min data: ATR, UT Bot trail stop, RSI, price momentum, candle patterns
+  From 2-min data: ATR, trend direction, support/resistance levels
+
+LABELS:
+  1  = BUY  (future N-candle return > threshold)
+  -1 = SELL (future N-candle return < -threshold)
+  0  = HOLD
+
+Usage:
+    python catboost_strategy.py                          # Train + backtest
+    python catboost_strategy.py --min-atr 6.5
+    python catboost_strategy.py --lookahead 5            # 5 candles for labeling
+    python catboost_strategy.py --threshold 8            # 8 pts for signal
 """
 
 import pandas as pd
@@ -18,6 +33,7 @@ except ImportError:
     print("❌ CatBoost not installed. Run: pip install catboost")
     exit(1)
 
+
 # ─────────── Config ───────────
 ATR_PERIOD = 14
 ATR_KEY_VALUE = 1.0
@@ -30,15 +46,19 @@ SQUARE_OFF = dt_time(15, 24)      # 3:24 PM
 LOT_SIZE = 65
 BASE_LOTS = 2
 
-LOOKAHEAD = 3                     # N candles ahead for labeling (3 candles x 2 = 6 mins)
+LOOKAHEAD = 5                     # N candles ahead for labeling
 THRESHOLD = 8.0                   # Min pts for buy/sell label
 
-TRAIN_END_YEAR = 2024
-TEST_START_YEAR = 2025
+# Fixed train/test split by year
+TRAIN_END_YEAR = 2024             # Train: 2019-2024
+TEST_START_YEAR = 2025            # Test: 2025-2026
+
 
 # ─────────── Indicators ───────────
+
 def calc_rma(series, period):
     return series.ewm(alpha=1/period, adjust=False).mean()
+
 
 def calc_atr(df, period=14):
     h = df['High'].astype(float)
@@ -51,6 +71,7 @@ def calc_atr(df, period=14):
     tr.iloc[0] = tr1.iloc[0]
     return calc_rma(tr, period)
 
+
 def calc_rsi(series, period=14):
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
@@ -60,7 +81,9 @@ def calc_rsi(series, period=14):
     rs = avg_gain / avg_loss.replace(0, 1e-10)
     return 100 - (100 / (1 + rs))
 
+
 def calc_ut_bot_direction(close, atr, key_value=1.0):
+    """Returns trail_stop and direction arrays."""
     n = len(close)
     trail_stop = np.zeros(n)
     direction = np.zeros(n)
@@ -94,8 +117,8 @@ def calc_ut_bot_direction(close, atr, key_value=1.0):
 
 # ─────────── Feature Engineering ───────────
 
-def build_features_2m(df):
-    """Build all features exclusively from 2-minute data."""
+def build_features_1min(df):
+    """Build features from 1-minute data."""
     close = df['Close'].astype(float)
     high = df['High'].astype(float)
     low = df['Low'].astype(float)
@@ -106,49 +129,91 @@ def build_features_2m(df):
     trail, dirn = calc_ut_bot_direction(close.values, atr.values, ATR_KEY_VALUE)
 
     features = pd.DataFrame(index=df.index)
-    
-    # Core Indicators
-    features['atr_2m'] = atr
-    features['rsi_2m'] = rsi
-    features['ut_dir_2m'] = dirn
-    features['close_vs_trail_2m'] = close.values - trail
+    features['atr_1m'] = atr
+    features['rsi_1m'] = rsi
+    features['ut_dir_1m'] = dirn
+    features['close_vs_trail_1m'] = close.values - trail
 
     # Price momentum
-    features['mom_3_2m'] = close.pct_change(3) * 100
-    features['mom_5_2m'] = close.pct_change(5) * 100
-    features['mom_10_2m'] = close.pct_change(10) * 100
+    features['mom_3'] = close.pct_change(3) * 100
+    features['mom_5'] = close.pct_change(5) * 100
+    features['mom_10'] = close.pct_change(10) * 100
 
     # Candle features
-    features['body_2m'] = close - opn
-    features['body_pct_2m'] = (close - opn) / opn.replace(0, 1e-10) * 100
-    features['upper_wick_2m'] = high - close.where(close > opn, opn)
-    features['lower_wick_2m'] = close.where(close < opn, opn) - low
-    features['range_2m'] = high - low
+    features['body_1m'] = close - opn
+    features['body_pct_1m'] = (close - opn) / opn * 100
+    features['upper_wick_1m'] = high - close.where(close > opn, opn)
+    features['lower_wick_1m'] = close.where(close < opn, opn) - low
+    features['range_1m'] = high - low
 
     # Volatility
-    features['std_5_2m'] = close.rolling(5).std()
-    features['std_10_2m'] = close.rolling(10).std()
+    features['std_5'] = close.rolling(5).std()
+    features['std_10'] = close.rolling(10).std()
 
     # Moving averages
-    features['sma_5_2m'] = close.rolling(5).mean()
-    features['sma_10_2m'] = close.rolling(10).mean()
-    features['sma_20_2m'] = close.rolling(20).mean()
-    features['close_vs_sma5_2m'] = close - features['sma_5_2m']
-    features['close_vs_sma10_2m'] = close - features['sma_10_2m']
-    features['sma5_vs_sma10_2m'] = features['sma_5_2m'] - features['sma_10_2m']
+    features['sma_5'] = close.rolling(5).mean()
+    features['sma_10'] = close.rolling(10).mean()
+    features['sma_20'] = close.rolling(20).mean()
+    features['close_vs_sma5'] = close - features['sma_5']
+    features['close_vs_sma10'] = close - features['sma_10']
+    features['sma5_vs_sma10'] = features['sma_5'] - features['sma_10']
 
     # High/Low channels
-    features['high_5_2m'] = high.rolling(5).max()
-    features['low_5_2m'] = low.rolling(5).min()
-    features['close_vs_high5_2m'] = close - features['high_5_2m']
-    features['close_vs_low5_2m'] = close - features['low_5_2m']
+    features['high_5'] = high.rolling(5).max()
+    features['low_5'] = low.rolling(5).min()
+    features['close_vs_high5'] = close - features['high_5']
+    features['close_vs_low5'] = close - features['low_5']
 
     return features
 
 
+def build_features_2min(df_2m, df_1m):
+    """
+    Build features from 2-min data and align to 1-min index.
+    Uses forward-fill to map 2-min features to the 1-min timeframe.
+    """
+    close_2m = df_2m['Close'].astype(float)
+    high_2m = df_2m['High'].astype(float)
+    low_2m = df_2m['Low'].astype(float)
+
+    atr_2m = calc_atr(df_2m, ATR_PERIOD)
+    rsi_2m = calc_rsi(close_2m, 14)
+    trail_2m, dir_2m = calc_ut_bot_direction(close_2m.values, atr_2m.values, ATR_KEY_VALUE)
+
+    feat_2m = pd.DataFrame(index=df_2m.index)
+    feat_2m['Time'] = df_2m['Time']
+    feat_2m['atr_2m'] = atr_2m.values
+    feat_2m['rsi_2m'] = rsi_2m.values
+    feat_2m['ut_dir_2m'] = dir_2m
+    feat_2m['close_vs_trail_2m'] = close_2m.values - trail_2m
+    feat_2m['mom_3_2m'] = close_2m.pct_change(3).values * 100
+    feat_2m['mom_5_2m'] = close_2m.pct_change(5).values * 100
+    feat_2m['range_2m'] = (high_2m - low_2m).values
+    feat_2m['body_2m'] = (close_2m - df_2m['Open'].astype(float)).values
+
+    # Merge to 1-min by time (forward fill)
+    feat_2m['Time'] = pd.to_datetime(feat_2m['Time'])
+    df_1m_time = pd.DataFrame({'Time': pd.to_datetime(df_1m['Time'])})
+
+    merged = pd.merge_asof(
+        df_1m_time.sort_values('Time'),
+        feat_2m.sort_values('Time'),
+        on='Time',
+        direction='backward'
+    )
+
+    return merged.drop('Time', axis=1).reset_index(drop=True)
+
+
 # ─────────── Label Generation ───────────
 
-def generate_labels(df, lookahead=3, threshold=8.0):
+def generate_labels(df, lookahead=5, threshold=8.0):
+    """
+    Label each candle:
+      1  = BUY  (max future gain > threshold)
+      -1 = SELL (max future loss > threshold)
+      0  = HOLD
+    """
     close = df['Close'].astype(float).values
     n = len(close)
     labels = np.zeros(n, dtype=int)
@@ -171,6 +236,7 @@ def generate_labels(df, lookahead=3, threshold=8.0):
 # ─────────── Backtest ───────────
 
 def backtest_predictions(df, predictions, atr_vals):
+    """Backtest using CatBoost predictions as signals."""
     close = df['Close'].astype(float)
     high_v = df['High'].astype(float)
     low_v = df['Low'].astype(float)
@@ -180,6 +246,7 @@ def backtest_predictions(df, predictions, atr_vals):
     daily_results = {}
     prev_date = None
 
+    # Lot management
     current_lots = BASE_LOTS
     accumulated_loss = 0.0
     recovering = False
@@ -192,9 +259,11 @@ def backtest_predictions(df, predictions, atr_vals):
         l = float(low_v.iloc[i])
         curr_atr = float(atr_vals[i])
 
+        # Day boundary
         if prev_date and curr_date != prev_date:
             if pos:
                 prev_close = float(close.iloc[i-1])
+                pnl = _pnl(pos, prev_close)
                 trade = _make_trade(pos, prev_close, df.iloc[i-1]['Time'], "DAY_END", current_lots, pos.get('initial_sl'))
                 all_trades.append(trade)
                 _add_daily(daily_results, prev_date, trade)
@@ -202,6 +271,7 @@ def backtest_predictions(df, predictions, atr_vals):
             if curr_date not in daily_results:
                 daily_results[curr_date] = {'trades': [], 'pnl': 0, 'lots': current_lots}
 
+            # Lot adjustment
             if prev_date in daily_results:
                 prev_pnl = daily_results[prev_date]['pnl']
                 if prev_pnl < 0:
@@ -214,6 +284,7 @@ def backtest_predictions(df, predictions, atr_vals):
                         current_lots = BASE_LOTS
                         accumulated_loss = 0.0
                         recovering = False
+
             if curr_date in daily_results:
                 daily_results[curr_date]['lots'] = current_lots
         prev_date = curr_date
@@ -221,6 +292,7 @@ def backtest_predictions(df, predictions, atr_vals):
         if curr_date not in daily_results:
             daily_results[curr_date] = {'trades': [], 'pnl': 0, 'lots': current_lots}
 
+        # Square off
         if pos and t >= SQUARE_OFF:
             trade = _make_trade(pos, c, df.iloc[i]['Time'], "SQUARE_OFF", current_lots, pos.get('initial_sl'))
             all_trades.append(trade)
@@ -230,6 +302,7 @@ def backtest_predictions(df, predictions, atr_vals):
 
         in_window = ENTRY_START <= t <= ENTRY_END
 
+        # SL check
         if pos:
             sl_hit = False
             if pos['dir'] == "LONG" and l <= pos['sl']:
@@ -245,6 +318,7 @@ def backtest_predictions(df, predictions, atr_vals):
                 _add_daily(daily_results, curr_date, trade)
                 pos = None
 
+        # Trail SL update
         if pos:
             if pos['dir'] == "LONG":
                 new_sl = c - curr_atr * ATR_KEY_VALUE
@@ -255,8 +329,10 @@ def backtest_predictions(df, predictions, atr_vals):
                 if new_sl < pos['sl']:
                     pos['sl'] = new_sl
 
+        # Signal from CatBoost
         pred = predictions[i]
 
+        # Opposite signal close
         if pred == 1 and pos and pos['dir'] == "SHORT":
             trade = _make_trade(pos, c, df.iloc[i]['Time'], "OPPOSITE", current_lots, pos.get('initial_sl'))
             all_trades.append(trade)
@@ -268,6 +344,7 @@ def backtest_predictions(df, predictions, atr_vals):
             _add_daily(daily_results, curr_date, trade)
             pos = None
 
+        # New entry
         if not pos and in_window and curr_atr >= MIN_ATR:
             if pred == 1:
                 sl = c - curr_atr * ATR_KEY_VALUE
@@ -280,11 +357,13 @@ def backtest_predictions(df, predictions, atr_vals):
 
     return all_trades, daily_results
 
+
 def _pnl(pos, exit_price):
     if pos['dir'] == "LONG":
         return exit_price - pos['entry']
     else:
         return pos['entry'] - exit_price
+
 
 def _make_trade(pos, exit_price, exit_time, reason, lots=2, sl=None):
     raw_pnl = _pnl(pos, exit_price)
@@ -308,11 +387,13 @@ def _make_trade(pos, exit_price, exit_time, reason, lots=2, sl=None):
         trade['sl'] = round(sl, 2)
     return trade
 
+
 def _add_daily(daily_results, date, trade):
     if date not in daily_results:
         daily_results[date] = {'trades': [], 'pnl': 0, 'lots': trade.get('lots', BASE_LOTS)}
     daily_results[date]['trades'].append(trade)
     daily_results[date]['pnl'] += trade['pnl']
+
 
 # ─────────── Reports ───────────
 
@@ -320,25 +401,32 @@ def print_results(all_trades, daily_results, label=""):
     if not all_trades:
         print("❌ No trades")
         return
+
     n = len(all_trades)
     wins = [t for t in all_trades if t['pnl'] > 0]
     losses = [t for t in all_trades if t['pnl'] <= 0]
     wr = len(wins) / n * 100
+
     pnl_list = [t['pnl'] for t in all_trades]
     total_pnl = sum(pnl_list)
+
     gp = sum(t['pnl'] for t in wins) if wins else 0
     gl = abs(sum(t['pnl'] for t in losses)) if losses else 1
     pf = gp / gl if gl > 0 else 0
+
     avg_win = np.mean([t['pnl'] for t in wins]) if wins else 0
     avg_loss = np.mean([t['pnl'] for t in losses]) if losses else 0
+
+    # Drawdown
     cumulative = np.cumsum(pnl_list)
     peak = np.maximum.accumulate(cumulative)
     max_dd = (peak - cumulative).max()
+
     trading_days = sum(1 for d in daily_results.values() if len(d['trades']) > 0)
     win_days = sum(1 for d in daily_results.values() if d['pnl'] > 0)
 
     print(f"\n{'='*60}")
-    print(f"  🤖 PURE 2-MIN CATBOOST STRATEGY — {label}")
+    print(f"  🤖 CATBOOST STRATEGY — {label}")
     print(f"{'='*60}")
     print(f"  Total trades:      {n}")
     print(f"  Win rate:          {wr:.1f}%")
@@ -351,19 +439,118 @@ def print_results(all_trades, daily_results, label=""):
     print(f"  Profitable days:   {win_days} ({win_days/max(trading_days,1)*100:.0f}%)")
     print(f"  Avg P&L/day:       {total_pnl/max(trading_days,1):+.2f} pts")
 
+    # Daily results
+    sorted_days = sorted(daily_results.keys())
+    print(f"\n  {'Date':>12} {'Lots':>5} {'Trades':>7} {'P&L':>10} {'Status':>8}")
+    print(f"  {'-'*45}")
+    cum = 0
+    for day in sorted_days:
+        trades = daily_results[day]['trades']
+        day_pnl = daily_results[day]['pnl']
+        lots = daily_results[day].get('lots', BASE_LOTS)
+        if len(trades) == 0:
+            continue
+        cum += day_pnl
+        icon = "✅" if day_pnl > 0 else "❌" if day_pnl < 0 else "➖"
+        print(f"  {str(day):>12} {lots:>5} {len(trades):>7} {day_pnl:>+9.2f} {icon:>8}")
+    print(f"  {'-'*45}")
+    print(f"  {'TOTAL':>12} {'':>5} {'':>7} {cum:>+9.2f}")
+
+    # Close reasons
+    reasons = {}
+    for t in all_trades:
+        reasons[t['reason']] = reasons.get(t['reason'], 0) + 1
+    print(f"\n  🔍 CLOSE REASONS")
+    for r, c in sorted(reasons.items(), key=lambda x: -x[1]):
+        r_trades = [t for t in all_trades if t['reason'] == r]
+        r_wr = sum(1 for t in r_trades if t['pnl'] > 0) / len(r_trades) * 100
+        print(f"    {r:15s}: {c:4d} trades | Win: {r_wr:.0f}%")
+
+    print(f"\n{'='*60}")
+
+
+def print_detailed_daily_log(all_trades, daily_results, log_file="catboost_detailed_log.txt"):
+    """Print AND save detailed per-trade explanation for each day."""
+    import sys
+    
+    sorted_days = sorted(daily_results.keys())
+    lines = []
+    
+    def out(s=""):
+        print(s)
+        lines.append(s)
+    
+    out(f"\n{'='*110}")
+    out(f"  📋 DETAILED TRADE LOG — EACH TRADE ON EACH DAY")
+    out(f"{'='*110}")
+    
+    day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+    cum_pnl = 0
+    
+    for day in sorted_days:
+        trades = daily_results[day]['trades']
+        day_pnl = daily_results[day]['pnl']
+        lots = daily_results[day].get('lots', BASE_LOTS)
+        
+        if len(trades) == 0:
+            continue
+        
+        cum_pnl += day_pnl
+        day_name = day_names[day.weekday()]
+        wins = sum(1 for t in trades if t['pnl'] > 0)
+        losses = len(trades) - wins
+        wr = wins / len(trades) * 100
+        icon = "✅" if day_pnl > 0 else "❌" if day_pnl < 0 else "➖"
+        
+        out(f"\n  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐")
+        out(f"  │ 📅 {day} ({day_name}) | Lots: {lots} (qty={lots*LOT_SIZE}) | Trades: {len(trades)} (W:{wins} L:{losses} {wr:.0f}%) | Day P&L: {day_pnl:+.2f} {icon} | Cum: {cum_pnl:+.2f}")
+        out(f"  ├───┬──────┬───────────┬───────────┬───────────┬───────────┬────────────┬──────────┬─────────────┤")
+        out(f"  │ # │ Dir  │ Entry Time│ Exit Time │ Entry Pr  │ Exit Pr   │ SL         │ P&L      │ Exit Reason │")
+        out(f"  ├───┼──────┼───────────┼───────────┼───────────┼───────────┼────────────┼──────────┼─────────────┤")
+        
+        for j, t in enumerate(trades, 1):
+            entry_t = t['entry_time'].strftime('%H:%M') if hasattr(t['entry_time'], 'strftime') else str(t['entry_time'])[-8:-3]
+            exit_t = t['exit_time'].strftime('%H:%M') if hasattr(t['exit_time'], 'strftime') else str(t['exit_time'])[-8:-3]
+            
+            # Calculate SL from entry and ATR
+            sl_str = "---"
+            if 'sl' in t:
+                sl_str = f"{t['sl']:.2f}"
+            
+            dir_icon = "🟢" if t['dir'] == 'LONG' else "🔴"
+            pnl_icon = "✅" if t['pnl'] > 0 else "❌" if t['pnl'] < 0 else "➖"
+            
+            out(f"  │{j:>2} │ {dir_icon}{t['dir']:>4} │ {entry_t:>9} │ {exit_t:>9} │ {t['entry']:>9.2f} │ {t['exit']:>9.2f} │ {sl_str:>10} │ {t['pnl']:>+7.2f}{pnl_icon}│ {t['reason']:<12}│")
+        
+        out(f"  └───┴──────┴───────────┴───────────┴───────────┴───────────┴────────────┴──────────┴─────────────┘")
+        out(f"  Day Summary: {day_pnl:+.2f} pts ({day_name}) | Raw trades: {len(trades)} | Multiplier: {lots // BASE_LOTS}x")
+    
+    out(f"\n{'='*110}")
+    out(f"  GRAND TOTAL: {cum_pnl:+.2f} pts")
+    out(f"{'='*110}")
+    
+    # Save to file
+    with open(log_file, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+    print(f"\n💾 Detailed log saved: {log_file}")
+
+
+# ─────────── Main ───────────
+
 def main():
     global ATR_KEY_VALUE, MIN_ATR, LOOKAHEAD, THRESHOLD, ENTRY_START, ENTRY_END, SQUARE_OFF
 
-    parser = argparse.ArgumentParser(description="Pure 2-Min CatBoost ML Strategy")
-    parser.add_argument("--file-2m", default="nifty_2min_data.csv", help="2-min data CSV file")
+    parser = argparse.ArgumentParser(description="CatBoost ML Strategy (NIFTY)")
+    parser.add_argument("--file-1m", default="nifty_1min_data.csv", help="1-min data")
+    parser.add_argument("--file-2m", default="nifty_2min_data.csv", help="2-min data")
     parser.add_argument("--atr-key", type=float, default=ATR_KEY_VALUE)
     parser.add_argument("--min-atr", type=float, default=MIN_ATR)
-    parser.add_argument("--lookahead", type=int, default=LOOKAHEAD)
-    parser.add_argument("--threshold", type=float, default=THRESHOLD)
-    parser.add_argument("--window-start", type=str, default="09:20")
-    parser.add_argument("--window-end", type=str, default="15:15")
-    parser.add_argument("--square-off", type=str, default="15:24")
-    parser.add_argument("--test-from", type=str, default="2025-01-01")
+    parser.add_argument("--lookahead", type=int, default=LOOKAHEAD, help="Candles to look ahead for labeling")
+    parser.add_argument("--threshold", type=float, default=THRESHOLD, help="Min pts for buy/sell label")
+    parser.add_argument("--window-start", type=str, default="09:20", help="Entry window start (HH:MM, default: 09:20)")
+    parser.add_argument("--window-end", type=str, default="15:15", help="Entry window end (HH:MM, default: 15:15)")
+    parser.add_argument("--square-off", type=str, default="15:24", help="Square off time (HH:MM, default: 15:24)")
+    parser.add_argument("--test-from", type=str, default="2025-01-01", help="Test data start date (YYYY-MM-DD, default: 2025-01-01)")
     args = parser.parse_args()
 
     ATR_KEY_VALUE = args.atr_key
@@ -371,6 +558,7 @@ def main():
     LOOKAHEAD = args.lookahead
     THRESHOLD = args.threshold
 
+    # Parse time windows
     def parse_time(s):
         h, m = map(int, s.split(':'))
         return dt_time(h, m)
@@ -378,46 +566,99 @@ def main():
     ENTRY_START = parse_time(args.window_start)
     ENTRY_END = parse_time(args.window_end)
     SQUARE_OFF = parse_time(args.square_off)
+    
     test_from_date = datetime.strptime(args.test_from, "%Y-%m-%d").date()
+
+    # ── Load data ──
+    print(f"Loading 1-min data: {args.file_1m}")
+    try:
+        df_1m = pd.read_csv(args.file_1m)
+    except FileNotFoundError:
+        print(f"❌ File not found: {args.file_1m}")
+        return
 
     print(f"Loading 2-min data: {args.file_2m}")
     try:
         df_2m = pd.read_csv(args.file_2m)
     except FileNotFoundError:
-        print(f"❌ File not found: {args.file_2m}")
-        return
+        print(f"⚠️  2-min file not found, using 1-min only")
+        df_2m = None
 
-    df_2m['Time'] = pd.to_datetime(df_2m['Time'])
-    df_2m = df_2m.sort_values('Time').reset_index(drop=True)
-    
-    total_candles = len(df_2m)
-    total_days = df_2m['Time'].dt.date.nunique()
-    print(f"2-min: {total_candles:,} candles | {total_days} days")
+    df_1m['Time'] = pd.to_datetime(df_1m['Time'])
+    df_1m = df_1m.sort_values('Time').reset_index(drop=True)
+
+    if df_2m is not None and len(df_2m) > 0:
+        df_2m['Time'] = pd.to_datetime(df_2m['Time'])
+        df_2m = df_2m.sort_values('Time').reset_index(drop=True)
+    else:
+        df_2m = None
+
+    total_candles = len(df_1m)
+    total_days = df_1m['Time'].dt.date.nunique()
+    print(f"1-min: {total_candles:,} candles | {total_days} days")
+    if df_2m is not None:
+        print(f"2-min: {len(df_2m):,} candles")
+    print(f"Date range: {df_1m['Time'].iloc[0].strftime('%Y-%m-%d')} → {df_1m['Time'].iloc[-1].strftime('%Y-%m-%d')}")
+
+    print(f"\n🤖 CATBOOST ML STRATEGY")
+    print(f"ATR: RMA({ATR_PERIOD}) × {ATR_KEY_VALUE} | Min ATR: {MIN_ATR}")
+    print(f"Window: {ENTRY_START.strftime('%H:%M')} - {ENTRY_END.strftime('%H:%M')} | Square off: {SQUARE_OFF.strftime('%H:%M')}")
+    print(f"Lookahead: {LOOKAHEAD} candles | Threshold: {THRESHOLD} pts")
+    print(f"Train: 2019-{TRAIN_END_YEAR} | Test: {TEST_START_YEAR}-2026")
+    print(f"{'='*60}")
 
     # ── Build features ──
-    print(f"\n📊 Building 2-min features natively...")
-    features = build_features_2m(df_2m)
-    
+    print(f"\n📊 Building features...")
+    feat_1m = build_features_1min(df_1m)
+    print(f"  1-min features: {feat_1m.shape[1]} columns")
+
+    if df_2m is not None:
+        feat_2m = build_features_2min(df_2m, df_1m)
+        features = pd.concat([feat_1m, feat_2m], axis=1)
+        print(f"  2-min features: {feat_2m.shape[1]} columns")
+    else:
+        features = feat_1m
+
+    print(f"  Total features: {features.shape[1]} columns")
+
     # ── Generate labels ──
     print(f"\n🏷️  Generating labels (lookahead={LOOKAHEAD}, threshold={THRESHOLD})...")
-    labels = generate_labels(df_2m, LOOKAHEAD, THRESHOLD)
-    
-    times = df_2m['Time'].dt.time
-    window_mask = (times >= ENTRY_START) & (times <= ENTRY_END)
+    labels = generate_labels(df_1m, LOOKAHEAD, THRESHOLD)
+    buy_count = (labels == 1).sum()
+    sell_count = (labels == -1).sum()
+    hold_count = (labels == 0).sum()
+    print(f"  BUY:  {buy_count} ({buy_count/len(labels)*100:.1f}%)")
+    print(f"  SELL: {sell_count} ({sell_count/len(labels)*100:.1f}%)")
+    print(f"  HOLD: {hold_count} ({hold_count/len(labels)*100:.1f}%)")
 
+    # ── Filter to trading window only ──
+    times = df_1m['Time'].dt.time
+    window_mask = (times >= ENTRY_START) & (times <= ENTRY_END)
+    print(f"\n  Window candles: {window_mask.sum()} (of {len(df_1m)})")
+
+    # ── Clean features ──
     features = features.fillna(0)
     features = features.replace([np.inf, -np.inf], 0)
 
-    dates = df_2m['Time'].dt.date
+    # ── Train/Test split (by date, no leakage) ──
+    dates = df_1m['Time'].dt.date
+    
     train_mask = (dates < test_from_date) & window_mask
     test_mask = (dates >= test_from_date) & window_mask
+    
+    train_dates_set = set(dates[dates < test_from_date].unique())
+    test_dates_set = set(dates[dates >= test_from_date].unique())
 
     X_train = features[train_mask]
     y_train = labels[train_mask]
     X_test = features[test_mask]
     y_test = labels[test_mask]
 
-    print(f"\n🧠 Training Pure 2-Minute CatBoost model...")
+    print(f"\n  Train: {len(X_train)} samples ({len(train_dates_set)} days) [up to {args.test_from}]")
+    print(f"  Test:  {len(X_test)} samples ({len(test_dates_set)} days) [{args.test_from} onwards]")
+
+    # ── Train CatBoost ──
+    print(f"\n🧠 Training CatBoost model...")
     model = CatBoostClassifier(
         iterations=500,
         depth=6,
@@ -436,23 +677,56 @@ def main():
         verbose=100,
     )
 
+    # ── Predictions ──
+    train_pred = model.predict(X_train).flatten().astype(int)
     test_pred = model.predict(X_test).flatten().astype(int)
-    full_predictions = np.zeros(len(df_2m), dtype=int)
+
+    train_acc = (train_pred == y_train).mean() * 100
+    test_acc = (test_pred == y_test).mean() * 100
+    print(f"\n  Train accuracy: {train_acc:.1f}%")
+    print(f"  Test accuracy:  {test_acc:.1f}%")
+
+    # ── Feature importance ──
+    importance = model.get_feature_importance()
+    feat_names = features.columns.tolist()
+    top_features = sorted(zip(feat_names, importance), key=lambda x: -x[1])[:10]
+    print(f"\n  📊 TOP 10 FEATURES:")
+    for name, imp in top_features:
+        print(f"    {name:>25}: {imp:.2f}")
+
+    # ── Build full prediction array ──
+    full_predictions = np.zeros(len(df_1m), dtype=int)
     full_predictions[test_mask] = test_pred
 
-    atr_vals = calc_atr(df_2m, ATR_PERIOD).values
+    # ── ATR for backtest ──
+    atr_vals = calc_atr(df_1m, ATR_PERIOD).values
 
-    print(f"\n🚀 Running TRUTHFUL backtest on TEST data...")
+    # ── Backtest on test set ──
+    print(f"\n🚀 Running backtest on TEST data ({args.test_from} onwards)...")
+    test_start = min(test_dates_set)
+    test_end = max(test_dates_set)
     test_df_mask = dates >= test_from_date
-    df_test = df_2m[test_df_mask].reset_index(drop=True)
+    df_test = df_1m[test_df_mask].reset_index(drop=True)
     pred_test_full = full_predictions[test_df_mask]
     atr_test = atr_vals[test_df_mask]
 
     all_trades, daily_results = backtest_predictions(df_test, pred_test_full, atr_test)
-    print_results(all_trades, daily_results, "PURE 2-MIN (REALITY CHECK)")
 
+    print_results(all_trades, daily_results, f"TEST ({test_start} → {test_end})")
+    
+    # ── Detailed per-trade daily log ──
+    print_detailed_daily_log(all_trades, daily_results)
+
+    # ── Save ──
+    if all_trades:
+        trades_df = pd.DataFrame(all_trades)
+        trades_df.to_csv("catboost_trades.csv", index=False)
+        print(f"\n💾 Trades saved: catboost_trades.csv")
+
+    # Save model
     model.save_model("catboost_nifty_model.cbm")
-    print(f"\n💾 Look-Ahead-Free Model saved: catboost_nifty_model.cbm")
+    print(f"💾 Model saved: catboost_nifty_model.cbm")
+
 
 if __name__ == "__main__":
     main()

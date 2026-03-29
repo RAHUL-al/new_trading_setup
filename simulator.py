@@ -1,7 +1,7 @@
 """
-simulator.py — Market Replay Simulator (Pure 2-Minute Timeframe)
+simulator.py — Market Replay Simulator
 
-Replays historical 2-minute CSV candle data through the CatBoost model one-by-one,
+Replays historical CSV candle data through the CatBoost model one-by-one,
 simulating live trading. Designed to work with the dashboard via callbacks.
 
 Usage (standalone test):
@@ -23,7 +23,8 @@ from typing import Optional, Callable, Dict, Any, List
 # Import backtest-identical feature builders
 try:
     from catboost_strategy import (
-        build_features_2m,
+        build_features_1min,
+        build_features_2min,
         calc_atr,
         calc_rma,
         calc_rsi,
@@ -44,6 +45,7 @@ except ImportError:
 
 # ─────────── Config ───────────
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+CSV_1M = os.environ.get("CSV_1M", os.path.join(PROJECT_ROOT, "nifty_1min_data.csv"))
 CSV_2M = os.environ.get("CSV_2M", os.path.join(PROJECT_ROOT, "nifty_2min_data.csv"))
 MODEL_PATH = os.environ.get("CATBOOST_MODEL", os.path.join(PROJECT_ROOT, "catboost_nifty_model.cbm"))
 
@@ -55,17 +57,22 @@ WINDOW_START = dt_time(9, 20)
 WINDOW_END = dt_time(15, 15)
 SQUARE_OFF_TIME = dt_time(15, 24)
 
-FEATURE_COLS_2M = [
-    'atr_2m', 'rsi_2m', 'ut_dir_2m', 'close_vs_trail_2m',
-    'mom_3_2m', 'mom_5_2m', 'mom_10_2m',
-    'body_2m', 'body_pct_2m', 'upper_wick_2m', 'lower_wick_2m', 'range_2m',
-    'std_5_2m', 'std_10_2m',
-    'sma_5_2m', 'sma_10_2m', 'sma_20_2m',
-    'close_vs_sma5_2m', 'close_vs_sma10_2m', 'sma5_vs_sma10_2m',
-    'high_5_2m', 'low_5_2m', 'close_vs_high5_2m', 'close_vs_low5_2m',
+FEATURE_COLS_1M = [
+    'atr_1m', 'rsi_1m', 'ut_dir_1m', 'close_vs_trail_1m',
+    'mom_3', 'mom_5', 'mom_10',
+    'body_1m', 'body_pct_1m', 'upper_wick_1m', 'lower_wick_1m', 'range_1m',
+    'std_5', 'std_10',
+    'sma_5', 'sma_10', 'sma_20',
+    'close_vs_sma5', 'close_vs_sma10', 'sma5_vs_sma10',
+    'high_5', 'low_5', 'close_vs_high5', 'close_vs_low5',
 ]
 
-ALL_FEATURE_COLS = FEATURE_COLS_2M
+FEATURE_COLS_2M = [
+    'atr_2m', 'rsi_2m', 'ut_dir_2m', 'close_vs_trail_2m',
+    'mom_3_2m', 'mom_5_2m', 'range_2m', 'body_2m',
+]
+
+ALL_FEATURE_COLS = FEATURE_COLS_1M + FEATURE_COLS_2M
 
 
 class SimulationState:
@@ -90,7 +97,7 @@ class SimulationState:
 
 class MarketSimulator:
     """
-    Replays historical 2-min candles through the CatBoost model,
+    Replays historical candles through the CatBoost model,
     streaming results via an async callback.
     """
 
@@ -99,20 +106,26 @@ class MarketSimulator:
         self.on_event = on_event  # async callback(event_type, data)
         self.model = None
         self.model_features = None
+        self.df_1m_full = None
         self.df_2m_full = None
         self._stop_requested = False
 
     def load_data(self):
         """Load CSV data and model."""
-        if self.df_2m_full is not None:
+        if self.df_1m_full is not None:
             return True  # Already loaded
 
-        if not os.path.exists(CSV_2M):
+        if not os.path.exists(CSV_1M):
             return False
 
-        self.df_2m_full = pd.read_csv(CSV_2M)
-        self.df_2m_full['Time'] = pd.to_datetime(self.df_2m_full['Time']).dt.tz_localize(None)
-        self.df_2m_full = self.df_2m_full.sort_values('Time').reset_index(drop=True)
+        self.df_1m_full = pd.read_csv(CSV_1M)
+        self.df_1m_full['Time'] = pd.to_datetime(self.df_1m_full['Time']).dt.tz_localize(None)
+        self.df_1m_full = self.df_1m_full.sort_values('Time').reset_index(drop=True)
+
+        if os.path.exists(CSV_2M):
+            self.df_2m_full = pd.read_csv(CSV_2M)
+            self.df_2m_full['Time'] = pd.to_datetime(self.df_2m_full['Time']).dt.tz_localize(None)
+            self.df_2m_full = self.df_2m_full.sort_values('Time').reset_index(drop=True)
 
         # Load model
         if HAS_CATBOOST and os.path.exists(MODEL_PATH):
@@ -127,11 +140,11 @@ class MarketSimulator:
 
     def get_available_dates(self) -> List[str]:
         """Return list of unique trading dates in the CSV."""
-        if self.df_2m_full is None:
+        if self.df_1m_full is None:
             self.load_data()
-        if self.df_2m_full is None:
+        if self.df_1m_full is None:
             return []
-        dates = self.df_2m_full['Time'].dt.date.unique()
+        dates = self.df_1m_full['Time'].dt.date.unique()
         return [str(d) for d in sorted(dates)]
 
     async def emit(self, event_type: str, data: Dict[str, Any]):
@@ -185,7 +198,7 @@ class MarketSimulator:
             return
 
         if not HAS_BACKTEST:
-            await self.emit("error", {"message": "catboost_strategy_2m.py not importable"})
+            await self.emit("error", {"message": "catboost_strategy.py not importable"})
             return
 
         # Reset state
@@ -200,8 +213,8 @@ class MarketSimulator:
         end_dt = pd.Timestamp(end_date) + pd.Timedelta(days=1)
 
         # Get simulation candles
-        sim_mask = (self.df_2m_full['Time'] >= start_dt) & (self.df_2m_full['Time'] < end_dt)
-        df_sim = self.df_2m_full[sim_mask].reset_index(drop=True)
+        sim_mask = (self.df_1m_full['Time'] >= start_dt) & (self.df_1m_full['Time'] < end_dt)
+        df_sim = self.df_1m_full[sim_mask].reset_index(drop=True)
 
         if len(df_sim) == 0:
             await self.emit("error", {"message": f"No data for {start_date} to {end_date}"})
@@ -209,8 +222,14 @@ class MarketSimulator:
             return
 
         # Get warm-up candles
-        warmup_mask = self.df_2m_full['Time'] < start_dt
-        df_warmup = self.df_2m_full[warmup_mask].tail(warmup_candles).reset_index(drop=True)
+        warmup_mask = self.df_1m_full['Time'] < start_dt
+        df_warmup = self.df_1m_full[warmup_mask].tail(warmup_candles).reset_index(drop=True)
+
+        # Get 2-min warm-up
+        df_2m_warmup = pd.DataFrame()
+        if self.df_2m_full is not None:
+            warmup_2m_mask = self.df_2m_full['Time'] < start_dt
+            df_2m_warmup = self.df_2m_full[warmup_2m_mask].tail(warmup_candles).reset_index(drop=True)
 
         self.state.total_candles = len(df_sim)
 
@@ -237,7 +256,7 @@ class MarketSimulator:
 
         prev_date = None
 
-        # ── Main 2-min candle-by-candle loop ──
+        # ── Main candle-by-candle loop ──
         for i in range(len(df_sim)):
             if self._stop_requested:
                 break
@@ -280,18 +299,40 @@ class MarketSimulator:
             self.state.current_date = str(curr_date)
             prev_date = curr_date
 
-            # ── Build 2-min features using warm-up + candles seen so far ──
+            # ── Build features using warm-up + candles seen so far ──
             t_feat_start = time.perf_counter()
 
             df_today_so_far = df_sim.iloc[:i + 1].copy()
             df_combined = pd.concat([df_warmup, df_today_so_far], ignore_index=True)
 
-            features_df = build_features_2m(df_combined)
-            last_feat = features_df.iloc[-1]
+            feat_1m = build_features_1min(df_combined)
 
-            current_atr = float(last_feat.get('atr_2m', 0))
-            current_rsi = float(last_feat.get('rsi_2m', 50))
-            ut_dir = float(last_feat.get('ut_dir_2m', 0))
+            # Build 2-min features
+            if len(df_2m_warmup) > 0:
+                today_start = df_today_so_far['Time'].iloc[0]
+                df_2m_today = df_today_so_far.set_index('Time').resample(
+                    '2min', label='left', closed='left'
+                ).agg({
+                    'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
+                }).dropna().reset_index()
+
+                warmup_2m_filtered = df_2m_warmup[df_2m_warmup['Time'] < today_start]
+                df_2m_combined = pd.concat([warmup_2m_filtered, df_2m_today], ignore_index=True)
+            else:
+                df_2m_combined = df_combined.set_index('Time').resample(
+                    '2min', label='left', closed='left'
+                ).agg({
+                    'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
+                }).dropna().reset_index()
+
+            feat_2m = build_features_2min(df_2m_combined, df_combined)
+
+            all_features = pd.concat([feat_1m, feat_2m], axis=1)
+            last_feat = all_features.iloc[-1]
+
+            current_atr = float(last_feat.get('atr_1m', 0))
+            current_rsi = float(last_feat.get('rsi_1m', 50))
+            ut_dir = float(last_feat.get('ut_dir_1m', 0))
 
             if self.model_features and len(self.model_features) > 0:
                 feature_vector = [float(last_feat.get(f, 0)) for f in self.model_features]
@@ -389,7 +430,7 @@ class MarketSimulator:
                     val = 0
                 feature_data[col] = round(val, 4)
 
-            # ── Emit 2-min candle event ──
+            # ── Emit candle event ──
             await self.emit("candle", {
                 "index": i,
                 "total": len(df_sim),
