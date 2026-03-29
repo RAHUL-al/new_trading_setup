@@ -192,7 +192,10 @@ def build_features_2min(df_2m, df_1m):
     feat_2m['body_2m'] = (close_2m - df_2m['Open'].astype(float)).values
 
     # Merge to 1-min by time (forward fill)
-    feat_2m['Time'] = pd.to_datetime(feat_2m['Time'])
+    # SHIFT by 2 minutes to eliminate MTF Look-Ahead Bias!
+    # A 2-minute candle starting at 09:14 only completes at 09:16.
+    # We must only make its features visible at 09:16, NOT BEFORE.
+    feat_2m['Time'] = pd.to_datetime(feat_2m['Time']) + pd.Timedelta(minutes=2)
     df_1m_time = pd.DataFrame({'Time': pd.to_datetime(df_1m['Time'])})
 
     merged = pd.merge_asof(

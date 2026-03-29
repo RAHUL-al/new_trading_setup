@@ -15,25 +15,35 @@
 
     <style>
         :root {
-            --bg-primary: #0a0e17;
-            --bg-secondary: #111827;
-            --bg-card: #1a1f2e;
-            --bg-card-hover: #222839;
-            --border: #2a3040;
-            --text-primary: #e2e8f0;
-            --text-secondary: #94a3b8;
+            /* Light/Dark Mix Theme */
+            --bg-primary: #ffffff;       /* Chart background */
+            --bg-secondary: #f8fafc;     /* Right panel */
+            --bg-card: #f1f5f9;
+            --bg-card-hover: #e2e8f0;
+            --border: #e2e8f0;
+            
+            --text-primary: #0f172a;
+            --text-secondary: #475569;
             --text-muted: #64748b;
-            --accent: #6366f1;
-            --accent-glow: rgba(99, 102, 241, 0.3);
-            --green: #22c55e;
-            --green-bg: rgba(34, 197, 94, 0.1);
-            --red: #ef4444;
-            --red-bg: rgba(239, 68, 68, 0.1);
-            --yellow: #eab308;
-            --blue: #3b82f6;
-            --cyan: #06b6d4;
+            
+            /* Dark elements */
+            --dark-bg: #0f172a;
+            --dark-panel: #1e293b;
+            --dark-border: #334155;
+            --dark-text: #f8fafc;
+            --dark-text-muted: #94a3b8;
+
+            --accent: #4f46e5;
+            --accent-glow: rgba(79, 70, 229, 0.3);
+            --green: #16a34a;
+            --green-bg: rgba(22, 163, 74, 0.15);
+            --red: #dc2626;
+            --red-bg: rgba(220, 38, 38, 0.15);
+            --yellow: #d97706;
+            --blue: #2563eb;
+            --cyan: #0891b2;
             --radius: 12px;
-            --shadow: 0 4px 24px rgba(0,0,0,0.3);
+            --shadow: 0 4px 24px rgba(0,0,0,0.1);
         }
 
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -52,12 +62,12 @@
             align-items: center;
             justify-content: space-between;
             padding: 16px 24px;
-            background: var(--bg-secondary);
-            border-bottom: 1px solid var(--border);
+            background: var(--dark-bg);
+            color: var(--dark-text);
+            border-bottom: 1px solid var(--dark-border);
             position: sticky;
             top: 0;
             z-index: 100;
-            backdrop-filter: blur(12px);
         }
 
         .header-left {
@@ -98,8 +108,8 @@
             align-items: center;
             gap: 12px;
             padding: 12px 24px;
-            background: var(--bg-secondary);
-            border-bottom: 1px solid var(--border);
+            background: var(--dark-panel);
+            border-bottom: 1px solid var(--dark-border);
         }
 
         .control-group {
@@ -116,10 +126,10 @@
             letter-spacing: 0.5px;
         }
 
-        input[type="date"], select {
-            background: var(--bg-card);
-            border: 1px solid var(--border);
-            color: var(--text-primary);
+        input[type="date"], input[type="number"], select {
+            background: var(--dark-bg);
+            border: 1px solid var(--dark-border);
+            color: var(--dark-text);
             padding: 8px 12px;
             border-radius: 8px;
             font-family: 'Inter', sans-serif;
@@ -359,7 +369,8 @@
         /* ── Bottom Panel: Logs + Process ── */
         .bottom-panel {
             grid-column: span 2;
-            background: var(--bg-secondary);
+            background: var(--dark-bg);
+            color: var(--dark-text);
             display: flex;
             height: 220px;
         }
@@ -368,7 +379,7 @@
             flex: 1;
             display: flex;
             flex-direction: column;
-            border-right: 1px solid var(--border);
+            border-right: 1px solid var(--dark-border);
         }
 
         .bottom-section:last-child { border-right: none; }
@@ -378,14 +389,14 @@
             align-items: center;
             justify-content: space-between;
             padding: 8px 16px;
-            background: var(--bg-card);
-            border-bottom: 1px solid var(--border);
+            background: var(--dark-panel);
+            border-bottom: 1px solid var(--dark-border);
         }
 
         .bottom-header h3 {
             font-size: 11px;
             font-weight: 600;
-            color: var(--text-muted);
+            color: var(--dark-text-muted);
             text-transform: uppercase;
             letter-spacing: 1px;
         }
@@ -480,8 +491,42 @@
         /* ── Scrollbar ── */
         ::-webkit-scrollbar { width: 6px; }
         ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+        ::-webkit-scrollbar-thumb { background: var(--text-muted); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-secondary); }
+
+        /* ── Mobile Responsiveness ── */
+        @media (max-width: 900px) {
+            .header { padding: 12px; flex-wrap: wrap; }
+            .header-left { margin-bottom: 12px; width: 100%; justify-content: space-between; }
+            .controls { flex-wrap: wrap; padding: 12px; gap: 10px; }
+            .control-group { flex: 1 1 40%; flex-wrap: wrap; }
+            .btn { flex: 1 1 100%; justify-content: center; }
+            
+            .main {
+                display: flex;
+                flex-direction: column;
+                height: auto;
+            }
+            .chart-area {
+                height: 450px;
+                width: 100%;
+                border-bottom: 1px solid var(--border);
+            }
+            .right-panel {
+                width: 100%;
+                max-height: 600px;
+            }
+            .bottom-panel {
+                flex-direction: column;
+                height: auto;
+            }
+            .bottom-section { 
+                border-right: none; 
+                border-bottom: 1px solid var(--dark-border); 
+                height: 300px; 
+            }
+            .timing-grid { flex-wrap: wrap; }
+        }
 
         /* ── Tab bar ── */
         .tab-bar {
@@ -757,27 +802,27 @@ const chart = LightweightCharts.createChart(chartContainer, {
     width: chartContainer.clientWidth,
     height: chartContainer.clientHeight,
     layout: {
-        background: { color: '#0a0e17' },
-        textColor: '#94a3b8',
+        background: { color: '#ffffff' },
+        textColor: '#475569',
         fontSize: 12,
         fontFamily: 'Inter',
     },
     grid: {
-        vertLines: { color: 'rgba(42, 48, 64, 0.5)' },
-        horzLines: { color: 'rgba(42, 48, 64, 0.5)' },
+        vertLines: { color: '#f1f5f9' },
+        horzLines: { color: '#f1f5f9' },
     },
     crosshair: {
         mode: LightweightCharts.CrosshairMode.Normal,
-        vertLine: { color: 'rgba(99, 102, 241, 0.4)', labelBackgroundColor: '#6366f1' },
-        horzLine: { color: 'rgba(99, 102, 241, 0.4)', labelBackgroundColor: '#6366f1' },
+        vertLine: { color: 'rgba(79, 70, 229, 0.4)', labelBackgroundColor: '#4f46e5' },
+        horzLine: { color: 'rgba(79, 70, 229, 0.4)', labelBackgroundColor: '#4f46e5' },
     },
     timeScale: {
-        borderColor: '#2a3040',
+        borderColor: '#e2e8f0',
         timeVisible: true,
         secondsVisible: false,
     },
     rightPriceScale: {
-        borderColor: '#2a3040',
+        borderColor: '#e2e8f0',
     },
 });
 
