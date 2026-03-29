@@ -857,9 +857,23 @@ function handleEvent(type, data) {
         case 'sim_start': handleSimStart(data); break;
         case 'sim_end': handleSimEnd(data); break;
         case 'day_change': handleDayChange(data); break;
+        case 'warmup_data': handleWarmup(data); break;
         case 'error': addLog(`❌ ${data.message}`, 'error'); break;
         case 'pong': break; // keepalive
     }
+}
+
+function handleWarmup(data) {
+    if (!data || data.length === 0) return;
+    const formattedData = data.map(d => ({
+        time: Math.floor(new Date(d.time.replace(' ', 'T') + 'Z').getTime() / 1000),
+        open: d.open,
+        high: d.high,
+        low: d.low,
+        close: d.close,
+    }));
+    candleSeries.setData(formattedData);
+    addLog(`📦 Loaded ${formattedData.length} warm-up candles into chart cache`, 'info');
 }
 
 function handleCandle(d) {

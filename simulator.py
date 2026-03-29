@@ -233,6 +233,19 @@ class MarketSimulator:
 
         self.state.total_candles = len(df_sim)
 
+        # Broadcast warm-up candles to the dashboard
+        warmup_payload = [
+            {
+                "time": row["Time"].isoformat(),
+                "open": float(row["Open"]),
+                "high": float(row["High"]),
+                "low": float(row["Low"]),
+                "close": float(row["Close"]),
+            }
+            for row in df_warmup.to_dict('records')
+        ]
+        await self.emit("warmup_data", warmup_payload)
+
         await self.emit("sim_start", {
             "start_date": start_date,
             "end_date": end_date,
