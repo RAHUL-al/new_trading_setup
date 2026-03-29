@@ -15,35 +15,37 @@
 
     <style>
         :root {
-            /* Light/Dark Mix Theme */
-            --bg-primary: #ffffff;       /* Chart background */
-            --bg-secondary: #f8fafc;     /* Right panel */
-            --bg-card: #f1f5f9;
-            --bg-card-hover: #e2e8f0;
-            --border: #e2e8f0;
+            /* Premium Obsidian Dark Theme */
+            --bg-primary: #040812;       /* Deep space background for Chart */
+            --bg-secondary: #0a101f;     /* Right/Bottom panels background */
+            --bg-card: #111a2e;          /* Cards & active elements */
+            --bg-card-hover: #1b263e;
             
-            --text-primary: #0f172a;
-            --text-secondary: #475569;
-            --text-muted: #64748b;
+            --border: rgba(255, 255, 255, 0.08); /* Very soft invisible edges */
             
-            /* Dark elements */
-            --dark-bg: #0f172a;
-            --dark-panel: #1e293b;
-            --dark-border: #334155;
-            --dark-text: #f8fafc;
-            --dark-text-muted: #94a3b8;
+            --text-primary: #f8fafc;     /* Bright text */
+            --text-secondary: #94a3b8;   /* Muted text */
+            --text-muted: #64748b;       /* Deeply muted */
+            
+            /* Unify older dark attributes */
+            --dark-bg: var(--bg-primary);
+            --dark-panel: var(--bg-secondary);
+            --dark-border: var(--border);
+            --dark-text: var(--text-primary);
+            --dark-text-muted: var(--text-muted);
 
-            --accent: #4f46e5;
-            --accent-glow: rgba(79, 70, 229, 0.3);
-            --green: #16a34a;
-            --green-bg: rgba(22, 163, 74, 0.15);
-            --red: #dc2626;
-            --red-bg: rgba(220, 38, 38, 0.15);
-            --yellow: #d97706;
-            --blue: #2563eb;
-            --cyan: #0891b2;
-            --radius: 12px;
-            --shadow: 0 4px 24px rgba(0,0,0,0.1);
+            /* Vibrant neon accents */
+            --accent: #3b82f6;           /* Vivid blue */
+            --accent-glow: rgba(59, 130, 246, 0.35);
+            --green: #00e676;            /* Neon green */
+            --green-bg: rgba(0, 230, 118, 0.12);
+            --red: #ff3366;              /* Neon red/pink */
+            --red-bg: rgba(255, 51, 102, 0.12);
+            --yellow: #facc15;
+            --cyan: #00f2fe;             /* Neon cyan */
+            
+            --radius: 6px;               /* Sharper corners feel more professional */
+            --shadow: 0 4px 20px rgba(0, 0, 0, 0.5); /* Deep shadows */
         }
 
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -802,37 +804,37 @@ const chart = LightweightCharts.createChart(chartContainer, {
     width: chartContainer.clientWidth,
     height: chartContainer.clientHeight,
     layout: {
-        background: { color: '#ffffff' },
-        textColor: '#475569',
+        background: { type: 'solid', color: '#040812' },
+        textColor: '#94a3b8',
         fontSize: 12,
         fontFamily: 'Inter',
     },
     grid: {
-        vertLines: { color: '#f1f5f9' },
-        horzLines: { color: '#f1f5f9' },
+        vertLines: { color: 'rgba(255, 255, 255, 0.04)' },
+        horzLines: { color: 'rgba(255, 255, 255, 0.04)' },
     },
     crosshair: {
         mode: LightweightCharts.CrosshairMode.Normal,
-        vertLine: { color: 'rgba(79, 70, 229, 0.4)', labelBackgroundColor: '#4f46e5' },
-        horzLine: { color: 'rgba(79, 70, 229, 0.4)', labelBackgroundColor: '#4f46e5' },
+        vertLine: { color: 'rgba(59, 130, 246, 0.4)', labelBackgroundColor: '#3b82f6' },
+        horzLine: { color: 'rgba(59, 130, 246, 0.4)', labelBackgroundColor: '#3b82f6' },
     },
     timeScale: {
-        borderColor: '#e2e8f0',
+        borderColor: 'rgba(255, 255, 255, 0.08)',
         timeVisible: true,
         secondsVisible: false,
     },
     rightPriceScale: {
-        borderColor: '#e2e8f0',
+        borderColor: 'rgba(255, 255, 255, 0.08)',
     },
 });
 
 const candleSeries = chart.addCandlestickSeries({
-    upColor: '#22c55e',
-    downColor: '#ef4444',
-    borderUpColor: '#22c55e',
-    borderDownColor: '#ef4444',
-    wickUpColor: '#22c55e88',
-    wickDownColor: '#ef444488',
+    upColor: '#00e676',
+    downColor: '#ff3366',
+    borderUpColor: '#00e676',
+    borderDownColor: '#ff3366',
+    wickUpColor: '#00e67688',
+    wickDownColor: '#ff336688',
 });
 
 const slLine = chart.addLineSeries({
