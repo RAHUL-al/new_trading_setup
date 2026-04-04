@@ -35,7 +35,9 @@ except ImportError:
 
 
 # ─────────── Config ───────────
-FIXED_SL_PTS = 15.0               # Fixed trailing stop loss points
+ATR_PERIOD = 14
+ATR_KEY_VALUE = 1.0
+MIN_ATR = 6.5
 
 ENTRY_START = dt_time(9, 20)      # 9:20 AM
 ENTRY_END = dt_time(15, 15)       # 3:15 PM
@@ -52,6 +54,67 @@ TRAIN_END_YEAR = 2024             # Train: 2019-2024
 TEST_START_YEAR = 2025            # Test: 2025-2026
 
 
+# ─────────── Indicators ───────────
+
+def calc_rma(series, period):
+    return series.ewm(alpha=1/period, adjust=False).mean()
+
+
+def calc_atr(df, period=14):
+    h = df['High'].astype(float)
+    l = df['Low'].astype(float)
+    c = df['Close'].astype(float)
+    tr1 = h - l
+    tr2 = (h - c.shift(1)).abs()
+    tr3 = (l - c.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    tr.iloc[0] = tr1.iloc[0]
+    return calc_rma(tr, period)
+
+
+def calc_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = (-delta).where(delta < 0, 0.0)
+    avg_gain = calc_rma(gain, period)
+    avg_loss = calc_rma(loss, period)
+    rs = avg_gain / avg_loss.replace(0, 1e-10)
+    return 100 - (100 / (1 + rs))
+
+
+def calc_ut_bot_direction(close, atr, key_value=1.0):
+    """Returns trail_stop and direction arrays."""
+    n = len(close)
+    trail_stop = np.zeros(n)
+    direction = np.zeros(n)
+    trail_stop[0] = close[0]
+    direction[0] = 1
+
+    for i in range(1, n):
+        nloss = atr[i] * key_value
+        prev_ts = trail_stop[i-1]
+        prev_dir = direction[i-1]
+
+        if prev_dir == 1:
+            new_ts = close[i] - nloss
+            trail_stop[i] = max(new_ts, prev_ts)
+            if close[i] < trail_stop[i]:
+                direction[i] = -1
+                trail_stop[i] = close[i] + nloss
+            else:
+                direction[i] = 1
+        else:
+            new_ts = close[i] + nloss
+            trail_stop[i] = min(new_ts, prev_ts)
+            if close[i] > trail_stop[i]:
+                direction[i] = 1
+                trail_stop[i] = close[i] - nloss
+            else:
+                direction[i] = -1
+
+    return trail_stop, direction
+
+
 # ─────────── Feature Engineering ───────────
 
 def build_features_1min(df):
@@ -61,7 +124,15 @@ def build_features_1min(df):
     low = df['Low'].astype(float)
     opn = df['Open'].astype(float)
 
+    atr = calc_atr(df, ATR_PERIOD)
+    rsi = calc_rsi(close, 14)
+    trail, dirn = calc_ut_bot_direction(close.values, atr.values, ATR_KEY_VALUE)
+
     features = pd.DataFrame(index=df.index)
+    features['atr_1m'] = atr
+    features['rsi_1m'] = rsi
+    features['ut_dir_1m'] = dirn
+    features['close_vs_trail_1m'] = close.values - trail
 
     # Price momentum
     features['mom_3'] = close.pct_change(3) * 100
@@ -105,8 +176,16 @@ def build_features_2min(df_2m, df_1m):
     high_2m = df_2m['High'].astype(float)
     low_2m = df_2m['Low'].astype(float)
 
+    atr_2m = calc_atr(df_2m, ATR_PERIOD)
+    rsi_2m = calc_rsi(close_2m, 14)
+    trail_2m, dir_2m = calc_ut_bot_direction(close_2m.values, atr_2m.values, ATR_KEY_VALUE)
+
     feat_2m = pd.DataFrame(index=df_2m.index)
     feat_2m['Time'] = df_2m['Time']
+    feat_2m['atr_2m'] = atr_2m.values
+    feat_2m['rsi_2m'] = rsi_2m.values
+    feat_2m['ut_dir_2m'] = dir_2m
+    feat_2m['close_vs_trail_2m'] = close_2m.values - trail_2m
     feat_2m['mom_3_2m'] = close_2m.pct_change(3).values * 100
     feat_2m['mom_5_2m'] = close_2m.pct_change(5).values * 100
     feat_2m['range_2m'] = (high_2m - low_2m).values
@@ -156,7 +235,7 @@ def generate_labels(df, lookahead=5, threshold=8.0):
 
 # ─────────── Backtest ───────────
 
-def backtest_predictions(df, predictions):
+def backtest_predictions(df, predictions, atr_vals):
     """Backtest using CatBoost predictions as signals."""
     close = df['Close'].astype(float)
     high_v = df['High'].astype(float)
@@ -178,6 +257,7 @@ def backtest_predictions(df, predictions):
         c = float(close.iloc[i])
         h = float(high_v.iloc[i])
         l = float(low_v.iloc[i])
+        curr_atr = float(atr_vals[i])
 
         # Day boundary
         if prev_date and curr_date != prev_date:
@@ -241,11 +321,11 @@ def backtest_predictions(df, predictions):
         # Trail SL update
         if pos:
             if pos['dir'] == "LONG":
-                new_sl = c - FIXED_SL_PTS
+                new_sl = c - curr_atr * ATR_KEY_VALUE
                 if new_sl > pos['sl']:
                     pos['sl'] = new_sl
             elif pos['dir'] == "SHORT":
-                new_sl = c + FIXED_SL_PTS
+                new_sl = c + curr_atr * ATR_KEY_VALUE
                 if new_sl < pos['sl']:
                     pos['sl'] = new_sl
 
@@ -265,13 +345,13 @@ def backtest_predictions(df, predictions):
             pos = None
 
         # New entry
-        if not pos and in_window:
+        if not pos and in_window and curr_atr >= MIN_ATR:
             if pred == 1:
-                sl = c - FIXED_SL_PTS
+                sl = c - curr_atr * ATR_KEY_VALUE
                 pos = {'dir': 'LONG', 'entry': c, 'sl': sl, 'initial_sl': sl,
                        'entry_time': df.iloc[i]['Time'], 'entry_idx': i}
             elif pred == -1:
-                sl = c + FIXED_SL_PTS
+                sl = c + curr_atr * ATR_KEY_VALUE
                 pos = {'dir': 'SHORT', 'entry': c, 'sl': sl, 'initial_sl': sl,
                        'entry_time': df.iloc[i]['Time'], 'entry_idx': i}
 
@@ -458,12 +538,13 @@ def print_detailed_daily_log(all_trades, daily_results, log_file="catboost_detai
 # ─────────── Main ───────────
 
 def main():
-    global FIXED_SL_PTS, LOOKAHEAD, THRESHOLD, ENTRY_START, ENTRY_END, SQUARE_OFF
+    global ATR_KEY_VALUE, MIN_ATR, LOOKAHEAD, THRESHOLD, ENTRY_START, ENTRY_END, SQUARE_OFF
 
     parser = argparse.ArgumentParser(description="CatBoost ML Strategy (NIFTY)")
     parser.add_argument("--file-1m", default="nifty_1min_data.csv", help="1-min data")
     parser.add_argument("--file-2m", default="nifty_2min_data.csv", help="2-min data")
-    parser.add_argument("--fixed-sl", type=float, default=FIXED_SL_PTS, help="Fixed trailing SL points")
+    parser.add_argument("--atr-key", type=float, default=ATR_KEY_VALUE)
+    parser.add_argument("--min-atr", type=float, default=MIN_ATR)
     parser.add_argument("--lookahead", type=int, default=LOOKAHEAD, help="Candles to look ahead for labeling")
     parser.add_argument("--threshold", type=float, default=THRESHOLD, help="Min pts for buy/sell label")
     parser.add_argument("--window-start", type=str, default="09:20", help="Entry window start (HH:MM, default: 09:20)")
@@ -472,7 +553,8 @@ def main():
     parser.add_argument("--test-from", type=str, default="2025-01-01", help="Test data start date (YYYY-MM-DD, default: 2025-01-01)")
     args = parser.parse_args()
 
-    FIXED_SL_PTS = args.fixed_sl
+    ATR_KEY_VALUE = args.atr_key
+    MIN_ATR = args.min_atr
     LOOKAHEAD = args.lookahead
     THRESHOLD = args.threshold
 
@@ -519,7 +601,7 @@ def main():
     print(f"Date range: {df_1m['Time'].iloc[0].strftime('%Y-%m-%d')} → {df_1m['Time'].iloc[-1].strftime('%Y-%m-%d')}")
 
     print(f"\n🤖 CATBOOST ML STRATEGY")
-    print(f"Fixed SL: {FIXED_SL_PTS} pts")
+    print(f"ATR: RMA({ATR_PERIOD}) × {ATR_KEY_VALUE} | Min ATR: {MIN_ATR}")
     print(f"Window: {ENTRY_START.strftime('%H:%M')} - {ENTRY_END.strftime('%H:%M')} | Square off: {SQUARE_OFF.strftime('%H:%M')}")
     print(f"Lookahead: {LOOKAHEAD} candles | Threshold: {THRESHOLD} pts")
     print(f"Train: 2019-{TRAIN_END_YEAR} | Test: {TEST_START_YEAR}-2026")
@@ -616,6 +698,9 @@ def main():
     full_predictions = np.zeros(len(df_1m), dtype=int)
     full_predictions[test_mask] = test_pred
 
+    # ── ATR for backtest ──
+    atr_vals = calc_atr(df_1m, ATR_PERIOD).values
+
     # ── Backtest on test set ──
     print(f"\n🚀 Running backtest on TEST data ({args.test_from} onwards)...")
     test_start = min(test_dates_set)
@@ -623,8 +708,9 @@ def main():
     test_df_mask = dates >= test_from_date
     df_test = df_1m[test_df_mask].reset_index(drop=True)
     pred_test_full = full_predictions[test_df_mask]
+    atr_test = atr_vals[test_df_mask]
 
-    all_trades, daily_results = backtest_predictions(df_test, pred_test_full)
+    all_trades, daily_results = backtest_predictions(df_test, pred_test_full, atr_test)
 
     print_results(all_trades, daily_results, f"TEST ({test_start} → {test_end})")
     

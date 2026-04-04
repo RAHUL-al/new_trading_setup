@@ -25,6 +25,10 @@ try:
     from catboost_strategy import (
         build_features_1min,
         build_features_2min,
+        calc_atr,
+        calc_rma,
+        calc_rsi,
+        calc_ut_bot_direction,
     )
     HAS_BACKTEST = True
 except ImportError:
@@ -45,13 +49,16 @@ CSV_1M = os.environ.get("CSV_1M", os.path.join(PROJECT_ROOT, "nifty_1min_data.cs
 CSV_2M = os.environ.get("CSV_2M", os.path.join(PROJECT_ROOT, "nifty_2min_data.csv"))
 MODEL_PATH = os.environ.get("CATBOOST_MODEL", os.path.join(PROJECT_ROOT, "catboost_nifty_model.cbm"))
 
-FIXED_SL_PTS = 15.0
+ATR_PERIOD = 14
+ATR_KEY_VALUE = 1.0
+MIN_ATR = 6.5
 
 WINDOW_START = dt_time(9, 20)
 WINDOW_END = dt_time(15, 15)
 SQUARE_OFF_TIME = dt_time(15, 24)
 
 FEATURE_COLS_1M = [
+    'atr_1m', 'rsi_1m', 'ut_dir_1m', 'close_vs_trail_1m',
     'mom_3', 'mom_5', 'mom_10',
     'body_1m', 'body_pct_1m', 'upper_wick_1m', 'lower_wick_1m', 'range_1m',
     'std_5', 'std_10',
@@ -61,6 +68,7 @@ FEATURE_COLS_1M = [
 ]
 
 FEATURE_COLS_2M = [
+    'atr_2m', 'rsi_2m', 'ut_dir_2m', 'close_vs_trail_2m',
     'mom_3_2m', 'mom_5_2m', 'range_2m', 'body_2m',
 ]
 
@@ -322,9 +330,9 @@ class MarketSimulator:
             all_features = pd.concat([feat_1m, feat_2m], axis=1)
             last_feat = all_features.iloc[-1]
 
-            current_atr = 0.0
-            current_rsi = 50.0
-            ut_dir = 0.0
+            current_atr = float(last_feat.get('atr_1m', 0))
+            current_rsi = float(last_feat.get('rsi_1m', 50))
+            ut_dir = float(last_feat.get('ut_dir_1m', 0))
 
             if self.model_features and len(self.model_features) > 0:
                 feature_vector = [float(last_feat.get(f, 0)) for f in self.model_features]
@@ -343,7 +351,7 @@ class MarketSimulator:
             signal_name = signal_map.get(pred, "HOLD")
 
             in_window = WINDOW_START <= t <= WINDOW_END
-            atr_ok = True
+            atr_ok = current_atr >= MIN_ATR
 
             # ── Square off at 15:24 ──
             if self.state.position and t >= SQUARE_OFF_TIME:
@@ -364,11 +372,11 @@ class MarketSimulator:
             if self.state.position:
                 pos = self.state.position
                 if pos['dir'] == 'LONG':
-                    new_sl = close_price - FIXED_SL_PTS
+                    new_sl = close_price - current_atr * ATR_KEY_VALUE
                     if new_sl > pos['sl']:
                         pos['sl'] = new_sl
                 elif pos['dir'] == 'SHORT':
-                    new_sl = close_price + FIXED_SL_PTS
+                    new_sl = close_price + current_atr * ATR_KEY_VALUE
                     if new_sl < pos['sl']:
                         pos['sl'] = new_sl
 
@@ -381,15 +389,15 @@ class MarketSimulator:
                 await self.emit("trade_close", trade)
 
             # ── New entry ──
-            if not self.state.position and pred != 0 and in_window and t < SQUARE_OFF_TIME:
+            if not self.state.position and pred != 0 and in_window and atr_ok and t < SQUARE_OFF_TIME:
                 if pred == 1:
-                    sl = close_price - FIXED_SL_PTS
+                    sl = close_price - current_atr * ATR_KEY_VALUE
                     self.state.position = {
                         'dir': 'LONG', 'entry': close_price,
                         'sl': sl, 'entry_time': time_str,
                     }
                 elif pred == -1:
-                    sl = close_price + FIXED_SL_PTS
+                    sl = close_price + current_atr * ATR_KEY_VALUE
                     self.state.position = {
                         'dir': 'SHORT', 'entry': close_price,
                         'sl': sl, 'entry_time': time_str,

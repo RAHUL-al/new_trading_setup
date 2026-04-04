@@ -63,7 +63,14 @@ REDIS_PREFIX = os.environ.get("REDIS_PREFIX", "")
 NIFTY_SYMBOL = "NIFTY"
 MODEL_PATH = os.environ.get("CATBOOST_MODEL", "catboost_nifty_model.cbm")
 
-FIXED_SL_PTS = float(os.environ.get("FIXED_SL_PTS", "15.0"))
+# CSV paths for warm-up data (must match what backtest uses)
+CSV_1M = os.environ.get("CSV_1M", "nifty_1min_data.csv")
+CSV_2M = os.environ.get("CSV_2M", "nifty_2min_data.csv")
+WARMUP_CANDLES = 500  # Load last N candles from CSV for EWM convergence
+
+ATR_PERIOD = 14
+ATR_KEY_VALUE = 1.0
+MIN_ATR = float(os.environ.get("MIN_ATR", "6.5"))
 SIGNAL_COOLDOWN = 2  # seconds between signals (fast for ML)
 
 # Trading window (configurable via env)
@@ -81,6 +88,7 @@ INDIA_TZ = pytz.timezone("Asia/Kolkata")
 
 # Feature column names (must match training order exactly)
 FEATURE_COLS_1M = [
+    'atr_1m', 'rsi_1m', 'ut_dir_1m', 'close_vs_trail_1m',
     'mom_3', 'mom_5', 'mom_10',
     'body_1m', 'body_pct_1m', 'upper_wick_1m', 'lower_wick_1m', 'range_1m',
     'std_5', 'std_10',
@@ -90,17 +98,80 @@ FEATURE_COLS_1M = [
 ]
 
 FEATURE_COLS_2M = [
+    'atr_2m', 'rsi_2m', 'ut_dir_2m', 'close_vs_trail_2m',
     'mom_3_2m', 'mom_5_2m', 'range_2m', 'body_2m',
 ]
 
 ALL_FEATURE_COLS = FEATURE_COLS_1M + FEATURE_COLS_2M
 
 
+# ─────────── Indicator Functions (same as catboost_strategy.py) ───────────
+
+def calc_rma(series, period):
+    """RMA (Wilder's smoothed moving average)."""
+    return series.ewm(alpha=1/period, adjust=False).mean()
+
+
+def calc_atr(df, period=14):
+    h = df['High'].astype(float)
+    l = df['Low'].astype(float)
+    c = df['Close'].astype(float)
+    tr1 = h - l
+    tr2 = (h - c.shift(1)).abs()
+    tr3 = (l - c.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    tr.iloc[0] = tr1.iloc[0]
+    return calc_rma(tr, period)
+
+
+def calc_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = (-delta).where(delta < 0, 0.0)
+    avg_gain = calc_rma(gain, period)
+    avg_loss = calc_rma(loss, period)
+    rs = avg_gain / avg_loss.replace(0, 1e-10)
+    return 100 - (100 / (1 + rs))
+
+
+def calc_ut_bot_direction(close, atr, key_value=1.0):
+    """Returns trail_stop and direction arrays."""
+    n = len(close)
+    trail_stop = np.zeros(n)
+    direction = np.zeros(n)
+    trail_stop[0] = close[0]
+    direction[0] = 1
+
+    for i in range(1, n):
+        nloss = atr[i] * key_value
+        prev_ts = trail_stop[i-1]
+        prev_dir = direction[i-1]
+
+        if prev_dir == 1:
+            new_ts = close[i] - nloss
+            trail_stop[i] = max(new_ts, prev_ts)
+            if close[i] < trail_stop[i]:
+                direction[i] = -1
+                trail_stop[i] = close[i] + nloss
+            else:
+                direction[i] = 1
+        else:
+            new_ts = close[i] + nloss
+            trail_stop[i] = min(new_ts, prev_ts)
+            if close[i] > trail_stop[i]:
+                direction[i] = 1
+                trail_stop[i] = close[i] - nloss
+            else:
+                direction[i] = -1
+
+    return trail_stop, direction
+
+
 # ─────────── Feature Builder ───────────
 
 def build_all_features(df_1m, df_2m=None):
     """
-    Build all features from 1-min (and optional 2-min) DataFrame.
+    Build all 32 features from 1-min (and optional 2-min) DataFrame.
     Returns the feature row for the LAST candle only.
     """
     close = df_1m['Close'].astype(float)
@@ -108,8 +179,17 @@ def build_all_features(df_1m, df_2m=None):
     low = df_1m['Low'].astype(float)
     opn = df_1m['Open'].astype(float)
 
+    atr = calc_atr(df_1m, ATR_PERIOD)
+    rsi = calc_rsi(close, 14)
+    trail, dirn = calc_ut_bot_direction(close.values, atr.values, ATR_KEY_VALUE)
+
     features = {}
     i = len(df_1m) - 1  # last row
+
+    features['atr_1m'] = float(atr.iloc[i])
+    features['rsi_1m'] = float(rsi.iloc[i])
+    features['ut_dir_1m'] = float(dirn[i])
+    features['close_vs_trail_1m'] = float(close.iloc[i] - trail[i])
 
     # Momentum
     features['mom_3'] = float((close.iloc[i] / close.iloc[max(0, i-3)] - 1) * 100) if i >= 3 else 0
@@ -156,7 +236,15 @@ def build_all_features(df_1m, df_2m=None):
         low_2m = df_2m['Low'].astype(float)
         opn_2m = df_2m['Open'].astype(float)
 
+        atr_2m = calc_atr(df_2m, ATR_PERIOD)
+        rsi_2m = calc_rsi(close_2m, 14)
+        trail_2m, dir_2m = calc_ut_bot_direction(close_2m.values, atr_2m.values, ATR_KEY_VALUE)
+
         j = len(df_2m) - 1
+        features['atr_2m'] = float(atr_2m.iloc[j])
+        features['rsi_2m'] = float(rsi_2m.iloc[j])
+        features['ut_dir_2m'] = float(dir_2m[j])
+        features['close_vs_trail_2m'] = float(close_2m.iloc[j] - trail_2m[j])
         features['mom_3_2m'] = float((close_2m.iloc[j] / close_2m.iloc[max(0, j-3)] - 1) * 100) if j >= 3 else 0
         features['mom_5_2m'] = float((close_2m.iloc[j] / close_2m.iloc[max(0, j-5)] - 1) * 100) if j >= 5 else 0
         features['range_2m'] = float(high_2m.iloc[j] - low_2m.iloc[j])
@@ -165,7 +253,7 @@ def build_all_features(df_1m, df_2m=None):
         for col in FEATURE_COLS_2M:
             features[col] = 0.0
 
-    return features
+    return features, float(atr.iloc[-1]), float(trail[i])
 
 
 def resample_to_2min(df_1m):
@@ -185,6 +273,100 @@ def resample_to_2min(df_1m):
     }).dropna().reset_index()
 
     return resampled
+
+# ─────────── Pre-Market CSV Sync ───────────
+
+def pre_market_csv_sync():
+    """
+    Sync CSV data before trading starts.
+    Checks last date in CSV → fetches missing days → saves.
+    Returns cached DataFrame from CSV (last N candles for warm-up).
+    """
+    if not HAS_FETCH_MODULE:
+        logger.warning("⚠️ Pre-market sync skipped — fetch module not available")
+        return None
+
+    logger.info("=" * 60)
+    logger.info("📡 PRE-MARKET CSV SYNC")
+    logger.info("=" * 60)
+
+    try:
+        smart_api = api_connect()
+    except Exception as e:
+        logger.error(f"❌ API login failed for pre-market sync: {e}")
+        return None
+
+    # Sync 1-min data
+    config_1m = INTERVAL_CONFIG["ONE_MINUTE"]
+    output_file = config_1m["output_file"]
+
+    last_date = get_last_date_in_csv(output_file)
+    today = datetime.date.today()
+
+    if last_date and last_date >= today:
+        logger.info(f"  ✅ CSV already up to date (last: {last_date})")
+    else:
+        if last_date:
+            start_date = datetime.datetime.combine(last_date, datetime.datetime.min.time())
+            days_missing = (today - last_date).days
+            logger.info(f"  📅 Missing ~{days_missing} days (last: {last_date})")
+        else:
+            start_date = datetime.datetime.strptime(config_1m["from_date"], "%Y-%m-%d")
+            logger.info(f"  📅 No CSV — fetching from {config_1m['from_date']}")
+
+        # Fetch missing chunks
+        end_date = datetime.datetime.now()
+        chunks = get_date_chunks(start_date, end_date, config_1m["chunk_days"])
+        logger.info(f"  📥 Fetching {len(chunks)} chunk(s)...")
+
+        new_data = []
+        for i, (from_d, to_d) in enumerate(chunks):
+            logger.info(f"  [{i+1}/{len(chunks)}] {from_d} → {to_d}...")
+            df = api_fetch_candles(smart_api, from_d, to_d, config_1m["api_interval"])
+            if not df.empty:
+                new_data.append(df)
+                logger.info(f"    ✓ {len(df)} candles")
+            if i < len(chunks) - 1:
+                time.sleep(2)
+
+        if new_data:
+            new_combined = pd.concat(new_data, ignore_index=True)
+            new_combined["Time"] = pd.to_datetime(new_combined["Time"])
+            new_combined = filter_market_hours(new_combined)
+
+            # Merge with existing
+            if last_date and os.path.exists(output_file):
+                existing_df = pd.read_csv(output_file)
+                existing_df["Time"] = pd.to_datetime(existing_df["Time"])
+                existing_df = existing_df[existing_df["Time"].dt.date < last_date]
+                combined = pd.concat([existing_df, new_combined], ignore_index=True)
+            else:
+                combined = new_combined
+
+            combined = combined.drop_duplicates(subset=["Time"]).sort_values("Time").reset_index(drop=True)
+            combined.to_csv(output_file, index=False)
+            logger.info(f"  ✅ CSV synced: {len(combined):,} candles → {output_file}")
+        else:
+            logger.info("  ℹ️ No new data to sync")
+
+    # Load last 100 candles from CSV as warm-up cache
+    cached_df = None
+    if os.path.exists(output_file):
+        try:
+            full_csv = pd.read_csv(output_file)
+            full_csv["Time"] = pd.to_datetime(full_csv["Time"])
+            # Take last 100 candles for feature warm-up
+            tail = full_csv.tail(100).copy()
+            cached_df = tail.rename(columns={"Time": "timestamp"})
+            for col in ["Open", "High", "Low", "Close"]:
+                cached_df[col] = cached_df[col].astype(float)
+            logger.info(f"  📦 Loaded {len(cached_df)} candles from CSV for warm-up")
+        except Exception as e:
+            logger.warning(f"  ⚠️ Could not load CSV cache: {e}")
+
+    logger.info("=" * 60)
+    return cached_df
+
 
 # ─────────── Background Cross-Check ───────────
 
@@ -394,12 +576,15 @@ async def catboost_signal_engine():
     last_candle_count = 0
     last_status_log = 0
     cached_df_1m = None          # Cached today's DataFrame
+    cached_df_1m_warmup = None   # CSV warm-up data (loaded once)
+    cached_df_2m_warmup = None   # CSV 2-min warm-up data (loaded once)
     last_live_predict = 0
+    pre_market_synced = False
     cross_check_task = None
 
     logger.info(f"⚡ CatBoost signal engine started")
     logger.info(f"  Window: {WINDOW_START.strftime('%H:%M')} - {WINDOW_END.strftime('%H:%M')}")
-    logger.info(f"  Fixed SL: {FIXED_SL_PTS} pts")
+    logger.info(f"  Min ATR: {MIN_ATR}")
     logger.info(f"  Signal cooldown: {SIGNAL_COOLDOWN}s")
 
     async def do_close_position(exit_price, reason, exit_time_str):
@@ -458,6 +643,16 @@ async def catboost_signal_engine():
                 break
 
             if now_time < datetime.time(9, 20):
+                # ── Pre-market CSV sync (run once at ~9:17) ──
+                if not pre_market_synced and now_time >= datetime.time(9, 17):
+                    logger.info("🚀 Starting pre-market CSV sync...")
+                    csv_cache = await asyncio.get_event_loop().run_in_executor(None, pre_market_csv_sync)
+                    if csv_cache is not None:
+                        cached_df_1m = csv_cache
+                        logger.info(f"  📦 CSV warm-up cache loaded: {len(cached_df_1m)} candles")
+                    pre_market_synced = True
+                    logger.info("  ✅ Pre-market sync complete. Waiting for 09:20...")
+
                 if time.time() - last_status_log > 10:
                     logger.info(f"⏳ Waiting for 09:20 (now: {now_time.strftime('%H:%M:%S')})...")
                     last_status_log = time.time()
@@ -540,20 +735,69 @@ async def catboost_signal_engine():
 
             cached_df_1m = df_today.copy()
 
+            # ── Load CSV warm-up data (once, then cache) ──
+            if cached_df_1m_warmup is None and os.path.exists(CSV_1M):
+                try:
+                    csv_full = pd.read_csv(CSV_1M)
+                    csv_full['Time'] = pd.to_datetime(csv_full['Time']).dt.tz_localize(None)
+                    csv_full = csv_full.sort_values('Time').reset_index(drop=True)
+                    # Take last WARMUP_CANDLES rows (prior days' data for EWM convergence)
+                    cached_df_1m_warmup = csv_full.tail(WARMUP_CANDLES).reset_index(drop=True)
+                    logger.info(f"  📦 CSV warm-up loaded: {len(cached_df_1m_warmup)} candles from {CSV_1M}")
+                except Exception as e:
+                    logger.warning(f"  ⚠️ CSV warm-up load failed: {e}")
+                    cached_df_1m_warmup = pd.DataFrame()
+
+            if cached_df_2m_warmup is None and os.path.exists(CSV_2M):
+                try:
+                    csv_2m = pd.read_csv(CSV_2M)
+                    csv_2m['Time'] = pd.to_datetime(csv_2m['Time']).dt.tz_localize(None)
+                    csv_2m = csv_2m.sort_values('Time').reset_index(drop=True)
+                    cached_df_2m_warmup = csv_2m.tail(WARMUP_CANDLES).reset_index(drop=True)
+                    logger.info(f"  📦 CSV 2-min warm-up loaded: {len(cached_df_2m_warmup)} candles from {CSV_2M}")
+                except Exception as e:
+                    logger.warning(f"  ⚠️ CSV 2-min warm-up load failed: {e}")
+                    cached_df_2m_warmup = pd.DataFrame()
+
             # ── Build features using BACKTEST-IDENTICAL approach ──
             if HAS_BACKTEST_FEATURES:
-                feat_1m = build_features_1min(df_today)
+                # Prepend warm-up candles → EWM converges to same state as backtest
+                if cached_df_1m_warmup is not None and len(cached_df_1m_warmup) > 0:
+                    # Filter out any warm-up rows that overlap with today
+                    today_start = df_today['Time'].iloc[0]
+                    warmup_filtered = cached_df_1m_warmup[cached_df_1m_warmup['Time'] < today_start]
+                    df_combined = pd.concat([warmup_filtered, df_today], ignore_index=True)
+                else:
+                    df_combined = df_today.copy()
 
-                # Build 2-min features using today's resampled
-                df_2m_today = df_today.set_index('Time').resample('2min', label='left', closed='left').agg({
-                    'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
-                }).dropna().reset_index()
+                # Build 1-min features on COMBINED data (warm-up + today)
+                feat_1m = build_features_1min(df_combined)
+                n_combined = len(df_combined)
+                n_today = len(df_today)
 
-                feat_2m = build_features_2min(df_2m_today, df_today)
+                # Build 2-min features using CSV warm-up + today's resampled
+                if cached_df_2m_warmup is not None and len(cached_df_2m_warmup) > 0:
+                    # Resample only today's data to 2-min
+                    df_2m_today = df_today.set_index('Time').resample('2min', label='left', closed='left').agg({
+                        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
+                    }).dropna().reset_index()
+
+                    # Filter warm-up 2-min rows before today
+                    warmup_2m_filtered = cached_df_2m_warmup[cached_df_2m_warmup['Time'] < today_start]
+                    df_2m_combined = pd.concat([warmup_2m_filtered, df_2m_today], ignore_index=True)
+                else:
+                    # No 2-min CSV → resample from combined 1-min
+                    df_2m_combined = df_combined.set_index('Time').resample('2min', label='left', closed='left').agg({
+                        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
+                    }).dropna().reset_index()
+
+                feat_2m = build_features_2min(df_2m_combined, df_combined)
 
                 # Combine features and take ONLY the last row (= current candle)
                 all_features = pd.concat([feat_1m, feat_2m], axis=1)
                 last_feat = all_features.iloc[-1]
+
+                current_atr = float(last_feat.get('atr_1m', 0))
 
                 if model_features and len(model_features) > 0:
                     feature_vector = [float(last_feat.get(f, 0)) for f in model_features]
@@ -561,17 +805,19 @@ async def catboost_signal_engine():
                     feature_vector = [float(last_feat.get(f, 0)) for f in ALL_FEATURE_COLS]
                 feature_vector = [0 if (v != v or abs(v) == float('inf')) else v for v in feature_vector]
 
-                logger.info(f"  📐 Features: backtest-identical built on {len(df_today)} candles")
+                logger.info(f"  📐 Features: backtest-identical | ATR={current_atr:.2f} | warmup={n_combined - n_today} + today={n_today}")
             else:
                 # Fallback: use built-in feature builder (no warm-up)
                 df_2m = resample_to_2min(df_today)
-                features = build_all_features(df_today, df_2m)
+                features, current_atr, trail_stop = build_all_features(df_today, df_2m)
 
                 if model_features and len(model_features) > 0:
                     feature_vector = [features.get(f, 0) for f in model_features]
                 else:
                     feature_vector = [features.get(f, 0) for f in ALL_FEATURE_COLS]
                 feature_vector = [0 if (v != v or abs(v) == float('inf')) else v for v in feature_vector]
+
+            await ar.set(f"{REDIS_PREFIX}ATR_value", str(round(current_atr, 2)))
 
             last_row = df_today.iloc[-1]
             close_price = float(last_row["Close"])
@@ -594,6 +840,7 @@ async def catboost_signal_engine():
             t_elapsed = (time.perf_counter() - t_start) * 1000
 
             in_window = WINDOW_START <= now_time <= WINDOW_END
+            atr_ok = current_atr >= MIN_ATR
             now_ts = time.time()
 
             signal_map = {1: "BUY", -1: "SELL", 0: "HOLD"}
@@ -614,11 +861,11 @@ async def catboost_signal_engine():
             # ── Update trailing SL ──
             if position:
                 if position['dir'] == 'LONG':
-                    new_sl = close_price - FIXED_SL_PTS
+                    new_sl = close_price - current_atr * ATR_KEY_VALUE
                     if new_sl > position['sl']:
                         position['sl'] = new_sl
                 elif position['dir'] == 'SHORT':
-                    new_sl = close_price + FIXED_SL_PTS
+                    new_sl = close_price + current_atr * ATR_KEY_VALUE
                     if new_sl < position['sl']:
                         position['sl'] = new_sl
 
@@ -629,7 +876,7 @@ async def catboost_signal_engine():
                 await do_close_position(close_price, "OPPOSITE", candle_time)
 
             # ── New entry ──
-            if not position and pred != 0 and in_window and now_time < SQUARE_OFF_TIME:
+            if not position and pred != 0 and in_window and atr_ok and now_time < SQUARE_OFF_TIME:
                 if now_ts - last_signal_time > SIGNAL_COOLDOWN:
                     # Read active contract from Redis
                     contract_name = ""
@@ -657,21 +904,22 @@ async def catboost_signal_engine():
                             pass
 
                     if pred == 1:
-                        sl = close_price - FIXED_SL_PTS
+                        sl = close_price - current_atr * ATR_KEY_VALUE
                         position = {'dir': 'LONG', 'entry': close_price, 'sl': sl, 'entry_time': candle_time, 'contract': contract_name, 'contract_entry': contract_entry_price}
-                        logger.info(f"  🟢 ENTERED LONG @ {close_price:.2f} | SL={sl:.2f} | Contract={contract_name} @ ₹{contract_entry_price:.2f}")
+                        logger.info(f"  🟢 ENTERED LONG @ {close_price:.2f} | SL={sl:.2f} | ATR={current_atr:.2f} | Contract={contract_name} @ ₹{contract_entry_price:.2f}")
                         await save_state()
                     elif pred == -1:
-                        sl = close_price + FIXED_SL_PTS
+                        sl = close_price + current_atr * ATR_KEY_VALUE
                         position = {'dir': 'SHORT', 'entry': close_price, 'sl': sl, 'entry_time': candle_time, 'contract': contract_name, 'contract_entry': contract_entry_price}
-                        logger.info(f"  🔴 ENTERED SHORT @ {close_price:.2f} | SL={sl:.2f} | Contract={contract_name} @ ₹{contract_entry_price:.2f}")
+                        logger.info(f"  🔴 ENTERED SHORT @ {close_price:.2f} | SL={sl:.2f} | ATR={current_atr:.2f} | Contract={contract_name} @ ₹{contract_entry_price:.2f}")
                         await save_state()
 
             # ── Publish signals via Redis (for pos_handle_wts) ──
-            if pred != 0 and pred != last_prediction and in_window:
+            if pred != 0 and pred != last_prediction and in_window and atr_ok:
                 if now_ts - last_signal_time > SIGNAL_COOLDOWN:
                     signal_data = json.dumps({
                         "signal": "buy" if pred == 1 else "sell",
+                        "atr": round(current_atr, 2),
                         "source": "catboost",
                         "prediction": pred,
                         "latency_ms": round(t_elapsed, 1),
@@ -715,7 +963,7 @@ async def catboost_signal_engine():
 
             logger.info(
                 f"📊 {candle_time} | NIFTY={close_price:.2f} | "
-                f"Pred={signal_name} | "
+                f"Pred={signal_name} | ATR={current_atr:.2f} | "
                 f"Pos={pos_str} | {pos_detail}"
                 f"Trades={total_trades} (W:{wins} L:{losses} {wr:.0f}%) | "
                 f"Day P&L={live_pnl:+.2f} | {t_elapsed:.0f}ms"
