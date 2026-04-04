@@ -35,7 +35,7 @@ if os.name == "nt":
 
 PROCESS_MAP = {
     "websocket": {"script": "angleone_websocket1.py", "pid_file": "/tmp/trading_websocket.pid"},
-    "catboost": {"script": "catboost_live_engine", "pid_file": None},
+    "xgboost_lstm": {"script": "xgboost_lstm_live_engine", "pid_file": None},
     "pos_handler": {"script": "pos_handle_wts.py", "pid_file": "/tmp/trading_pos.pid"},
     "symbol_finder": {"script": "symbol_found.py", "pid_file": "/tmp/trading_symbol.pid"},
 }
@@ -100,7 +100,7 @@ def _get_log_file(process_name: str) -> Optional[str]:
     """Find the latest log file for a process."""
     name_map = {
         "websocket": "websocket_",
-        "catboost": "websocket_",  # catboost logs into websocket log
+        "xgboost_lstm": "websocket_",  # live engine logs into websocket log
         "pos_handler": "pos_handler_",
         "symbol_finder": "symbol_found_",
     }
@@ -161,7 +161,7 @@ async def start_simulation(
 
     _simulator = MarketSimulator(on_event=broadcast)
     if not _simulator.load_data():
-        return JSONResponse(status_code=404, content={"error": "CSV data or model not found"})
+        return JSONResponse(status_code=404, content={"error": f"CSV data or models not found"})
 
     # Run simulation in background task
     _sim_task = asyncio.create_task(

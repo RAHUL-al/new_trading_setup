@@ -1,7 +1,7 @@
 """
 simulator.py — Market Replay Simulator
 
-Replays historical CSV candle data through the CatBoost model one-by-one,
+Replays historical CSV candle data through the XGBoost+LSTM model one-by-one,
 simulating live trading. Designed to work with the dashboard via callbacks.
 
 Usage (standalone test):
@@ -16,38 +16,53 @@ import numpy as np
 import os
 import time
 import json
+import pickle
 import asyncio
+from collections import deque
 from datetime import datetime, time as dt_time
 from typing import Optional, Callable, Dict, Any, List
 
-# Import backtest-identical feature builders
+# ─── XGBoost + LSTM imports ───
 try:
-    from catboost_strategy import (
-        build_features_1min,
-        build_features_2min,
-        calc_atr,
-        calc_rma,
-        calc_rsi,
-        calc_ut_bot_direction,
+    from xgboost_lstm_strategy import (
+        build_features_1min as xgl_build_features_1min,
+        build_features_2min as xgl_build_features_2min,
+        calc_atr as xgl_calc_atr,
+        LSTMClassifier,
     )
-    HAS_BACKTEST = True
+    HAS_XGBOOST_STRATEGY = True
 except ImportError:
-    HAS_BACKTEST = False
-    print("⚠️  catboost_strategy.py not importable — features will be limited")
+    HAS_XGBOOST_STRATEGY = False
 
 try:
-    from catboost import CatBoostClassifier
-    HAS_CATBOOST = True
+    import xgboost as xgb
+    HAS_XGBOOST = True
 except ImportError:
-    HAS_CATBOOST = False
-    print("⚠️  CatBoost not installed")
+    HAS_XGBOOST = False
+
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+try:
+    from sklearn.preprocessing import StandardScaler
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
 
 
 # ─────────── Config ───────────
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 CSV_1M = os.environ.get("CSV_1M", os.path.join(PROJECT_ROOT, "nifty_1min_data.csv"))
 CSV_2M = os.environ.get("CSV_2M", os.path.join(PROJECT_ROOT, "nifty_2min_data.csv"))
-MODEL_PATH = os.environ.get("CATBOOST_MODEL", os.path.join(PROJECT_ROOT, "catboost_nifty_model.cbm"))
+
+# XGBoost + LSTM model paths
+XGB_MODEL_PATH = os.environ.get("XGB_MODEL", os.path.join(PROJECT_ROOT, "xgboost_nifty_model.json"))
+LSTM_MODEL_PATH = os.environ.get("LSTM_MODEL", os.path.join(PROJECT_ROOT, "lstm_nifty_model.pt"))
+SCALER_PATH = os.environ.get("SCALER_PATH", os.path.join(PROJECT_ROOT, "feature_scaler.pkl"))
+FEATURE_COLS_PATH = os.environ.get("FEATURE_COLS", os.path.join(PROJECT_ROOT, "feature_columns.pkl"))
 
 ATR_PERIOD = 14
 ATR_KEY_VALUE = 1.0
@@ -95,23 +110,47 @@ class SimulationState:
         self.candle_times: List[float] = []  # timing per candle
 
 
+def _ensemble_predict_single(xgb_pred, lstm_pred):
+    """Combine XGBoost and LSTM predictions for a single candle."""
+    if xgb_pred == lstm_pred:
+        return xgb_pred
+    elif xgb_pred != 0 and lstm_pred == 0:
+        return xgb_pred
+    elif xgb_pred == 0 and lstm_pred != 0:
+        return lstm_pred
+    else:
+        return 0  # Conflicting → HOLD
+
+
 class MarketSimulator:
     """
-    Replays historical candles through the CatBoost model,
+    Replays historical candles through XGBoost+LSTM models,
     streaming results via an async callback.
     """
 
     def __init__(self, on_event: Optional[Callable] = None):
         self.state = SimulationState()
         self.on_event = on_event  # async callback(event_type, data)
-        self.model = None
-        self.model_features = None
+
+        # XGBoost + LSTM models
+        self.xgb_model = None
+        self.lstm_model = None
+        self.scaler = None
+        self.feature_columns = ALL_FEATURE_COLS
+        self.lstm_seq_len = 20
+        self.lstm_feature_buffer = deque(maxlen=20)
+
+        # Data
         self.df_1m_full = None
         self.df_2m_full = None
         self._stop_requested = False
 
+        # Aliases for the active engine's feature builders
+        self._build_features_1min = None
+        self._build_features_2min = None
+
     def load_data(self):
-        """Load CSV data and model."""
+        """Load CSV data and model(s) based on selected engine."""
         if self.df_1m_full is not None:
             return True  # Already loaded
 
@@ -127,15 +166,71 @@ class MarketSimulator:
             self.df_2m_full['Time'] = pd.to_datetime(self.df_2m_full['Time']).dt.tz_localize(None)
             self.df_2m_full = self.df_2m_full.sort_values('Time').reset_index(drop=True)
 
-        # Load model
-        if HAS_CATBOOST and os.path.exists(MODEL_PATH):
-            self.model = CatBoostClassifier()
-            self.model.load_model(MODEL_PATH)
-            try:
-                self.model_features = self.model.feature_names_
-            except Exception:
-                self.model_features = None
+        return self._load_xgboost_lstm()
 
+    def _load_xgboost_lstm(self):
+        """Load XGBoost + LSTM models, scaler, and feature builders."""
+        if not HAS_XGBOOST_STRATEGY:
+            print("xgboost_lstm_strategy.py not importable")
+            return False
+
+        loaded_any = False
+
+        # XGBoost
+        if HAS_XGBOOST and os.path.exists(XGB_MODEL_PATH):
+            self.xgb_model = xgb.XGBClassifier()
+            self.xgb_model.load_model(XGB_MODEL_PATH)
+            print(f"XGBoost model loaded: {XGB_MODEL_PATH}")
+            loaded_any = True
+        else:
+            print(f"XGBoost model not found: {XGB_MODEL_PATH}")
+
+        # LSTM
+        if HAS_TORCH and os.path.exists(LSTM_MODEL_PATH):
+            try:
+                checkpoint = torch.load(LSTM_MODEL_PATH, map_location='cpu', weights_only=False)
+                input_size = checkpoint['input_size']
+                hidden_size = checkpoint['hidden_size']
+                num_layers = checkpoint['num_layers']
+                self.lstm_seq_len = checkpoint.get('seq_len', 20)
+                self.lstm_feature_buffer = deque(maxlen=self.lstm_seq_len)
+
+                self.lstm_model = LSTMClassifier(
+                    input_size=input_size,
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    dropout=0.0,
+                )
+                self.lstm_model.load_state_dict(checkpoint['model_state_dict'])
+                self.lstm_model.eval()
+                print(f"LSTM model loaded: {LSTM_MODEL_PATH} (seq_len={self.lstm_seq_len})")
+                loaded_any = True
+            except Exception as e:
+                print(f"LSTM model load failed: {e}")
+        else:
+            print(f"LSTM model not found: {LSTM_MODEL_PATH}")
+
+        # Scaler
+        if HAS_SKLEARN and os.path.exists(SCALER_PATH):
+            with open(SCALER_PATH, "rb") as f:
+                self.scaler = pickle.load(f)
+            print(f"Feature scaler loaded: {SCALER_PATH}")
+
+        # Feature columns
+        if os.path.exists(FEATURE_COLS_PATH):
+            with open(FEATURE_COLS_PATH, "rb") as f:
+                self.feature_columns = pickle.load(f)
+            print(f"Feature columns loaded: {len(self.feature_columns)} features")
+
+        self._build_features_1min = xgl_build_features_1min
+        self._build_features_2min = xgl_build_features_2min
+
+        if not loaded_any:
+            print("No XGBoost or LSTM model loaded!")
+            return False
+
+        print(f"Engine: XGBoost+LSTM loaded (XGB={'yes' if self.xgb_model else 'no'}, "
+              f"LSTM={'yes' if self.lstm_model else 'no'})")
         return True
 
     def get_available_dates(self) -> List[str]:
@@ -190,15 +285,15 @@ class MarketSimulator:
         Speed = candles per second (1 = real-time, 60 = fast).
         """
         if not self.load_data():
-            await self.emit("error", {"message": "CSV data not found"})
+            await self.emit("error", {"message": "CSV data or models not found"})
             return
 
-        if self.model is None:
-            await self.emit("error", {"message": "CatBoost model not found"})
+        if self.xgb_model is None and self.lstm_model is None:
+            await self.emit("error", {"message": "No XGBoost or LSTM model found"})
             return
 
-        if not HAS_BACKTEST:
-            await self.emit("error", {"message": "catboost_strategy.py not importable"})
+        if self._build_features_1min is None:
+            await self.emit("error", {"message": f"Feature builders not available"})
             return
 
         # Reset state
@@ -246,12 +341,16 @@ class MarketSimulator:
         ]
         await self.emit("warmup_data", warmup_payload)
 
+        # Reset LSTM buffer for fresh simulation
+        self.lstm_feature_buffer = deque(maxlen=self.lstm_seq_len)
+
         await self.emit("sim_start", {
             "start_date": start_date,
             "end_date": end_date,
             "total_candles": len(df_sim),
             "warmup_candles": len(df_warmup),
             "speed": speed,
+            "engine": "xgboost_lstm",
         })
 
         prev_date = None
@@ -305,7 +404,7 @@ class MarketSimulator:
             df_today_so_far = df_sim.iloc[:i + 1].copy()
             df_combined = pd.concat([df_warmup, df_today_so_far], ignore_index=True)
 
-            feat_1m = build_features_1min(df_combined)
+            feat_1m = self._build_features_1min(df_combined)
 
             # Build 2-min features
             if len(df_2m_warmup) > 0:
@@ -325,7 +424,7 @@ class MarketSimulator:
                     'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
                 }).dropna().reset_index()
 
-            feat_2m = build_features_2min(df_2m_combined, df_combined)
+            feat_2m = self._build_features_2min(df_2m_combined, df_combined)
 
             all_features = pd.concat([feat_1m, feat_2m], axis=1)
             last_feat = all_features.iloc[-1]
@@ -334,21 +433,45 @@ class MarketSimulator:
             current_rsi = float(last_feat.get('rsi_1m', 50))
             ut_dir = float(last_feat.get('ut_dir_1m', 0))
 
-            if self.model_features and len(self.model_features) > 0:
-                feature_vector = [float(last_feat.get(f, 0)) for f in self.model_features]
-            else:
-                feature_vector = [float(last_feat.get(f, 0)) for f in ALL_FEATURE_COLS]
+            # Build feature vector
+            feature_vector = [float(last_feat.get(f, 0)) for f in self.feature_columns]
             feature_vector = [0 if (v != v or abs(v) == float('inf')) else v for v in feature_vector]
 
             t_feat_elapsed = (time.perf_counter() - t_feat_start) * 1000
 
             # ── Predict ──
             t_pred_start = time.perf_counter()
-            pred = self.model.predict([feature_vector]).flatten()[0].item()
+            xgb_pred = 0
+            lstm_pred = 0
+
+            # ── XGBoost prediction ──
+            if self.xgb_model is not None:
+                xgb_raw = self.xgb_model.predict(np.array([feature_vector]))[0]
+                xgb_pred = int(xgb_raw) - 1  # unmap: 0->-1, 1->0, 2->1
+
+            # ── LSTM prediction ──
+            if self.lstm_model is not None and self.scaler is not None:
+                full_feature_row = np.array(feature_vector, dtype=np.float32)
+                scaled_row = self.scaler.transform(full_feature_row.reshape(1, -1))[0]
+                self.lstm_feature_buffer.append(scaled_row)
+
+                if len(self.lstm_feature_buffer) >= self.lstm_seq_len:
+                    seq_array = np.array(list(self.lstm_feature_buffer), dtype=np.float32)
+                    x_tensor = torch.FloatTensor(seq_array).unsqueeze(0)
+                    with torch.no_grad():
+                        output = self.lstm_model(x_tensor)
+                        pred_class = output.argmax(dim=1).item()
+                        lstm_pred = pred_class - 1  # unmap: 0->-1, 1->0, 2->1
+
+            # Ensemble
+            pred = _ensemble_predict_single(xgb_pred, lstm_pred)
+
             t_pred_elapsed = (time.perf_counter() - t_pred_start) * 1000
 
             signal_map = {1: "BUY", -1: "SELL", 0: "HOLD"}
             signal_name = signal_map.get(pred, "HOLD")
+            xgb_signal = signal_map.get(xgb_pred, "HOLD")
+            lstm_signal = signal_map.get(lstm_pred, "HOLD")
 
             in_window = WINDOW_START <= t <= WINDOW_END
             atr_ok = current_atr >= MIN_ATR
@@ -431,7 +554,7 @@ class MarketSimulator:
                 feature_data[col] = round(val, 4)
 
             # ── Emit candle event ──
-            await self.emit("candle", {
+            candle_event = {
                 "index": i,
                 "total": len(df_sim),
                 "time": candle_time.isoformat(),
@@ -443,6 +566,7 @@ class MarketSimulator:
                 "close": close_price,
                 "signal": signal_name,
                 "prediction": int(pred),
+                "engine": "xgboost_lstm",
                 "atr": round(current_atr, 2),
                 "rsi": round(current_rsi, 2),
                 "ut_dir": int(ut_dir),
@@ -464,7 +588,13 @@ class MarketSimulator:
                     "total_ms": round(t_candle_elapsed, 1),
                 },
                 "features": feature_data,
-            })
+            }
+
+            # Add XGBoost/LSTM sub-predictions for the ensemble engine
+            candle_event["xgb_signal"] = xgb_signal
+            candle_event["lstm_signal"] = lstm_signal
+
+            await self.emit("candle", candle_event)
 
             # ── Sleep to control replay speed ──
             if speed > 0:
@@ -526,18 +656,24 @@ if __name__ == "__main__":
             if data.get("position"):
                 p = data["position"]
                 pos_str = f" | {p['dir']} @ {p['entry']:.2f} SL={p['sl']:.2f} Unreal={p['unrealized']:+.2f}"
+
+            # Show sub-predictions for XGBoost+LSTM engine
+            engine_str = f" [XGB={data.get('xgb_signal','?')} LSTM={data.get('lstm_signal','?')}]"
+
             print(
                 f"[{data['time_str']}] NIFTY={data['close']:.2f} | "
-                f"{data['signal']} | ATR={data['atr']:.2f} | "
+                f"{data['signal']}{engine_str} | ATR={data['atr']:.2f} | "
                 f"RSI={data['rsi']:.1f}{pos_str} | "
                 f"P&L={data['daily_pnl']:+.2f} | "
                 f"{data['timing']['total_ms']:.0f}ms"
             )
         elif event_type == "trade_open":
-            print(f"  🟢 OPENED {data['dir']} @ {data['entry']:.2f} | SL={data['sl']:.2f}")
+            print(f"  OPENED {data['dir']} @ {data['entry']:.2f} | SL={data['sl']:.2f}")
         elif event_type == "trade_close":
-            icon = "✅" if data['pnl'] > 0 else "❌"
+            icon = "W" if data['pnl'] > 0 else "L"
             print(f"  {icon} CLOSED {data['dir']} | Entry={data['entry']:.2f} Exit={data['exit']:.2f} | P&L={data['pnl']:+.2f} | {data['reason']}")
+        elif event_type == "sim_start":
+            print(f"\nSimulation started: {data['start_date']} to {data['end_date']} | Engine: {data.get('engine', '?')}")
         elif event_type == "sim_end":
             print(f"\n{'='*60}")
             print(f"  SIMULATION COMPLETE")
@@ -546,9 +682,9 @@ if __name__ == "__main__":
             print(f"  Avg candle: {data['avg_candle_ms']:.1f}ms")
             print(f"{'='*60}")
         elif event_type == "day_change":
-            print(f"\n📅 Day: {data['date']} | P&L: {data['daily_pnl']:+.2f}")
+            print(f"\nDay: {data['date']} | P&L: {data['daily_pnl']:+.2f}")
         elif event_type == "error":
-            print(f"❌ {data['message']}")
+            print(f"ERROR: {data['message']}")
 
     sim = MarketSimulator(on_event=print_event)
     asyncio.run(sim.run_simulation(args.date, end, speed=args.speed))
