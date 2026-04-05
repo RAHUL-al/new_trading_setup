@@ -6,7 +6,7 @@
 #
 #   Execution Flow:
 #     08:55 → stocks_name.py → create_angleone_csv.py → fetch_nifty_incremental.py
-#     09:10 → symbol_found.py → angleone_websocket1.py (+ CatBoost) → pos_handle_wts.py
+#     09:10 → symbol_found.py → angleone_websocket1.py (+ ML Engine) → pos_handle_wts.py
 #     15:35 → kill all trading processes
 #     Sunday → cleanup old logs
 # ═══════════════════════════════════════════════════════════
@@ -14,7 +14,7 @@
 # 08:55 — Pre-market: Download stocks list, scrip master, sync NIFTY data
 55 8 * * 1-5 /bin/bash /root/Trading_setup_code/scripts/pre_market.sh
 
-# 09:10 — Start trading: symbol_found → websocket+catboost → pos_handler
+# 09:10 — Start trading: symbol_found → websocket+ML Engine → pos_handler
 10 9 * * 1-5 /bin/bash /root/Trading_setup_code/scripts/start_trading.sh
 
 # 15:35 — Stop all trading processes (market closes at 15:30)

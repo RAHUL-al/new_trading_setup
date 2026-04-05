@@ -670,8 +670,8 @@ def run_signal_engine():
 if __name__ == "__main__":
     load_tokens_from_csv()
 
-    # Import CatBoost live engine
-    from catboost_live_engine import run_catboost_engine
+    # Import XGBoost+LSTM live engine
+    from xgboost_lstm_live_engine import run_signal_engine
 
     # Wait until 9:14 AM (1 min before market open) if started early
     now = datetime.datetime.now(INDIA_TZ)
@@ -687,7 +687,7 @@ if __name__ == "__main__":
         logger.info("🔔 Starting all processes — market about to open!")
 
     P0 = Process(target=run_websocket)
-    P1 = Process(target=run_catboost_engine)  # CatBoost ML (replaces UT Bot)
+    P1 = Process(target=run_signal_engine)  # XGBoost+LSTM ML
     P2 = Process(target=market_close_cleanup)
 
     P0.start()

@@ -4,12 +4,12 @@
 #
 # Execution order:
 #   1. symbol_found.py         — Select CE/PE option contracts (background)
-#   2. angleone_websocket1.py  — WebSocket feeder + CatBoost ML engine (background)
-#      ↳ internally spawns: catboost_live_engine.py (as subprocess)
+#   2. angleone_websocket1.py  — WebSocket feeder + XGBoost/LSTM ML engine (background)
+#      ↳ internally spawns: xgboost_lstm_live_engine.py (as subprocess)
 #      ↳ internally spawns: market_close_cleanup (as subprocess)
 #   3. pos_handle_wts.py       — Paper trading bot / position handler (background)
 #
-# NOTE: catboost_live_engine.py does NOT need to be run separately.
+# NOTE: xgboost_lstm_live_engine.py does NOT need to be run separately.
 #       angleone_websocket1.py already launches it via multiprocessing.
 # ─────────────────────────────────────────────────────────
 
@@ -29,7 +29,7 @@ echo "========================================" >> "$LOGDIR/cron.log"
 pkill -f "angleone_websocket1.py" 2>/dev/null
 pkill -f "symbol_found.py" 2>/dev/null
 pkill -f "pos_handle_wts.py" 2>/dev/null
-pkill -f "catboost_live_engine" 2>/dev/null
+pkill -f "xgboost_lstm_live_engine" 2>/dev/null
 sleep 2
 
 # Process 1: Option contract selector (finds CE/PE in ₹200-250 range, stores in Redis)
@@ -41,15 +41,15 @@ echo "[$(date '+%H:%M:%S')] [1/3] Symbol finder started (PID: $SYM_PID)" >> "$LO
 
 sleep 3  # Give symbol_found time to populate Redis with CE/PE tokens
 
-# Process 2: WebSocket feeder + CatBoost engine + market close cleanup
+# Process 2: WebSocket feeder + XGBoost/LSTM engine + market close cleanup
 # This is the MAIN process — it internally spawns:
 #   P0: run_websocket()        — tick data → 1-min candles → Redis
-#   P1: run_catboost_engine()  — ML predictions → signals → Redis
+#   P1: run_signal_engine()    — ML predictions → signals → Redis
 #   P2: market_close_cleanup() — cleanup at 3:30 PM
 nohup python3 angleone_websocket1.py >> "$LOGDIR/websocket_${DATE}.log" 2>&1 &
 WS_PID=$!
 echo "$WS_PID" > /tmp/trading_websocket.pid
-echo "[$(date '+%H:%M:%S')] [2/3] WebSocket + CatBoost started (PID: $WS_PID)" >> "$LOGDIR/cron.log"
+echo "[$(date '+%H:%M:%S')] [2/3] WebSocket + ML Engine started (PID: $WS_PID)" >> "$LOGDIR/cron.log"
 
 sleep 5  # Let websocket connect and start building candles before pos handler
 
@@ -62,6 +62,6 @@ echo "[$(date '+%H:%M:%S')] [3/3] Position handler started (PID: $POS_PID)" >> "
 echo "" >> "$LOGDIR/cron.log"
 echo "  All trading processes running:" >> "$LOGDIR/cron.log"
 echo "    Symbol Finder              : PID $SYM_PID  (symbol_found.py)" >> "$LOGDIR/cron.log"
-echo "    WebSocket + CatBoost       : PID $WS_PID  (angleone_websocket1.py)" >> "$LOGDIR/cron.log"
+echo "    WebSocket + ML Engine      : PID $WS_PID  (angleone_websocket1.py)" >> "$LOGDIR/cron.log"
 echo "    Position Handler (Paper)   : PID $POS_PID  (pos_handle_wts.py)" >> "$LOGDIR/cron.log"
 echo "" >> "$LOGDIR/cron.log"

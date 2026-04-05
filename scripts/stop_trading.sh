@@ -15,7 +15,7 @@ echo "========================================" >> "$LOGDIR/cron.log"
 pkill -f "angleone_websocket1.py" 2>/dev/null
 pkill -f "symbol_found.py" 2>/dev/null
 pkill -f "pos_handle_wts.py" 2>/dev/null
-pkill -f "catboost_live_engine" 2>/dev/null
+pkill -f "xgboost_lstm_live_engine" 2>/dev/null
 
 sleep 3
 
@@ -23,7 +23,7 @@ sleep 3
 pkill -9 -f "angleone_websocket1.py" 2>/dev/null
 pkill -9 -f "symbol_found.py" 2>/dev/null
 pkill -9 -f "pos_handle_wts.py" 2>/dev/null
-pkill -9 -f "catboost_live_engine" 2>/dev/null
+pkill -9 -f "xgboost_lstm_live_engine" 2>/dev/null
 
 # Clean up PID files
 rm -f /tmp/trading_websocket.pid
