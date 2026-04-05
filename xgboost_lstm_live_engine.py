@@ -926,14 +926,16 @@ async def xgboost_lstm_signal_engine():
             # ── LSTM Prediction ──
             lstm_pred = 0
             if lstm_model is not None and scaler is not None:
-                # Add current feature to the rolling buffer
-                scaled_row = scaler.transform(full_feature_row.reshape(1, -1))[0]
-                lstm_feature_buffer.append(scaled_row)
-
-                # Only predict if we have enough history
-                if len(lstm_feature_buffer) >= seq_len:
-                    seq_array = np.array(list(lstm_feature_buffer), dtype=np.float32)
-                    x_tensor = torch.FloatTensor(seq_array).unsqueeze(0)
+                if len(all_features) >= seq_len:
+                    recent_features = all_features.iloc[-seq_len:]
+                    feature_matrix = []
+                    for _, row in recent_features.iterrows():
+                        vec = [float(row.get(f, 0)) for f in feature_columns]
+                        vec = [0 if (v != v or abs(v) == float('inf')) else v for v in vec]
+                        feature_matrix.append(vec)
+                        
+                    seq_scaled = scaler.transform(np.array(feature_matrix, dtype=np.float32))
+                    x_tensor = torch.FloatTensor(seq_scaled).unsqueeze(0)
                     with torch.no_grad():
                         output = lstm_model(x_tensor)
                         pred_class = output.argmax(dim=1).item()

@@ -31,29 +31,23 @@ REDIS_PREFIX = os.environ.get("REDIS_PREFIX", "")
 r = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, db=0, decode_responses=True)
 
 # TOTP_TOKEN = os.environ.get("ANGELONE_TOTP_SECRET", "33OUTDUE57WS3TUPHPLFUCGHFM")
-TOTP_TOKEN = os.environ.get("ANGELONE_TOTP_SECRET", "OIN6QBZAYV4I26Q55OYASIEQVY")
+TOTP_TOKEN = os.environ.get("ANGELONE_TOTP_SECRET", "33OUTDUE57WS3TUPHPLFUCGHFM")
 # API_KEY = os.environ.get("ANGELONE_API_KEY", "Ytt1NkKD")
-API_KEY = os.environ.get("ANGELONE_API_KEY", "SsUDlNA9")
+API_KEY = os.environ.get("ANGELONE_API_KEY", "7355")
 # CLIENT_ID = os.environ.get("ANGELONE_CLIENT_ID", "R865920")
-CLIENT_ID = os.environ.get("ANGELONE_CLIENT_ID", "A1079871")
+CLIENT_ID = os.environ.get("ANGELONE_CLIENT_ID", "R865920")
 # PWD = os.environ.get("ANGELONE_PASSWORD", "7355")
-PWD = os.environ.get("ANGELONE_PASSWORD", "0465")
+PWD = os.environ.get("ANGELONE_PASSWORD", "7355")
 CORRELATION_ID = f"user_{CLIENT_ID}"
 
 # ─────────── Credential Failover ───────────
 CREDENTIALS = [
     {
-        "totp": "OIN6QBZAYV4I26Q55OYASIEQVY",
-        "api_key": "SsUDlNA9",
-        "client_id": "A1079871",
-        "pwd": "0465",
-    },
-    {
         "totp": "33OUTDUE57WS3TUPHPLFUCGHFM",
-        "api_key": "Ytt1NkKD",
+        "api_key": "7355",
         "client_id": "R865920",
         "pwd": "7355",
-    },
+    }
 ]
 current_cred_index = 0
 
