@@ -105,9 +105,13 @@ class SimulationState:
         self.wins = 0
         self.losses = 0
         self.current_date = ""
-        self.start_date = ""
         self.end_date = ""
         self.candle_times: List[float] = []  # timing per candle
+
+        # Lot management
+        self.current_lots = 2
+        self.accumulated_loss = 0.0
+        self.recovering = False
 
 
 def _ensemble_predict_single(xgb_pred, lstm_pred):
@@ -254,15 +258,19 @@ class MarketSimulator:
             return {}
 
         if pos['dir'] == 'LONG':
-            pnl = exit_price - pos['entry']
+            raw_pnl = exit_price - pos['entry']
         else:
-            pnl = pos['entry'] - exit_price
+            raw_pnl = pos['entry'] - exit_price
+        
+        raw_pnl = round(raw_pnl, 2)
+        lot_multiplier = self.state.current_lots // 2
+        pnl = raw_pnl * lot_multiplier
         pnl = round(pnl, 2)
 
         self.state.daily_pnl += pnl
         if pnl > 0:
             self.state.wins += 1
-        else:
+        elif pnl < 0:
             self.state.losses += 1
 
         trade = {
@@ -273,6 +281,8 @@ class MarketSimulator:
             'exit_time': exit_time,
             'sl': round(pos['sl'], 2),
             'pnl': pnl,
+            'raw_pnl': raw_pnl,
+            'lots': self.state.current_lots,
             'reason': reason,
         }
         self.state.trades.append(trade)
@@ -385,6 +395,20 @@ class MarketSimulator:
                         df_sim.iloc[i - 1]['Time'].strftime('%H:%M')
                     )
                     await self.emit("trade_close", trade)
+
+                # ── Lot adjustment for Martingale recovery ──
+                if prev_date:
+                    day_pnl = self.state.daily_pnl
+                    if day_pnl < 0:
+                        self.state.accumulated_loss += day_pnl
+                        self.state.recovering = True
+                        self.state.current_lots += 2
+                    elif day_pnl > 0 and self.state.recovering:
+                        self.state.accumulated_loss += day_pnl
+                        if self.state.accumulated_loss >= 0:
+                            self.state.current_lots = 2
+                            self.state.accumulated_loss = 0.0
+                            self.state.recovering = False
 
                 await self.emit("day_change", {
                     "date": str(curr_date),
@@ -538,9 +562,10 @@ class MarketSimulator:
             unrealized = 0
             if self.state.position:
                 if self.state.position['dir'] == 'LONG':
-                    unrealized = close_price - self.state.position['entry']
+                    raw_unrealized = close_price - self.state.position['entry']
                 else:
-                    unrealized = self.state.position['entry'] - close_price
+                    raw_unrealized = self.state.position['entry'] - close_price
+                unrealized = raw_unrealized * (self.state.current_lots // 2)
 
             t_candle_elapsed = (time.perf_counter() - t_candle_start) * 1000
             self.state.candle_times.append(t_candle_elapsed)
@@ -655,7 +680,8 @@ if __name__ == "__main__":
             pos_str = ""
             if data.get("position"):
                 p = data["position"]
-                pos_str = f" | {p['dir']} @ {p['entry']:.2f} SL={p['sl']:.2f} Unreal={p['unrealized']:+.2f}"
+                lots = self.state.current_lots if hasattr(self, 'state') else 2
+                pos_str = f" | {p['dir']} ({lots} lots) @ {p['entry']:.2f} SL={p['sl']:.2f} Unreal={p['unrealized']:+.2f}"
 
             # Show sub-predictions for XGBoost+LSTM engine
             engine_str = f" [XGB={data.get('xgb_signal','?')} LSTM={data.get('lstm_signal','?')}]"
