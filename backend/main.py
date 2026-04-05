@@ -45,6 +45,16 @@ def health_check():
     return {"status": "ok", "message": "Trading Platform API is running"}
 
 
+@app.get("/api/model-metadata")
+def get_model_metadata():
+    import json
+    metadata_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "model_metadata.json")
+    if os.path.exists(metadata_path):
+        with open(metadata_path, "r") as f:
+            return json.load(f)
+    return {"error": "metadata not found"}
+
+
 # Serve dashboard at /dashboard
 DASHBOARD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "dashboard")
 if os.path.isdir(DASHBOARD_DIR):

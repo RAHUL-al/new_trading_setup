@@ -1085,6 +1085,20 @@ def main():
         pickle.dump(features.columns.tolist(), f)
     print(f"💾 Feature columns saved: feature_columns.pkl")
 
+    # ── Save Training Metadata ──
+    metadata = {
+        "train_samples": len(X_train),
+        "train_days": len(train_dates_set),
+        "train_up_to": args.test_from,
+        "test_samples": len(X_test),
+        "test_days": len(test_dates_set),
+        "test_from": args.test_from,
+        "last_trained_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    with open("model_metadata.json", "w") as f:
+        json.dump(metadata, f, indent=4)
+    print(f"💾 Training metadata saved: model_metadata.json")
+
 
 if __name__ == "__main__":
     main()

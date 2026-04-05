@@ -1,0 +1,9 @@
+{
+    "train_samples": 87778,
+    "train_days": 248,
+    "train_up_to": "2025-01-01",
+    "test_samples": 109720,
+    "test_days": 309,
+    "test_from": "2025-01-01",
+    "last_trained_date": "2026-04-05 06:14:00"
+}

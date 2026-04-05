@@ -668,6 +668,14 @@
             </div>
         </div>
 
+        <!-- Model Metadata -->
+        <div class="panel-section">
+            <div class="panel-title">🧠 Model Details</div>
+            <div id="modelDetails" style="font-size:11px; color:var(--text-secondary); line-height:1.6; font-family:'JetBrains Mono', monospace;">
+                Loading...
+            </div>
+        </div>
+
         <!-- Trades -->
         <div class="panel-section" style="flex:1;">
             <div class="panel-title">📋 Trade Log</div>
@@ -752,6 +760,30 @@ const WS_BASE = API_BASE.replace('http', 'ws');
 // ═══════════════════════════════════════════
 //  Chart Setup
 // ═══════════════════════════════════════════
+
+async function loadModelMetadata() {
+    try {
+        const res = await fetch(API_BASE + '/api/model-metadata');
+        const data = await res.json();
+        const detailsEl = document.getElementById('modelDetails');
+        if (data.error) {
+            detailsEl.innerText = "No model metadata found. Run xgboost_lstm_strategy.py first.";
+            return;
+        }
+        detailsEl.innerHTML = `
+            <div><b>Train Dates:</b> up to ${data.train_up_to}</div>
+            <div><b>Train Size:</b> ${data.train_samples.toLocaleString()} samples (${data.train_days} days)</div>
+            <div style="margin-top:6px;"><b>Test Dates:</b> ${data.test_from} onwards</div>
+            <div><b>Test Size:</b> ${data.test_samples.toLocaleString()} samples (${data.test_days} days)</div>
+            <div style="margin-top:6px; font-size:10px; color:var(--text-muted)">Trained on: ${data.last_trained_date}</div>
+        `;
+    } catch (e) {
+        document.getElementById('modelDetails').innerText = "Error loading metadata.";
+    }
+}
+
+loadModelMetadata();
+
 const chartContainer = document.getElementById('chart');
 const chart = LightweightCharts.createChart(chartContainer, {
     width: chartContainer.clientWidth,
