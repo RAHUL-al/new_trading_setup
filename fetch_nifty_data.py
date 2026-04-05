@@ -27,7 +27,7 @@ from logzero import logger
 
 # ─────────── Config ───────────
 TOTP_TOKEN = os.environ.get("ANGELONE_TOTP_SECRET", "33OUTDUE57WS3TUPHPLFUCGHFM")
-API_KEY = os.environ.get("ANGELONE_API_KEY", "7355")
+API_KEY = os.environ.get("ANGELONE_API_KEY", "eGoFh2vK")
 CLIENT_ID = os.environ.get("ANGELONE_CLIENT_ID", "R865920")
 PWD = os.environ.get("ANGELONE_PASSWORD", "7355")
 
