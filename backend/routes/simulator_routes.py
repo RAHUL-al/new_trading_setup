@@ -148,7 +148,7 @@ async def start_simulation(
     start_date: str = Query(..., description="Start date YYYY-MM-DD"),
     end_date: str = Query(None, description="End date YYYY-MM-DD (default: same as start)"),
     speed: int = Query(10, description="Candles per second"),
-    warmup: int = Query(500, description="Number of warm-up cache candles"),
+    warmup: int = Query(10000, description="Number of warm-up cache candles"),
 ):
     """Start a market replay simulation."""
     global _simulator, _sim_task
