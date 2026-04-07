@@ -43,9 +43,9 @@ sleep 3  # Give symbol_found time to populate Redis with CE/PE tokens
 
 # Process 2: WebSocket feeder + XGBoost/LSTM engine + market close cleanup
 # This is the MAIN process — it internally spawns:
-#   P0: run_websocket()        — tick data → 1-min candles → Redis
-#   P1: run_signal_engine()    — ML predictions → signals → Redis
-#   P2: market_close_cleanup() — cleanup at 3:30 PM
+#   P0: run_websocket()              — tick data → 1-min candles → Redis
+#   P1: run_xgboost_lstm_engine()    — ML predictions → signals → Redis
+#   P2: market_close_cleanup()       — cleanup at 3:30 PM
 nohup python3 angleone_websocket1.py >> "$LOGDIR/websocket_${DATE}.log" 2>&1 &
 WS_PID=$!
 echo "$WS_PID" > /tmp/trading_websocket.pid
