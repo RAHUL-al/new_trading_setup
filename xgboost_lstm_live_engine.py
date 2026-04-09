@@ -110,7 +110,7 @@ WARMUP_CANDLES = 500
 ATR_PERIOD = 14
 ATR_KEY_VALUE = 1.0
 MIN_ATR = float(os.environ.get("MIN_ATR", "6.5"))
-SIGNAL_COOLDOWN = 2  # seconds between signals
+SIGNAL_COOLDOWN = 0  # disabled — engine is gated by candle arrival, not time
 
 # Trading window
 WINDOW_START = datetime.time(

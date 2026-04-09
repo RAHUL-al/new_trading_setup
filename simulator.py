@@ -4,9 +4,9 @@ simulator.py — Market Replay Simulator
 Replays historical CSV candle data through the XGBoost+LSTM model one-by-one,
 simulating live trading. Designed to work with the dashboard via callbacks.
 
-IMPORTANT: Features and predictions are PRE-COMPUTED at the start of the
-simulation using the exact same pipeline as the offline backtester
-(xgboost_lstm_strategy.py). This guarantees identical results.
+IMPORTANT: Features and predictions are computed INCREMENTALLY per-candle,
+using exactly the same approach as xgboost_lstm_live_engine.py.
+This guarantees parity between simulation and live trading results.
 
 Usage (standalone test):
     python simulator.py --date 2026-03-20 --speed 60
@@ -31,8 +31,6 @@ try:
     from xgboost_lstm_strategy import (
         build_features_1min as xgl_build_features_1min,
         build_features_2min as xgl_build_features_2min,
-        calc_atr as xgl_calc_atr,
-        predict_lstm_full as xgl_predict_lstm_full,
         ensemble_predict as xgl_ensemble_predict,
         LSTMClassifier,
     )
@@ -150,15 +148,6 @@ class MarketSimulator:
         self.df_2m_full = None
         self._stop_requested = False
 
-        # Pre-computed arrays (filled at simulation start)
-        self._sim_predictions = None   # ensemble predictions for each sim candle
-        self._sim_xgb_preds = None     # XGBoost sub-predictions
-        self._sim_lstm_preds = None    # LSTM sub-predictions
-        self._sim_atr = None           # ATR for each sim candle
-        self._sim_rsi = None           # RSI for each sim candle
-        self._sim_ut_dir = None        # UT Bot direction for each sim candle
-        self._sim_features = None      # full feature dict for dashboard display
-
     def load_data(self):
         """Load CSV data and model(s)."""
         if self.df_1m_full is not None:
@@ -239,115 +228,6 @@ class MarketSimulator:
               f"LSTM={'yes' if self.lstm_model else 'no'})")
         return True
 
-    def _precompute_predictions(self, df_warmup, df_sim, df_2m_warmup):
-        """
-        Pre-compute ALL features and predictions at once — matching the
-        offline backtester (xgboost_lstm_strategy.py) exactly.
-
-        This is the KEY fix: features are computed on the full combined
-        dataset (warmup + all sim candles) in a single vectorized call,
-        producing identical results to the backtester.
-        """
-        t_start = time.perf_counter()
-
-        # ── 1. Build 1-min features on full dataset ──
-        df_all = pd.concat([df_warmup, df_sim], ignore_index=True)
-        warmup_len = len(df_warmup)
-        total_len = len(df_all)
-        sim_len = len(df_sim)
-
-        print(f"  Pre-computing features on {total_len:,} candles "
-              f"({warmup_len:,} warmup + {sim_len:,} sim)...")
-
-        feat_1m = xgl_build_features_1min(df_all)
-
-        # ── 2. Build 2-min features using pre-built 2-min CSV ──
-        if self.df_2m_full is not None:
-            # Use the pre-built 2-min CSV, exactly like the backtester does
-            # Filter to relevant time range
-            warmup_start_time = df_warmup['Time'].iloc[0] if len(df_warmup) > 0 else df_sim['Time'].iloc[0]
-            sim_end_time = df_sim['Time'].iloc[-1]
-
-            df_2m_range = self.df_2m_full[
-                (self.df_2m_full['Time'] >= warmup_start_time) &
-                (self.df_2m_full['Time'] <= sim_end_time)
-            ].reset_index(drop=True)
-
-            if len(df_2m_range) > 0:
-                feat_2m = xgl_build_features_2min(df_2m_range, df_all)
-            else:
-                # Fallback: resample from 1-min (should rarely happen)
-                df_2m_resampled = df_all.set_index('Time').resample(
-                    '2min', label='left', closed='left'
-                ).agg({
-                    'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
-                }).dropna().reset_index()
-                feat_2m = xgl_build_features_2min(df_2m_resampled, df_all)
-        else:
-            # No 2-min CSV: resample from 1-min
-            df_2m_resampled = df_all.set_index('Time').resample(
-                '2min', label='left', closed='left'
-            ).agg({
-                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
-            }).dropna().reset_index()
-            feat_2m = xgl_build_features_2min(df_2m_resampled, df_all)
-
-        # ── 3. Combine and clean features (same as backtester) ──
-        features = pd.concat([feat_1m, feat_2m], axis=1)
-        features = features.fillna(0)
-        features = features.replace([np.inf, -np.inf], 0)
-
-        # ── 4. Extract sim-period features (skip warmup) ──
-        sim_features = features.iloc[warmup_len:].reset_index(drop=True)
-        X_sim = sim_features[self.feature_columns].values
-
-        # ── 5. Pre-compute ATR on the full dataset ──
-        atr_all = xgl_calc_atr(df_all, ATR_PERIOD).values
-        self._sim_atr = atr_all[warmup_len:]
-
-        # ── 6. Extract RSI and UT Bot direction ──
-        self._sim_rsi = sim_features['rsi_1m'].values if 'rsi_1m' in sim_features.columns else np.full(sim_len, 50.0)
-        self._sim_ut_dir = sim_features['ut_dir_1m'].values if 'ut_dir_1m' in sim_features.columns else np.zeros(sim_len)
-
-        # ── 7. XGBoost predictions for all sim candles ──
-        xgb_preds = np.zeros(sim_len, dtype=int)
-        if self.xgb_model is not None:
-            xgb_raw = self.xgb_model.predict(X_sim)
-            xgb_preds = (xgb_raw - 1).astype(int)  # unmap: 0→-1, 1→0, 2→1
-
-        self._sim_xgb_preds = xgb_preds
-
-        # ── 8. LSTM predictions using full sliding window ──
-        # This matches predict_lstm_full() from the backtester:
-        # - Scale ALL features (warmup + sim) using the saved scaler
-        # - Run the sliding window across the FULL feature array
-        # - Extract sim-period predictions
-        lstm_preds = np.zeros(sim_len, dtype=int)
-        if self.lstm_model is not None and self.scaler is not None:
-            full_feature_values = features[self.feature_columns].values
-            full_scaled = self.scaler.transform(full_feature_values)
-            lstm_full = xgl_predict_lstm_full(self.lstm_model, full_scaled, self.lstm_seq_len)
-            lstm_preds = lstm_full[warmup_len:]
-
-        self._sim_lstm_preds = lstm_preds
-
-        # ── 9. Ensemble predictions ──
-        self._sim_predictions = xgl_ensemble_predict(xgb_preds, lstm_preds)
-
-        # ── 10. Store feature values for dashboard display ──
-        self._sim_features = sim_features
-
-        t_elapsed = time.perf_counter() - t_start
-
-        # Stats
-        buy_count = (self._sim_predictions == 1).sum()
-        sell_count = (self._sim_predictions == -1).sum()
-        hold_count = (self._sim_predictions == 0).sum()
-
-        print(f"  Pre-computation done in {t_elapsed:.1f}s")
-        print(f"  Predictions: BUY={buy_count} SELL={sell_count} HOLD={hold_count}")
-        print(f"  XGB: BUY={sum(xgb_preds==1)} SELL={sum(xgb_preds==-1)} HOLD={sum(xgb_preds==0)}")
-        print(f"  LSTM: BUY={sum(lstm_preds==1)} SELL={sum(lstm_preds==-1)} HOLD={sum(lstm_preds==0)}")
 
     def get_available_dates(self) -> List[str]:
         """Return list of unique trading dates in the CSV."""
@@ -452,8 +332,17 @@ class MarketSimulator:
 
         self.state.total_candles = len(df_sim)
 
-        # ── PRE-COMPUTE all features and predictions (backtester parity) ──
-        self._precompute_predictions(df_warmup, df_sim, df_2m_warmup)
+        # ── Prepare for INCREMENTAL feature computation (live engine parity) ──
+        # Pre-concat for efficient slicing (iloc[:n] is O(1) view)
+        df_full = pd.concat([df_warmup, df_sim], ignore_index=True)
+        warmup_len = len(df_warmup)
+
+        # Filter 2-min warmup to before simulation start
+        today_start = df_sim['Time'].iloc[0]
+        if len(df_2m_warmup) > 0:
+            df_2m_warmup = df_2m_warmup[df_2m_warmup['Time'] < today_start].reset_index(drop=True)
+
+        print(f"  Incremental mode: {warmup_len} warmup + {len(df_sim)} sim candles")
 
         # Broadcast warm-up candles to the dashboard
         warmup_payload = [
@@ -536,15 +425,79 @@ class MarketSimulator:
             self.state.current_date = str(curr_date)
             prev_date = curr_date
 
-            # ── Look up PRE-COMPUTED values (no per-candle feature rebuild!) ──
-            current_atr = float(self._sim_atr[i])
-            current_rsi = float(self._sim_rsi[i])
-            ut_dir = float(self._sim_ut_dir[i])
+            # ── INCREMENTAL feature computation (matching live engine) ──
+            end_idx = warmup_len + i + 1
+            df_so_far = df_full.iloc[:end_idx]
 
-            # Prediction from pre-computed ensemble
-            pred = int(self._sim_predictions[i])
-            xgb_pred = int(self._sim_xgb_preds[i])
-            lstm_pred = int(self._sim_lstm_preds[i])
+            # 1-min features on warmup + sim candles so far
+            feat_1m = xgl_build_features_1min(df_so_far)
+
+            # 2-min features: resample current day's candles + prepend 2-min warmup
+            df_today_so_far = df_sim.iloc[:i+1]
+            if len(df_today_so_far) >= 2:
+                df_2m_today = df_today_so_far.set_index('Time').resample(
+                    '2min', label='left', closed='left'
+                ).agg({
+                    'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
+                }).dropna().reset_index()
+            else:
+                df_2m_today = pd.DataFrame(columns=['Time', 'Open', 'High', 'Low', 'Close'])
+
+            if len(df_2m_warmup) > 0:
+                df_2m_combined = pd.concat([df_2m_warmup, df_2m_today], ignore_index=True)
+            else:
+                df_2m_combined = df_so_far.set_index('Time').resample(
+                    '2min', label='left', closed='left'
+                ).agg({
+                    'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
+                }).dropna().reset_index()
+
+            feat_2m = xgl_build_features_2min(df_2m_combined, df_so_far)
+
+            # Combine and clean (same as live engine)
+            all_features = pd.concat([feat_1m, feat_2m], axis=1)
+            all_features = all_features.fillna(0).replace([np.inf, -np.inf], 0)
+
+            last_feat = all_features.iloc[-1]
+            current_atr = float(last_feat.get('atr_1m', 0))
+            current_rsi = float(last_feat.get('rsi_1m', 50.0))
+            ut_dir = float(last_feat.get('ut_dir_1m', 0))
+
+            # Feature vector for XGBoost
+            feature_vector = [float(last_feat.get(f, 0)) for f in self.feature_columns]
+            feature_vector = [
+                0 if (v != v or abs(v) == float('inf')) else v for v in feature_vector
+            ]
+
+            # XGBoost prediction
+            xgb_pred = 0
+            if self.xgb_model is not None:
+                xgb_raw = self.xgb_model.predict(np.array([feature_vector]))[0]
+                xgb_pred = int(xgb_raw) - 1  # unmap: 0→-1, 1→0, 2→1
+
+            # LSTM prediction (matching live engine: scale last seq_len rows)
+            lstm_pred = 0
+            if self.lstm_model is not None and self.scaler is not None:
+                if len(all_features) >= self.lstm_seq_len:
+                    recent_features = all_features.iloc[-self.lstm_seq_len:]
+                    feature_matrix = []
+                    for _, row_feat in recent_features.iterrows():
+                        vec = [float(row_feat.get(f, 0)) for f in self.feature_columns]
+                        vec = [0 if (v != v or abs(v) == float('inf')) else v for v in vec]
+                        feature_matrix.append(vec)
+                    seq_scaled = self.scaler.transform(
+                        np.array(feature_matrix, dtype=np.float32)
+                    )
+                    x_tensor = torch.FloatTensor(seq_scaled).unsqueeze(0)
+                    with torch.no_grad():
+                        output = self.lstm_model(x_tensor)
+                        pred_class = output.argmax(dim=1).item()
+                        lstm_pred = pred_class - 1
+
+            # Ensemble prediction
+            pred = xgl_ensemble_predict(
+                np.array([xgb_pred]), np.array([lstm_pred])
+            )[0]
 
             signal_map = {1: "BUY", -1: "SELL", 0: "HOLD"}
             signal_name = signal_map.get(pred, "HOLD")
@@ -626,13 +579,12 @@ class MarketSimulator:
 
             # ── Feature dict for dashboard ──
             feature_data = {}
-            if self._sim_features is not None and i < len(self._sim_features):
-                for col in ALL_FEATURE_COLS:
-                    if col in self._sim_features.columns:
-                        val = float(self._sim_features.iloc[i].get(col, 0))
-                        if val != val or abs(val) == float('inf'):
-                            val = 0
-                        feature_data[col] = round(val, 4)
+            for col in ALL_FEATURE_COLS:
+                if col in all_features.columns:
+                    val = float(last_feat.get(col, 0))
+                    if val != val or abs(val) == float('inf'):
+                        val = 0
+                    feature_data[col] = round(val, 4)
 
             # ── Emit candle event ──
             candle_event = {
