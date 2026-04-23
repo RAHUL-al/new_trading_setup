@@ -1,29 +1,37 @@
 """
-rf_strategy.py — Multi-Timeframe Random Forest + LSTM Strategy for NIFTY
+rf_strategy.py — Random Forest + UT Bot + StochRSI Strategy (NIFTY)
 
-STRATEGY CONCEPT:
-  Phase 1 (09:15-11:00): Observation — RF builds market regime confidence
-  Phase 2 (11:00-15:15): Active trading
-    LONG:  RF=BULL + StochRSI_1m < 10 (oversold pullback) + UT_Bot confirm
-    SHORT: RF=BEAR + StochRSI_1m > 90 (overbought rally) + UT_Bot confirm
+ARCHITECTURE:
+  Two SEPARATE models trained and evaluated INDEPENDENTLY:
+    Model A: Trained on 2-minute candle data
+    Model B: Trained on 3-minute candle data
 
-  Regime changes (BULL→BEAR or BEAR→BULL) trigger position flips.
+  Each model gets its OWN:
+    - Feature set (UT Bot + StochRSI + ATR + momentum + patterns)
+    - Random Forest classifier
+    - Backtest results
+    - Trade categorization (HIGH / MID / LOW points)
 
-MODELS:
-  1. Random Forest — Market regime classifier (BULL/BEAR/CHOP)
-     Trained on multi-timeframe features (1m + 3m + 5m)
-  2. LSTM (optional) — Short-term momentum confirmation
-     Trained on 1-min sequential patterns
+  Results are printed side-by-side for comparison.
+
+STRATEGY LOGIC (per timeframe):
+  Phase 1 (09:15-11:00): OBSERVATION — analyze market direction
+    → RF builds regime confidence from morning price action patterns
+    → Determine if market is BULLISH or BEARISH
+
+  Phase 2 (11:00-15:15): ACTIVE TRADING
+    LONG:  RF=BULL + StochRSI K < 10 (oversold) + UT Bot bullish
+    SHORT: RF=BEAR + StochRSI K > 90 (overbought) + UT Bot bearish
+
+  Regime Change: If RF flips direction → close + reverse
 
 ZERO LOOK-AHEAD:
-  Regime labels are generated from FUTURE price movement (EMA slope),
-  but only used for training. At inference, the model predicts from
-  current + past data only.
+  Regime labels use forward EMА slope — only for training.
+  At inference: model uses current/past data only.
 
 Usage:
-    python rf_strategy.py                                    # Train + backtest
+    python rf_strategy.py                                    # Both timeframes
     python rf_strategy.py --test-from 2026-04-01             # April test
-    python rf_strategy.py --no-lstm                          # RF only
     python rf_strategy.py --stoch-buy 15 --stoch-sell 85     # Adjust thresholds
 """
 
@@ -41,48 +49,34 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, accuracy_score
 
-try:
-    import torch
-    import torch.nn as nn
-    from torch.utils.data import Dataset, DataLoader
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
-    print("⚠️  PyTorch not installed. LSTM will be disabled. Run: pip install torch")
-
 
 # ─────────── Config ───────────
 ATR_PERIOD = 14
 ATR_KEY_VALUE = 1.0
 MIN_ATR = 6.5
 
-# Trading windows
-OBSERVATION_END = dt_time(11, 0)        # No trades before 11:00 AM
-ENTRY_START = dt_time(11, 0)            # Trading starts at 11:00 AM
-ENTRY_END = dt_time(15, 15)             # No new trades after 3:15 PM
-SQUARE_OFF = dt_time(15, 24)            # Force close at 3:24 PM
+OBSERVATION_END = dt_time(11, 0)
+ENTRY_START = dt_time(11, 0)
+ENTRY_END = dt_time(15, 15)
+SQUARE_OFF = dt_time(15, 24)
 
-# StochRSI entry thresholds
-STOCH_BUY_THRESHOLD = 10       # StochRSI K < 10 → oversold pullback → BUY
-STOCH_SELL_THRESHOLD = 90      # StochRSI K > 90 → overbought rally → SELL
-
-# StochRSI parameters
+STOCH_BUY_THRESHOLD = 10
+STOCH_SELL_THRESHOLD = 90
 STOCH_RSI_PERIOD = 14
 STOCH_K_SMOOTH = 3
 STOCH_D_SMOOTH = 3
 
-# Regime label: forward-looking EMA slope window
-REGIME_FORWARD_CANDLES_5M = 30   # 30 five-min candles = 150 minutes
-REGIME_SLOPE_THRESHOLD = 0.02   # Min EMA slope for BULL/BEAR classification
+REGIME_FORWARD_CANDLES = 30
+REGIME_SLOPE_THRESHOLD = 0.02
 
-# Lot sizing
 LOT_SIZE = 65
 BASE_LOTS = 2
 
-# LSTM
-SEQ_LEN = 20
+# Trade categorization thresholds (in points)
+HIGH_POINTS_THRESHOLD = 30   # > 30 pts = HIGH
+MID_POINTS_THRESHOLD = 10    # 10-30 pts = MID
+                              # < 10 pts = LOW
 
-# Script directory
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -91,12 +85,10 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # ═══════════════════════════════════════════
 
 def calc_rma(series, period):
-    """Wilder's smoothing (RMA)."""
     return series.ewm(alpha=1/period, adjust=False).mean()
 
 
 def calc_atr(df, period=14):
-    """Average True Range using RMA."""
     h = df['High'].astype(float)
     l = df['Low'].astype(float)
     c = df['Close'].astype(float)
@@ -109,7 +101,6 @@ def calc_atr(df, period=14):
 
 
 def calc_rsi(series, period=14):
-    """RSI using RMA."""
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = (-delta).where(delta < 0, 0.0)
@@ -120,30 +111,21 @@ def calc_rsi(series, period=14):
 
 
 def calc_stochastic_rsi(close, rsi_period=14, stoch_period=14, k_smooth=3, d_smooth=3):
-    """
-    Stochastic RSI = Stochastic oscillator applied to RSI values.
-    Returns: stoch_k, stoch_d (both as Series)
-    """
     rsi = calc_rsi(close, rsi_period)
-
     rsi_low = rsi.rolling(stoch_period).min()
     rsi_high = rsi.rolling(stoch_period).max()
     denom = (rsi_high - rsi_low).replace(0, 1e-10)
     stoch_rsi = (rsi - rsi_low) / denom * 100
-
     stoch_k = stoch_rsi.rolling(k_smooth).mean()
     stoch_d = stoch_k.rolling(d_smooth).mean()
-
     return stoch_k, stoch_d
 
 
-def calc_ut_bot_direction(close, atr, key_value=1.0):
-    """
-    UT Bot trailing stop + direction.
-    Returns: trail_stop (array), direction (array: +1 bullish, -1 bearish)
-    """
-    close_arr = close.values if hasattr(close, 'values') else np.array(close)
-    atr_arr = atr.values if hasattr(atr, 'values') else np.array(atr)
+def calc_ut_bot_direction(close_arr, atr_arr, key_value=1.0):
+    if hasattr(close_arr, 'values'):
+        close_arr = close_arr.values
+    if hasattr(atr_arr, 'values'):
+        atr_arr = atr_arr.values
     n = len(close_arr)
     trail_stop = np.zeros(n)
     direction = np.zeros(n)
@@ -176,16 +158,18 @@ def calc_ut_bot_direction(close, atr, key_value=1.0):
 
 
 def calc_ema(series, period):
-    """Standard EMA."""
     return series.ewm(span=period, adjust=False).mean()
 
 
 # ═══════════════════════════════════════════
-#  FEATURE ENGINEERING — 3 TIMEFRAMES
+#  FEATURE ENGINEERING (SINGLE TIMEFRAME)
 # ═══════════════════════════════════════════
 
-def build_features_1min(df):
-    """Build 1-minute features (entry timing + momentum)."""
+def build_features(df, tf_label=""):
+    """Build features from a single timeframe dataframe.
+    tf_label: suffix like '2m' or '3m' for column naming.
+    """
+    sfx = f"_{tf_label}" if tf_label else ""
     close = df['Close'].astype(float)
     high = df['High'].astype(float)
     low = df['Low'].astype(float)
@@ -197,174 +181,98 @@ def build_features_1min(df):
                                             STOCH_K_SMOOTH, STOCH_D_SMOOTH)
     trail, dirn = calc_ut_bot_direction(close, atr, ATR_KEY_VALUE)
 
-    features = pd.DataFrame(index=df.index)
-
-    # Core indicators
-    features['atr_1m'] = atr
-    features['rsi_1m'] = rsi
-    features['stoch_k_1m'] = stoch_k
-    features['stoch_d_1m'] = stoch_d
-    features['stoch_kd_diff_1m'] = stoch_k - stoch_d
-    features['ut_dir_1m'] = dirn
-    features['close_vs_trail_1m'] = close.values - trail
-
-    # Price momentum
-    features['mom_3_1m'] = close.pct_change(3) * 100
-    features['mom_5_1m'] = close.pct_change(5) * 100
-    features['mom_10_1m'] = close.pct_change(10) * 100
-
-    # Candle features
-    features['body_1m'] = close - opn
-    features['body_pct_1m'] = (close - opn) / opn * 100
-    features['upper_wick_1m'] = high - close.where(close > opn, opn)
-    features['lower_wick_1m'] = close.where(close < opn, opn) - low
-    features['range_1m'] = high - low
-
-    # Volatility
-    features['std_5_1m'] = close.rolling(5).std()
-    features['std_10_1m'] = close.rolling(10).std()
-
-    # Moving averages
     ema_5 = calc_ema(close, 5)
     ema_10 = calc_ema(close, 10)
     ema_20 = calc_ema(close, 20)
-    features['close_vs_ema5_1m'] = close - ema_5
-    features['close_vs_ema10_1m'] = close - ema_10
-    features['close_vs_ema20_1m'] = close - ema_20
-    features['ema5_vs_ema10_1m'] = ema_5 - ema_10
+    ema_50 = calc_ema(close, 50)
 
-    # High/Low channels
-    features['close_vs_high5_1m'] = close - high.rolling(5).max()
-    features['close_vs_low5_1m'] = close - low.rolling(5).min()
+    features = pd.DataFrame(index=df.index)
+
+    # ── Core Indicators ──
+    features[f'atr{sfx}'] = atr
+    features[f'rsi{sfx}'] = rsi
+    features[f'stoch_k{sfx}'] = stoch_k
+    features[f'stoch_d{sfx}'] = stoch_d
+    features[f'stoch_kd_diff{sfx}'] = stoch_k - stoch_d
+    features[f'ut_dir{sfx}'] = dirn
+    features[f'close_vs_trail{sfx}'] = close.values - trail
+
+    # ── UT Bot change detection ──
+    ut_change = np.diff(dirn, prepend=dirn[0])
+    features[f'ut_change{sfx}'] = ut_change
+    features[f'ut_buy_signal{sfx}'] = (ut_change > 0).astype(int)
+    features[f'ut_sell_signal{sfx}'] = (ut_change < 0).astype(int)
+
+    # ── StochRSI zone flags ──
+    features[f'stoch_oversold{sfx}'] = (stoch_k < STOCH_BUY_THRESHOLD).astype(int)
+    features[f'stoch_overbought{sfx}'] = (stoch_k > STOCH_SELL_THRESHOLD).astype(int)
+    features[f'stoch_k_cross_up_d{sfx}'] = ((stoch_k > stoch_d) & (stoch_k.shift(1) <= stoch_d.shift(1))).astype(int)
+    features[f'stoch_k_cross_dn_d{sfx}'] = ((stoch_k < stoch_d) & (stoch_k.shift(1) >= stoch_d.shift(1))).astype(int)
+
+    # ── Price Momentum ──
+    features[f'mom_3{sfx}'] = close.pct_change(3) * 100
+    features[f'mom_5{sfx}'] = close.pct_change(5) * 100
+    features[f'mom_10{sfx}'] = close.pct_change(10) * 100
+    features[f'mom_20{sfx}'] = close.pct_change(20) * 100
+
+    # ── Candle Patterns ──
+    features[f'body{sfx}'] = close - opn
+    features[f'body_pct{sfx}'] = (close - opn) / opn * 100
+    features[f'upper_wick{sfx}'] = high - close.where(close > opn, opn)
+    features[f'lower_wick{sfx}'] = close.where(close < opn, opn) - low
+    features[f'range{sfx}'] = high - low
+    features[f'body_vs_range{sfx}'] = (close - opn).abs() / (high - low).replace(0, 1e-10)
+
+    # ── Volatility ──
+    features[f'std_5{sfx}'] = close.rolling(5).std()
+    features[f'std_10{sfx}'] = close.rolling(10).std()
+    features[f'std_20{sfx}'] = close.rolling(20).std()
+
+    # ── EMA relationships ──
+    features[f'close_vs_ema5{sfx}'] = close - ema_5
+    features[f'close_vs_ema10{sfx}'] = close - ema_10
+    features[f'close_vs_ema20{sfx}'] = close - ema_20
+    features[f'close_vs_ema50{sfx}'] = close - ema_50
+    features[f'ema5_vs_ema10{sfx}'] = ema_5 - ema_10
+    features[f'ema10_vs_ema20{sfx}'] = ema_10 - ema_20
+    features[f'ema20_vs_ema50{sfx}'] = ema_20 - ema_50
+    features[f'ema20_slope{sfx}'] = ema_20.diff(3) / 3
+
+    # ── High/Low channels ──
+    features[f'close_vs_high5{sfx}'] = close - high.rolling(5).max()
+    features[f'close_vs_low5{sfx}'] = close - low.rolling(5).min()
+    features[f'close_vs_high10{sfx}'] = close - high.rolling(10).max()
+    features[f'close_vs_low10{sfx}'] = close - low.rolling(10).min()
+
+    # ── Morning session pattern (for regime detection before 11:00) ──
+    # Count of bullish/bearish candles in last N bars
+    bullish_candle = (close > opn).astype(int)
+    features[f'bullish_count_10{sfx}'] = bullish_candle.rolling(10).sum()
+    features[f'bullish_count_20{sfx}'] = bullish_candle.rolling(20).sum()
+    features[f'bullish_ratio_10{sfx}'] = features[f'bullish_count_10{sfx}'] / 10
+    features[f'bullish_ratio_20{sfx}'] = features[f'bullish_count_20{sfx}'] / 20
+
+    # ── Cumulative return from day start (intraday bias) ──
+    # This requires knowing the day's open — compute per day later in main
+    features[f'day_return{sfx}'] = 0.0  # placeholder, filled in main
 
     return features
 
 
-def build_features_3min(df_3m, df_1m):
-    """Build 3-minute features and align to 1-min index via merge_asof."""
-    close = df_3m['Close'].astype(float)
-    high = df_3m['High'].astype(float)
-    low = df_3m['Low'].astype(float)
-    opn = df_3m['Open'].astype(float)
-
-    atr = calc_atr(df_3m, ATR_PERIOD)
-    rsi = calc_rsi(close, 14)
-    stoch_k, stoch_d = calc_stochastic_rsi(close, STOCH_RSI_PERIOD, STOCH_RSI_PERIOD,
-                                            STOCH_K_SMOOTH, STOCH_D_SMOOTH)
-    trail, dirn = calc_ut_bot_direction(close, atr, ATR_KEY_VALUE)
-
-    ema_20 = calc_ema(close, 20)
-    ema_50 = calc_ema(close, 50)
-
-    feat = pd.DataFrame(index=df_3m.index)
-    feat['Time'] = df_3m['Time']
-    feat['atr_3m'] = atr.values
-    feat['rsi_3m'] = rsi.values
-    feat['stoch_k_3m'] = stoch_k.values
-    feat['stoch_d_3m'] = stoch_d.values
-    feat['stoch_kd_diff_3m'] = (stoch_k - stoch_d).values
-    feat['ut_dir_3m'] = dirn
-    feat['close_vs_trail_3m'] = close.values - trail
-    feat['mom_3_3m'] = (close.pct_change(3) * 100).values
-    feat['mom_5_3m'] = (close.pct_change(5) * 100).values
-    feat['range_3m'] = (high - low).values
-    feat['body_3m'] = (close - opn).values
-    feat['ema20_3m'] = ema_20.values
-    feat['ema50_3m'] = ema_50.values
-    feat['ema20_vs_ema50_3m'] = (ema_20 - ema_50).values
-    feat['ema20_slope_3m'] = (ema_20.diff(3) / 3).values  # slope over 3 bars
-
-    # Merge to 1-min
-    feat['Time'] = pd.to_datetime(feat['Time'])
-    df_1m_time = pd.DataFrame({'Time': pd.to_datetime(df_1m['Time'])})
-
-    merged = pd.merge_asof(
-        df_1m_time.sort_values('Time'),
-        feat.sort_values('Time'),
-        on='Time',
-        direction='backward'
-    )
-
-    return merged.drop('Time', axis=1).reset_index(drop=True)
-
-
-def build_features_5min(df_5m, df_1m):
-    """Build 5-minute features (regime backbone) and align to 1-min index."""
-    close = df_5m['Close'].astype(float)
-    high = df_5m['High'].astype(float)
-    low = df_5m['Low'].astype(float)
-    opn = df_5m['Open'].astype(float)
-
-    atr = calc_atr(df_5m, ATR_PERIOD)
-    rsi = calc_rsi(close, 14)
-    stoch_k, stoch_d = calc_stochastic_rsi(close, STOCH_RSI_PERIOD, STOCH_RSI_PERIOD,
-                                            STOCH_K_SMOOTH, STOCH_D_SMOOTH)
-    trail, dirn = calc_ut_bot_direction(close, atr, ATR_KEY_VALUE)
-
-    ema_20 = calc_ema(close, 20)
-    ema_50 = calc_ema(close, 50)
-
-    feat = pd.DataFrame(index=df_5m.index)
-    feat['Time'] = df_5m['Time']
-    feat['atr_5m'] = atr.values
-    feat['rsi_5m'] = rsi.values
-    feat['stoch_k_5m'] = stoch_k.values
-    feat['stoch_d_5m'] = stoch_d.values
-    feat['stoch_kd_diff_5m'] = (stoch_k - stoch_d).values
-    feat['ut_dir_5m'] = dirn
-    feat['close_vs_trail_5m'] = close.values - trail
-    feat['mom_3_5m'] = (close.pct_change(3) * 100).values
-    feat['mom_5_5m'] = (close.pct_change(5) * 100).values
-    feat['mom_10_5m'] = (close.pct_change(10) * 100).values
-    feat['range_5m'] = (high - low).values
-    feat['body_5m'] = (close - opn).values
-    feat['ema20_5m'] = ema_20.values
-    feat['ema50_5m'] = ema_50.values
-    feat['ema20_vs_ema50_5m'] = (ema_20 - ema_50).values
-    feat['ema20_slope_5m'] = (ema_20.diff(3) / 3).values
-    feat['close_vs_ema20_5m'] = (close - ema_20).values
-    feat['close_vs_ema50_5m'] = (close - ema_50).values
-    feat['high_10_5m'] = high.rolling(10).max().values
-    feat['low_10_5m'] = low.rolling(10).min().values
-    feat['close_vs_high10_5m'] = (close.values - high.rolling(10).max().values)
-    feat['close_vs_low10_5m'] = (close.values - low.rolling(10).min().values)
-
-    # Merge to 1-min
-    feat['Time'] = pd.to_datetime(feat['Time'])
-    df_1m_time = pd.DataFrame({'Time': pd.to_datetime(df_1m['Time'])})
-
-    merged = pd.merge_asof(
-        df_1m_time.sort_values('Time'),
-        feat.sort_values('Time'),
-        on='Time',
-        direction='backward'
-    )
-
-    return merged.drop('Time', axis=1).reset_index(drop=True)
-
-
 # ═══════════════════════════════════════════
-#  REGIME LABEL GENERATION (ZERO LOOK-AHEAD)
+#  REGIME LABEL GENERATION
 # ═══════════════════════════════════════════
 
-def generate_regime_labels(df_5m, forward_candles=30, slope_threshold=0.02):
+def generate_regime_labels(df, forward_candles=30, slope_threshold=0.02):
     """
-    Generate regime labels from 5-min data based on forward EMA20 slope.
-
-    For each candle at time t:
-      - Compute EMA20 at t and EMA20 at t + forward_candles
-      - slope = (EMA20[t+N] - EMA20[t]) / EMA20[t] * 100
-      - BULL (+1) if slope > threshold
-      - BEAR (-1) if slope < -threshold
-      - CHOP (0)  otherwise
-
-    These labels are ONLY used for training. At inference, the model
-    predicts regime from current/past features only.
+    Regime labels based on forward EMA20 slope.
+    BULL (+1) / BEAR (-1) / CHOP (0)
+    Only used for training — no look-ahead at inference.
     """
-    close = df_5m['Close'].astype(float)
+    close = df['Close'].astype(float)
     ema_20 = calc_ema(close, 20)
 
-    n = len(df_5m)
+    n = len(df)
     labels = np.zeros(n, dtype=int)
 
     for i in range(n - forward_candles):
@@ -386,75 +294,11 @@ def generate_regime_labels(df_5m, forward_candles=30, slope_threshold=0.02):
     return labels
 
 
-def map_5m_labels_to_1m(df_5m, labels_5m, df_1m):
-    """Map 5-minute regime labels to 1-minute index using merge_asof."""
-    label_df = pd.DataFrame({
-        'Time': pd.to_datetime(df_5m['Time']),
-        'regime_label': labels_5m,
-    })
-
-    df_1m_time = pd.DataFrame({'Time': pd.to_datetime(df_1m['Time'])})
-
-    merged = pd.merge_asof(
-        df_1m_time.sort_values('Time'),
-        label_df.sort_values('Time'),
-        on='Time',
-        direction='backward'
-    )
-
-    return merged['regime_label'].fillna(0).astype(int).values
-
-
-# ═══════════════════════════════════════════
-#  LSTM MODEL (OPTIONAL)
-# ═══════════════════════════════════════════
-
-if HAS_TORCH:
-    class LSTMClassifier(nn.Module):
-        """2-layer LSTM for sequential regime confirmation."""
-        def __init__(self, input_size, hidden_size=64, num_layers=2, dropout=0.3, num_classes=3):
-            super().__init__()
-            self.lstm = nn.LSTM(
-                input_size=input_size,
-                hidden_size=hidden_size,
-                num_layers=num_layers,
-                batch_first=True,
-                dropout=dropout if num_layers > 1 else 0,
-            )
-            self.dropout = nn.Dropout(dropout)
-            self.fc = nn.Linear(hidden_size, num_classes)
-
-        def forward(self, x):
-            lstm_out, (h_n, _) = self.lstm(x)
-            last_hidden = h_n[-1]
-            out = self.dropout(last_hidden)
-            return self.fc(out)
-
-
-    class SequenceDataset(Dataset):
-        """Sliding window dataset for LSTM training."""
-        def __init__(self, features, labels, seq_len=20):
-            self.features = features
-            self.labels = labels
-            self.seq_len = seq_len
-
-        def __len__(self):
-            return max(0, len(self.features) - self.seq_len)
-
-        def __getitem__(self, idx):
-            x = self.features[idx:idx + self.seq_len]
-            y = self.labels[idx + self.seq_len - 1]
-            y_mapped = y + 1  # -1→0, 0→1, 1→2
-            return torch.FloatTensor(x), torch.LongTensor([y_mapped]).squeeze()
-
-
 # ═══════════════════════════════════════════
 #  TRAINING
 # ═══════════════════════════════════════════
 
-def train_random_forest(X_train, y_train, X_test, y_test, n_estimators=500):
-    """Train Random Forest regime classifier."""
-    # Map labels: -1→0, 0→1, 1→2
+def train_random_forest(X_train, y_train, X_test, y_test, n_estimators=500, label=""):
     y_train_mapped = y_train + 1
     y_test_mapped = y_test + 1
 
@@ -467,215 +311,39 @@ def train_random_forest(X_train, y_train, X_test, y_test, n_estimators=500):
         class_weight='balanced',
         random_state=42,
         n_jobs=-1,
-        verbose=1,
+        verbose=0,
     )
 
-    print(f"\n  Training Random Forest ({n_estimators} trees)...")
+    print(f"\n  Training Random Forest ({n_estimators} trees) [{label}]...")
     model.fit(X_train, y_train_mapped)
 
-    # Predictions
     train_pred = model.predict(X_train) - 1
     test_pred = model.predict(X_test) - 1
 
     train_acc = accuracy_score(y_train, train_pred) * 100
     test_acc = accuracy_score(y_test, test_pred) * 100
-    print(f"\n  RF Train accuracy: {train_acc:.1f}%")
-    print(f"  RF Test accuracy:  {test_acc:.1f}%")
+    print(f"  Train acc: {train_acc:.1f}% | Test acc: {test_acc:.1f}%")
 
-    # Class report
-    print(f"\n  Test Classification Report:")
-    target_names = ['BEAR (-1)', 'CHOP (0)', 'BULL (+1)']
-    print(classification_report(y_test + 1, test_pred + 1, target_names=target_names, zero_division=0))
+    target_names = ['BEAR', 'CHOP', 'BULL']
+    print(classification_report(y_test + 1, test_pred + 1,
+                                target_names=target_names, zero_division=0))
 
     return model
-
-
-def train_lstm(X_train, y_train, X_test, y_test, scaler, seq_len=20,
-               epochs=30, batch_size=256, lr=0.001):
-    """Train LSTM sequential classifier."""
-    if not HAS_TORCH:
-        print("  ⚠️ PyTorch not available. Skipping LSTM.")
-        return None
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\n  LSTM Device: {device}")
-
-    X_train_scaled = scaler.transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-
-    train_dataset = SequenceDataset(X_train_scaled, y_train, seq_len)
-    test_dataset = SequenceDataset(X_test_scaled, y_test, seq_len)
-
-    if len(train_dataset) == 0 or len(test_dataset) == 0:
-        print("  ⚠️ Not enough data for LSTM sequences. Skipping LSTM.")
-        return None
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-    n_features = X_train.shape[1]
-    model = LSTMClassifier(input_size=n_features, hidden_size=64,
-                           num_layers=2, dropout=0.3).to(device)
-
-    # Class weights
-    class_counts = np.bincount(y_train + 1, minlength=3).astype(float)
-    class_counts = np.maximum(class_counts, 1.0)
-    class_weights = 1.0 / class_counts
-    class_weights = class_weights / class_weights.sum() * 3
-    weights_tensor = torch.FloatTensor(class_weights).to(device)
-
-    criterion = nn.CrossEntropyLoss(weight=weights_tensor)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
-
-    best_loss = float('inf')
-    best_state = None
-    patience_counter = 0
-
-    for epoch in range(epochs):
-        model.train()
-        train_loss = 0
-        train_correct = 0
-        train_total = 0
-        for batch_x, batch_y in train_loader:
-            batch_x = batch_x.to(device)
-            batch_y = batch_y.to(device)
-            optimizer.zero_grad()
-            outputs = model(batch_x)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            train_loss += loss.item()
-            _, predicted = outputs.max(1)
-            train_total += batch_y.size(0)
-            train_correct += predicted.eq(batch_y).sum().item()
-
-        model.eval()
-        test_loss = 0
-        test_correct = 0
-        test_total = 0
-        with torch.no_grad():
-            for batch_x, batch_y in test_loader:
-                batch_x = batch_x.to(device)
-                batch_y = batch_y.to(device)
-                outputs = model(batch_x)
-                loss = criterion(outputs, batch_y)
-                test_loss += loss.item()
-                _, predicted = outputs.max(1)
-                test_total += batch_y.size(0)
-                test_correct += predicted.eq(batch_y).sum().item()
-
-        avg_test_loss = test_loss / max(len(test_loader), 1)
-        scheduler.step(avg_test_loss)
-
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            train_acc = train_correct / max(train_total, 1) * 100
-            test_acc = test_correct / max(test_total, 1) * 100
-            print(f"    Epoch {epoch+1:3d}/{epochs} | "
-                  f"Train Loss: {train_loss/max(len(train_loader),1):.4f} Acc: {train_acc:.1f}% | "
-                  f"Test Loss: {avg_test_loss:.4f} Acc: {test_acc:.1f}%")
-
-        if avg_test_loss < best_loss:
-            best_loss = avg_test_loss
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= 10:
-                print(f"    Early stopping at epoch {epoch+1}")
-                break
-
-    if best_state:
-        model.load_state_dict(best_state)
-    model = model.cpu()
-
-    # Final accuracy
-    model.eval()
-    test_dataset_full = SequenceDataset(scaler.transform(X_test), y_test, seq_len)
-    test_loader_full = DataLoader(test_dataset_full, batch_size=batch_size, shuffle=False)
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for batch_x, batch_y in test_loader_full:
-            outputs = model(batch_x)
-            _, predicted = outputs.max(1)
-            total += batch_y.size(0)
-            correct += predicted.eq(batch_y).sum().item()
-    print(f"\n  LSTM Final Test Accuracy: {correct/max(total,1)*100:.1f}%")
-
-    return model
-
-
-def predict_lstm_full(model, features_scaled, seq_len=20):
-    """Generate LSTM predictions for the full dataset."""
-    n = len(features_scaled)
-    predictions = np.zeros(n, dtype=int)
-
-    if model is None or not HAS_TORCH:
-        return predictions
-
-    model.eval()
-    device = next(model.parameters()).device
-
-    with torch.no_grad():
-        for i in range(seq_len, n + 1):
-            seq = features_scaled[i - seq_len:i]
-            x = torch.FloatTensor(seq).unsqueeze(0).to(device)
-            outputs = model(x)
-            pred_class = outputs.argmax(dim=1).item()
-            predictions[i - 1] = pred_class - 1  # unmap
-
-    return predictions
-
-
-def ensemble_predict(rf_pred, lstm_pred):
-    """
-    Combine RF and LSTM predictions.
-    Both agree → use that signal (HIGH confidence)
-    One active, other HOLD → use active signal (MEDIUM confidence)
-    Conflicting → HOLD (sit out)
-    """
-    n = len(rf_pred)
-    final = np.zeros(n, dtype=int)
-
-    for i in range(n):
-        r = rf_pred[i]
-        l = lstm_pred[i] if i < len(lstm_pred) else 0
-
-        if r == l:
-            final[i] = r
-        elif r != 0 and l == 0:
-            final[i] = r
-        elif r == 0 and l != 0:
-            final[i] = l
-        else:
-            final[i] = 0  # conflicting → HOLD
-
-    return final
 
 
 # ═══════════════════════════════════════════
 #  BACKTEST ENGINE
 # ═══════════════════════════════════════════
 
-def backtest_strategy(df, regime_predictions, stoch_k_vals, stoch_d_vals,
-                      ut_dir_vals, atr_vals,
+def backtest_strategy(df, regime_predictions, stoch_k_vals, ut_dir_vals, atr_vals,
                       stoch_buy_thresh=10, stoch_sell_thresh=90):
     """
-    Backtest the multi-timeframe regime + StochRSI strategy.
-
-    Rules:
-      PHASE 1 (09:15-11:00): No trades — observation only
-      PHASE 2 (11:00-15:15): Active trading
-        LONG:  regime=BULL AND StochRSI_K < buy_thresh AND UT_Bot=bullish
-        SHORT: regime=BEAR AND StochRSI_K > sell_thresh AND UT_Bot=bearish
-      REGIME CHANGE: Close existing + open opposite if StochRSI confirms
-
-    Exit:
-      - Trailing SL (ATR-based)
-      - Opposite regime signal
-      - Square off at 15:24
+    Backtest with:
+      - No trades before ENTRY_START (11:00)
+      - LONG:  regime=BULL + StochRSI < buy_thresh + UT_Bot bullish
+      - SHORT: regime=BEAR + StochRSI > sell_thresh + UT_Bot bearish
+      - Regime flip → close position
+      - Trailing SL + Square off
     """
     close = df['Close'].astype(float)
     high_v = df['High'].astype(float)
@@ -685,8 +353,6 @@ def backtest_strategy(df, regime_predictions, stoch_k_vals, stoch_d_vals,
     all_trades = []
     daily_results = {}
     prev_date = None
-
-    # Lot management
     current_lots = BASE_LOTS
     accumulated_loss = 0.0
     recovering = False
@@ -699,7 +365,7 @@ def backtest_strategy(df, regime_predictions, stoch_k_vals, stoch_d_vals,
         l = float(low_v.iloc[i])
         curr_atr = float(atr_vals[i])
 
-        # ── Day boundary ──
+        # Day boundary
         if prev_date and curr_date != prev_date:
             if pos:
                 prev_close = float(close.iloc[i-1])
@@ -711,7 +377,6 @@ def backtest_strategy(df, regime_predictions, stoch_k_vals, stoch_d_vals,
             if curr_date not in daily_results:
                 daily_results[curr_date] = {'trades': [], 'pnl': 0, 'lots': current_lots}
 
-            # Lot adjustment
             if prev_date in daily_results:
                 prev_pnl = daily_results[prev_date]['pnl']
                 if prev_pnl < 0:
@@ -724,7 +389,6 @@ def backtest_strategy(df, regime_predictions, stoch_k_vals, stoch_d_vals,
                         current_lots = BASE_LOTS
                         accumulated_loss = 0.0
                         recovering = False
-
             if curr_date in daily_results:
                 daily_results[curr_date]['lots'] = current_lots
         prev_date = curr_date
@@ -732,7 +396,7 @@ def backtest_strategy(df, regime_predictions, stoch_k_vals, stoch_d_vals,
         if curr_date not in daily_results:
             daily_results[curr_date] = {'trades': [], 'pnl': 0, 'lots': current_lots}
 
-        # ── Square off ──
+        # Square off
         if pos and t >= SQUARE_OFF:
             trade = _make_trade(pos, c, df.iloc[i]['Time'], "SQUARE_OFF",
                                 current_lots, pos.get('initial_sl'))
@@ -741,10 +405,9 @@ def backtest_strategy(df, regime_predictions, stoch_k_vals, stoch_d_vals,
             pos = None
             continue
 
-        # ── Skip if before observation period ends ──
         in_window = ENTRY_START <= t <= ENTRY_END
 
-        # ── SL check ──
+        # SL check
         if pos:
             if pos['dir'] == "LONG" and l <= pos['sl']:
                 trade = _make_trade(pos, pos['sl'], df.iloc[i]['Time'], "TRAIL_SL",
@@ -759,7 +422,7 @@ def backtest_strategy(df, regime_predictions, stoch_k_vals, stoch_d_vals,
                 _add_daily(daily_results, curr_date, trade)
                 pos = None
 
-        # ── Trail SL update ──
+        # Trail SL update
         if pos:
             if pos['dir'] == "LONG":
                 new_sl = c - curr_atr * ATR_KEY_VALUE
@@ -770,36 +433,31 @@ def backtest_strategy(df, regime_predictions, stoch_k_vals, stoch_d_vals,
                 if new_sl < pos['sl']:
                     pos['sl'] = new_sl
 
-        # ── Get current indicators ──
+        # Current indicators
         regime = regime_predictions[i]
         sk = stoch_k_vals[i] if not np.isnan(stoch_k_vals[i]) else 50
         ut_d = ut_dir_vals[i]
 
-        # ── Regime change — close existing position ──
+        # Regime change → close existing
         if regime == 1 and pos and pos['dir'] == "SHORT":
-            # Regime flipped to BULL while SHORT → close
             trade = _make_trade(pos, c, df.iloc[i]['Time'], "REGIME_FLIP",
                                 current_lots, pos.get('initial_sl'))
             all_trades.append(trade)
             _add_daily(daily_results, curr_date, trade)
             pos = None
         elif regime == -1 and pos and pos['dir'] == "LONG":
-            # Regime flipped to BEAR while LONG → close
             trade = _make_trade(pos, c, df.iloc[i]['Time'], "REGIME_FLIP",
                                 current_lots, pos.get('initial_sl'))
             all_trades.append(trade)
             _add_daily(daily_results, curr_date, trade)
             pos = None
 
-        # ── New entry ──
+        # New entry
         if not pos and in_window and curr_atr >= MIN_ATR:
-            # BUY: regime=BULL + StochRSI oversold + UT Bot bullish
             if regime == 1 and sk < stoch_buy_thresh and ut_d == 1:
                 sl = c - curr_atr * ATR_KEY_VALUE
                 pos = {'dir': 'LONG', 'entry': c, 'sl': sl, 'initial_sl': sl,
                        'entry_time': df.iloc[i]['Time'], 'entry_idx': i}
-
-            # SELL: regime=BEAR + StochRSI overbought + UT Bot bearish
             elif regime == -1 and sk > stoch_sell_thresh and ut_d == -1:
                 sl = c + curr_atr * ATR_KEY_VALUE
                 pos = {'dir': 'SHORT', 'entry': c, 'sl': sl, 'initial_sl': sl,
@@ -820,18 +478,11 @@ def _make_trade(pos, exit_price, exit_time, reason, lots=2, sl=None):
     lot_multiplier = lots // BASE_LOTS
     adj_pnl = raw_pnl * lot_multiplier
     trade = {
-        'dir': pos['dir'],
-        'entry': pos['entry'],
-        'exit': round(exit_price, 2),
-        'entry_time': pos['entry_time'],
-        'exit_time': exit_time,
-        'pnl': round(adj_pnl, 2),
-        'raw_pnl': round(raw_pnl, 2),
-        'lots': lots,
-        'multiplier': lot_multiplier,
-        'qty': lots * LOT_SIZE,
-        'pnl_pct': round(raw_pnl / pos['entry'] * 100, 4),
-        'reason': reason,
+        'dir': pos['dir'], 'entry': pos['entry'], 'exit': round(exit_price, 2),
+        'entry_time': pos['entry_time'], 'exit_time': exit_time,
+        'pnl': round(adj_pnl, 2), 'raw_pnl': round(raw_pnl, 2),
+        'lots': lots, 'multiplier': lot_multiplier, 'qty': lots * LOT_SIZE,
+        'pnl_pct': round(raw_pnl / pos['entry'] * 100, 4), 'reason': reason,
     }
     if sl is not None:
         trade['sl'] = round(sl, 2)
@@ -849,9 +500,34 @@ def _add_daily(daily_results, date, trade):
 #  REPORTING
 # ═══════════════════════════════════════════
 
-def print_results(all_trades, daily_results, label=""):
+def categorize_trades(trades):
+    """Categorize trades into HIGH / MID / LOW point buckets."""
+    high_pts = [t for t in trades if abs(t['raw_pnl']) >= HIGH_POINTS_THRESHOLD]
+    mid_pts = [t for t in trades if MID_POINTS_THRESHOLD <= abs(t['raw_pnl']) < HIGH_POINTS_THRESHOLD]
+    low_pts = [t for t in trades if abs(t['raw_pnl']) < MID_POINTS_THRESHOLD]
+    return high_pts, mid_pts, low_pts
+
+
+def print_category_stats(trades, category_name):
+    """Print stats for a trade category."""
+    if not trades:
+        print(f"    {category_name}: No trades")
+        return
+
+    n = len(trades)
+    wins = [t for t in trades if t['pnl'] > 0]
+    losses = [t for t in trades if t['pnl'] <= 0]
+    wr = len(wins) / n * 100
+    total_pnl = sum(t['pnl'] for t in trades)
+    avg_pnl = total_pnl / n
+
+    print(f"    {category_name}: {n} trades | Win: {wr:.0f}% | "
+          f"P&L: {total_pnl:+.2f} pts | Avg: {avg_pnl:+.2f} pts")
+
+
+def print_results(all_trades, daily_results, label="", tf_name=""):
     if not all_trades:
-        print("❌ No trades")
+        print(f"\n❌ No trades [{tf_name}]")
         return
 
     n = len(all_trades)
@@ -877,7 +553,7 @@ def print_results(all_trades, daily_results, label=""):
     win_days = sum(1 for d in daily_results.values() if d['pnl'] > 0)
 
     print(f"\n{'='*70}")
-    print(f"  🌲 RANDOM FOREST + STOCHRSI — {label}")
+    print(f"  🌲 RANDOM FOREST [{tf_name}] — {label}")
     print(f"{'='*70}")
     print(f"  Total trades:      {n}")
     print(f"  Win rate:          {wr:.1f}%")
@@ -890,7 +566,26 @@ def print_results(all_trades, daily_results, label=""):
     print(f"  Profitable days:   {win_days} ({win_days/max(trading_days,1)*100:.0f}%)")
     print(f"  Avg P&L/day:       {total_pnl/max(trading_days,1):+.2f} pts")
 
-    # Daily results
+    # ── Trade Categories ──
+    high_pts, mid_pts, low_pts = categorize_trades(all_trades)
+    print(f"\n  📊 TRADE CATEGORIES (by absolute points):")
+    print(f"    HIGH (>={HIGH_POINTS_THRESHOLD} pts):")
+    print_category_stats(high_pts, "     HIGH")
+    print(f"    MID ({MID_POINTS_THRESHOLD}-{HIGH_POINTS_THRESHOLD} pts):")
+    print_category_stats(mid_pts, "      MID")
+    print(f"    LOW (<{MID_POINTS_THRESHOLD} pts):")
+    print_category_stats(low_pts, "      LOW")
+
+    # ── Winning trades by category ──
+    high_wins = [t for t in high_pts if t['pnl'] > 0]
+    mid_wins = [t for t in mid_pts if t['pnl'] > 0]
+    low_wins = [t for t in low_pts if t['pnl'] > 0]
+    print(f"\n  ✅ WINNING TRADES by category:")
+    print(f"    HIGH wins: {len(high_wins)} | P&L: {sum(t['pnl'] for t in high_wins):+.2f} pts")
+    print(f"    MID wins:  {len(mid_wins)} | P&L: {sum(t['pnl'] for t in mid_wins):+.2f} pts")
+    print(f"    LOW wins:  {len(low_wins)} | P&L: {sum(t['pnl'] for t in low_wins):+.2f} pts")
+
+    # ── Daily results ──
     sorted_days = sorted(daily_results.keys())
     print(f"\n  {'Date':>12} {'Lots':>5} {'Trades':>7} {'P&L':>10} {'Status':>8}")
     print(f"  {'-'*45}")
@@ -920,8 +615,7 @@ def print_results(all_trades, daily_results, label=""):
     print(f"\n{'='*70}")
 
 
-def print_detailed_daily_log(all_trades, daily_results, log_file="rf_detailed_log.txt"):
-    """Print AND save detailed per-trade log."""
+def print_detailed_daily_log(all_trades, daily_results, tf_name="", log_file=None):
     sorted_days = sorted(daily_results.keys())
     lines = []
 
@@ -930,7 +624,7 @@ def print_detailed_daily_log(all_trades, daily_results, log_file="rf_detailed_lo
         lines.append(s)
 
     out(f"\n{'='*110}")
-    out(f"  📋 DETAILED TRADE LOG — RANDOM FOREST + STOCHRSI")
+    out(f"  📋 DETAILED TRADE LOG — [{tf_name}]")
     out(f"{'='*110}")
 
     day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
@@ -952,7 +646,7 @@ def print_detailed_daily_log(all_trades, daily_results, log_file="rf_detailed_lo
         icon = "✅" if day_pnl > 0 else "❌" if day_pnl < 0 else "➖"
 
         out(f"\n  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐")
-        out(f"  │ 📅 {day} ({day_name}) | Lots: {lots} (qty={lots*LOT_SIZE}) | Trades: {len(trades)} (W:{wins} L:{losses_count} {wr:.0f}%) | Day P&L: {day_pnl:+.2f} {icon} | Cum: {cum_pnl:+.2f}")
+        out(f"  │ 📅 {day} ({day_name}) | Lots: {lots} | Trades: {len(trades)} (W:{wins} L:{losses_count} {wr:.0f}%) | Day P&L: {day_pnl:+.2f} {icon} | Cum: {cum_pnl:+.2f}")
         out(f"  ├───┬──────┬───────────┬───────────┬───────────┬───────────┬────────────┬──────────┬─────────────┤")
         out(f"  │ # │ Dir  │ Entry Time│ Exit Time │ Entry Pr  │ Exit Pr   │ SL         │ P&L      │ Exit Reason │")
         out(f"  ├───┼──────┼───────────┼───────────┼───────────┼───────────┼────────────┼──────────┼─────────────┤")
@@ -968,13 +662,203 @@ def print_detailed_daily_log(all_trades, daily_results, log_file="rf_detailed_lo
         out(f"  └───┴──────┴───────────┴───────────┴───────────┴───────────┴────────────┴──────────┴─────────────┘")
 
     out(f"\n{'='*110}")
-    out(f"  GRAND TOTAL: {cum_pnl:+.2f} pts")
+    out(f"  GRAND TOTAL [{tf_name}]: {cum_pnl:+.2f} pts")
     out(f"{'='*110}")
 
-    log_path = os.path.join(SCRIPT_DIR, log_file)
-    with open(log_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines))
-    print(f"\n💾 Detailed log saved: {log_path}")
+    if log_file:
+        log_path = os.path.join(SCRIPT_DIR, log_file)
+        with open(log_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+        print(f"\n💾 Detailed log saved: {log_path}")
+
+
+def print_comparison(results_2m, results_3m):
+    """Print side-by-side comparison of 2-min vs 3-min results."""
+    print(f"\n{'='*70}")
+    print(f"  📊 COMPARISON: 2-MINUTE vs 3-MINUTE")
+    print(f"{'='*70}")
+
+    def _stats(trades, daily):
+        if not trades:
+            return {'n': 0, 'wr': 0, 'pnl': 0, 'pf': 0, 'dd': 0, 'days': 0, 'win_days': 0}
+        n = len(trades)
+        wins = [t for t in trades if t['pnl'] > 0]
+        losses = [t for t in trades if t['pnl'] <= 0]
+        wr = len(wins) / n * 100
+        pnl = sum(t['pnl'] for t in trades)
+        gp = sum(t['pnl'] for t in wins) if wins else 0
+        gl = abs(sum(t['pnl'] for t in losses)) if losses else 1
+        pf = gp / gl if gl > 0 else 0
+        pnl_list = [t['pnl'] for t in trades]
+        cumulative = np.cumsum(pnl_list)
+        peak = np.maximum.accumulate(cumulative)
+        dd = (peak - cumulative).max()
+        trading_days = sum(1 for d in daily.values() if len(d['trades']) > 0)
+        win_days = sum(1 for d in daily.values() if d['pnl'] > 0)
+        high, mid, low = categorize_trades(trades)
+        return {'n': n, 'wr': wr, 'pnl': pnl, 'pf': pf, 'dd': dd,
+                'days': trading_days, 'win_days': win_days,
+                'high': len(high), 'mid': len(mid), 'low': len(low)}
+
+    s2 = _stats(*results_2m) if results_2m[0] else _stats([], {})
+    s3 = _stats(*results_3m) if results_3m[0] else _stats([], {})
+
+    print(f"\n  {'Metric':<22} {'2-MIN':>12} {'3-MIN':>12} {'BETTER':>10}")
+    print(f"  {'-'*58}")
+
+    def _row(label, v2, v3, fmt="+.2f", higher_better=True):
+        s2_str = f"{v2:{fmt}}"
+        s3_str = f"{v3:{fmt}}"
+        if v2 == v3:
+            better = "TIE"
+        elif (v2 > v3) == higher_better:
+            better = "← 2-MIN"
+        else:
+            better = "3-MIN →"
+        print(f"  {label:<22} {s2_str:>12} {s3_str:>12} {better:>10}")
+
+    _row("Total Trades", s2['n'], s3['n'], "d", False)
+    _row("Win Rate %", s2['wr'], s3['wr'], ".1f")
+    _row("Total P&L", s2['pnl'], s3['pnl'])
+    _row("Profit Factor", s2['pf'], s3['pf'], ".2f")
+    _row("Max Drawdown", s2['dd'], s3['dd'], ".2f", False)
+    _row("Trading Days", s2['days'], s3['days'], "d")
+    _row("Win Days", s2['win_days'], s3['win_days'], "d")
+    _row("HIGH pt trades", s2.get('high',0), s3.get('high',0), "d")
+    _row("MID pt trades", s2.get('mid',0), s3.get('mid',0), "d")
+    _row("LOW pt trades", s2.get('low',0), s3.get('low',0), "d")
+
+    print(f"  {'-'*58}")
+    winner = "2-MINUTE" if s2['pnl'] > s3['pnl'] else "3-MINUTE" if s3['pnl'] > s2['pnl'] else "TIE"
+    print(f"\n  🏆 OVERALL WINNER: {winner}")
+    print(f"{'='*70}")
+
+
+# ═══════════════════════════════════════════
+#  RUN PIPELINE FOR ONE TIMEFRAME
+# ═══════════════════════════════════════════
+
+def run_single_timeframe(df, tf_name, test_from_date, n_estimators=500,
+                          stoch_buy=10, stoch_sell=90, regime_thresh=0.02,
+                          regime_forward=30):
+    """Run the full pipeline for a single timeframe. Returns (trades, daily_results, model)."""
+    print(f"\n{'#'*70}")
+    print(f"  RUNNING PIPELINE: {tf_name}")
+    print(f"{'#'*70}")
+
+    # Build features
+    print(f"\n  📊 Building features [{tf_name}]...")
+    features = build_features(df, tf_name.replace('-', '').replace(' ', ''))
+    print(f"    Features: {features.shape[1]} columns")
+
+    # Fill day_return
+    close = df['Close'].astype(float)
+    suffix = f"_{tf_name.replace('-', '').replace(' ', '')}"
+    day_groups = df.groupby(df['Time'].dt.date)
+    day_returns = pd.Series(0.0, index=df.index)
+    for day, group in day_groups:
+        day_open = float(group.iloc[0]['Open'])
+        if day_open > 0:
+            day_returns.loc[group.index] = (close.loc[group.index] - day_open) / day_open * 100
+    features[f'day_return{suffix}'] = day_returns.values
+
+    # Generate regime labels
+    print(f"  🏷️  Generating regime labels [{tf_name}]...")
+    labels = generate_regime_labels(df, regime_forward, regime_thresh)
+    bull = (labels == 1).sum()
+    bear = (labels == -1).sum()
+    chop = (labels == 0).sum()
+    print(f"    BULL={bull} ({bull/len(labels)*100:.1f}%) | "
+          f"BEAR={bear} ({bear/len(labels)*100:.1f}%) | "
+          f"CHOP={chop} ({chop/len(labels)*100:.1f}%)")
+
+    # Train/test split
+    times = df['Time'].dt.time
+    window_mask = (times >= dt_time(9, 20)) & (times <= ENTRY_END)
+    dates = df['Time'].dt.date
+
+    train_mask = (dates < test_from_date) & window_mask
+    test_mask = (dates >= test_from_date) & window_mask
+
+    features = features.fillna(0).replace([np.inf, -np.inf], 0)
+
+    X_train = features[train_mask].values
+    y_train = labels[train_mask]
+    X_test = features[test_mask].values
+    y_test = labels[test_mask]
+
+    train_days = dates[dates < test_from_date].nunique()
+    test_days = dates[dates >= test_from_date].nunique()
+
+    print(f"    Train: {len(X_train)} samples ({train_days} days)")
+    print(f"    Test:  {len(X_test)} samples ({test_days} days)")
+
+    if len(X_train) == 0 or len(X_test) == 0:
+        print(f"  ❌ Insufficient data for [{tf_name}]. Skipping.")
+        return [], {}, None, features
+
+    # Train RF
+    rf_model = train_random_forest(X_train, y_train, X_test, y_test,
+                                    n_estimators, label=tf_name)
+
+    # Feature importance
+    importance = rf_model.feature_importances_
+    feat_names = features.columns.tolist()
+    top_features = sorted(zip(feat_names, importance), key=lambda x: -x[1])[:10]
+    print(f"\n  📊 TOP 10 FEATURES [{tf_name}]:")
+    for name, imp in top_features:
+        print(f"    {name:>35}: {imp:.4f}")
+
+    # Generate predictions
+    print(f"\n  🔮 Generating predictions [{tf_name}]...")
+    rf_full_pred = np.zeros(len(df), dtype=int)
+    rf_test_pred = rf_model.predict(X_test) - 1
+    rf_full_pred[test_mask] = rf_test_pred
+    print(f"    BULL={sum(rf_test_pred==1)} BEAR={sum(rf_test_pred==-1)} CHOP={sum(rf_test_pred==0)}")
+
+    # Prepare indicators for backtest
+    atr_vals = calc_atr(df, ATR_PERIOD).values
+    stoch_k_vals, stoch_d_vals = calc_stochastic_rsi(
+        close, STOCH_RSI_PERIOD, STOCH_RSI_PERIOD, STOCH_K_SMOOTH, STOCH_D_SMOOTH
+    )
+    stoch_k_vals = stoch_k_vals.values
+    _, ut_dir_vals = calc_ut_bot_direction(close, calc_atr(df, ATR_PERIOD), ATR_KEY_VALUE)
+
+    # Backtest on test set
+    print(f"\n  🚀 Running backtest [{tf_name}]...")
+    test_df_mask = dates >= test_from_date
+    df_test = df[test_df_mask].reset_index(drop=True)
+    pred_test = rf_full_pred[test_df_mask]
+    atr_test = atr_vals[test_df_mask]
+    stoch_k_test = stoch_k_vals[test_df_mask]
+    ut_dir_test = ut_dir_vals[test_df_mask]
+
+    all_trades, daily_results = backtest_strategy(
+        df_test, pred_test, stoch_k_test, ut_dir_test, atr_test,
+        stoch_buy_thresh=stoch_buy, stoch_sell_thresh=stoch_sell,
+    )
+
+    test_start = df_test['Time'].dt.date.min()
+    test_end = df_test['Time'].dt.date.max()
+    print_results(all_trades, daily_results,
+                  f"TEST ({test_start} → {test_end})", tf_name)
+    print_detailed_daily_log(all_trades, daily_results,
+                             tf_name, f"rf_detailed_log_{tf_name.lower().replace('-','').replace(' ','')}.txt")
+
+    # Save trades
+    if all_trades:
+        trades_df = pd.DataFrame(all_trades)
+        trades_path = os.path.join(SCRIPT_DIR, f"rf_trades_{tf_name.lower().replace('-','').replace(' ','')}.csv")
+        trades_df.to_csv(trades_path, index=False)
+        print(f"  💾 Trades saved: {trades_path}")
+
+    # Save model
+    model_path = os.path.join(SCRIPT_DIR, f"rf_model_{tf_name.lower().replace('-','').replace(' ','')}.pkl")
+    with open(model_path, 'wb') as f:
+        pickle.dump(rf_model, f)
+    print(f"  💾 Model saved: {model_path}")
+
+    return all_trades, daily_results, rf_model, features
 
 
 # ═══════════════════════════════════════════
@@ -982,329 +866,121 @@ def print_detailed_daily_log(all_trades, daily_results, log_file="rf_detailed_lo
 # ═══════════════════════════════════════════
 
 def main():
-    global ATR_KEY_VALUE, MIN_ATR, SEQ_LEN, ENTRY_START, ENTRY_END, SQUARE_OFF
+    global ATR_KEY_VALUE, MIN_ATR, ENTRY_START, ENTRY_END, SQUARE_OFF
     global STOCH_BUY_THRESHOLD, STOCH_SELL_THRESHOLD, OBSERVATION_END
 
-    parser = argparse.ArgumentParser(description="Multi-TF Random Forest + StochRSI Strategy (NIFTY)")
-    parser.add_argument("--file-1m", default=os.path.join(SCRIPT_DIR, "nifty_1min_data.csv"), help="1-min data")
+    parser = argparse.ArgumentParser(description="RF + StochRSI + UT Bot (2-min & 3-min SEPARATE)")
+    parser.add_argument("--file-2m", default=os.path.join(SCRIPT_DIR, "nifty_2min_data.csv"), help="2-min data")
     parser.add_argument("--file-3m", default=os.path.join(SCRIPT_DIR, "nifty_3min_data.csv"), help="3-min data")
-    parser.add_argument("--file-5m", default=os.path.join(SCRIPT_DIR, "nifty_5min_data.csv"), help="5-min data")
     parser.add_argument("--atr-key", type=float, default=ATR_KEY_VALUE)
     parser.add_argument("--min-atr", type=float, default=MIN_ATR)
-    parser.add_argument("--stoch-buy", type=float, default=STOCH_BUY_THRESHOLD,
-                        help="StochRSI K threshold for BUY (default: 10)")
-    parser.add_argument("--stoch-sell", type=float, default=STOCH_SELL_THRESHOLD,
-                        help="StochRSI K threshold for SELL (default: 90)")
-    parser.add_argument("--regime-thresh", type=float, default=REGIME_SLOPE_THRESHOLD,
-                        help="EMA slope threshold for regime classification")
-    parser.add_argument("--seq-len", type=int, default=SEQ_LEN, help="LSTM lookback window")
-    parser.add_argument("--lstm-epochs", type=int, default=30, help="LSTM training epochs")
-    parser.add_argument("--rf-trees", type=int, default=500, help="Random Forest n_estimators")
-    parser.add_argument("--obs-end", type=str, default="11:00",
-                        help="End of observation period (HH:MM). No trades before this.")
-    parser.add_argument("--window-end", type=str, default="15:15", help="Entry window end (HH:MM)")
-    parser.add_argument("--square-off", type=str, default="15:24", help="Square off time (HH:MM)")
-    parser.add_argument("--test-from", type=str, default="2026-04-01",
-                        help="Test data start date (YYYY-MM-DD)")
-    parser.add_argument("--no-lstm", action="store_true", help="Skip LSTM, use RF only")
-    parser.add_argument("--lstm-only", action="store_true", help="Skip RF, use LSTM only")
+    parser.add_argument("--stoch-buy", type=float, default=STOCH_BUY_THRESHOLD)
+    parser.add_argument("--stoch-sell", type=float, default=STOCH_SELL_THRESHOLD)
+    parser.add_argument("--regime-thresh", type=float, default=REGIME_SLOPE_THRESHOLD)
+    parser.add_argument("--regime-forward", type=int, default=REGIME_FORWARD_CANDLES,
+                        help="Forward candles for regime label (default: 30)")
+    parser.add_argument("--rf-trees", type=int, default=500)
+    parser.add_argument("--obs-end", type=str, default="11:00")
+    parser.add_argument("--window-end", type=str, default="15:15")
+    parser.add_argument("--square-off", type=str, default="15:24")
+    parser.add_argument("--test-from", type=str, default="2026-04-01")
+    parser.add_argument("--only-2m", action="store_true", help="Run only 2-min")
+    parser.add_argument("--only-3m", action="store_true", help="Run only 3-min")
     args = parser.parse_args()
 
     ATR_KEY_VALUE = args.atr_key
     MIN_ATR = args.min_atr
     STOCH_BUY_THRESHOLD = args.stoch_buy
     STOCH_SELL_THRESHOLD = args.stoch_sell
-    SEQ_LEN = args.seq_len
 
     def parse_time(s):
         h, m = map(int, s.split(':'))
         return dt_time(h, m)
 
     OBSERVATION_END = parse_time(args.obs_end)
-    ENTRY_START = OBSERVATION_END  # Trading starts when observation ends
+    ENTRY_START = OBSERVATION_END
     ENTRY_END = parse_time(args.window_end)
     SQUARE_OFF = parse_time(args.square_off)
 
     test_from_date = datetime.strptime(args.test_from, "%Y-%m-%d").date()
 
-    # ── Load data ──
     print(f"{'='*70}")
-    print(f"  🌲 MULTI-TIMEFRAME RANDOM FOREST + STOCHRSI STRATEGY")
+    print(f"  🌲 RANDOM FOREST + STOCHRSI + UT BOT")
+    print(f"  SEPARATE 2-MIN & 3-MIN MODELS")
     print(f"{'='*70}")
+    print(f"  Observation: 09:15 - {args.obs_end}")
+    print(f"  Trading:     {args.obs_end} - {args.window_end}")
+    print(f"  Square off:  {args.square_off}")
+    print(f"  StochRSI BUY: K < {STOCH_BUY_THRESHOLD} | SELL: K > {STOCH_SELL_THRESHOLD}")
+    print(f"  Test from:   {args.test_from}")
 
-    print(f"\n📊 Loading data...")
-    try:
-        df_1m = pd.read_csv(args.file_1m)
-    except FileNotFoundError:
-        print(f"❌ File not found: {args.file_1m}")
-        return
-    df_1m['Time'] = pd.to_datetime(df_1m['Time'])
-    df_1m = df_1m.sort_values('Time').reset_index(drop=True)
-    print(f"  1-min: {len(df_1m):,} candles | {df_1m['Time'].dt.date.nunique()} days")
+    results_2m = ([], {})
+    results_3m = ([], {})
 
-    try:
-        df_3m = pd.read_csv(args.file_3m)
-        df_3m['Time'] = pd.to_datetime(df_3m['Time'])
-        df_3m = df_3m.sort_values('Time').reset_index(drop=True)
-        print(f"  3-min: {len(df_3m):,} candles | {df_3m['Time'].dt.date.nunique()} days")
-    except FileNotFoundError:
-        print(f"⚠️  3-min file not found: {args.file_3m}")
-        df_3m = None
+    # ── 2-MINUTE MODEL ──
+    if not args.only_3m:
+        print(f"\n📊 Loading 2-min data: {args.file_2m}")
+        try:
+            df_2m = pd.read_csv(args.file_2m)
+            df_2m['Time'] = pd.to_datetime(df_2m['Time'])
+            df_2m = df_2m.sort_values('Time').reset_index(drop=True)
+            print(f"  {len(df_2m):,} candles | {df_2m['Time'].dt.date.nunique()} days")
+            print(f"  Range: {df_2m['Time'].iloc[0].strftime('%Y-%m-%d')} → "
+                  f"{df_2m['Time'].iloc[-1].strftime('%Y-%m-%d')}")
 
-    try:
-        df_5m = pd.read_csv(args.file_5m)
-        df_5m['Time'] = pd.to_datetime(df_5m['Time'])
-        df_5m = df_5m.sort_values('Time').reset_index(drop=True)
-        print(f"  5-min: {len(df_5m):,} candles | {df_5m['Time'].dt.date.nunique()} days")
-    except FileNotFoundError:
-        print(f"❌ 5-min file required for regime detection. File not found: {args.file_5m}")
-        return
+            trades_2m, daily_2m, model_2m, feats_2m = run_single_timeframe(
+                df_2m, "2-MIN", test_from_date,
+                n_estimators=args.rf_trees,
+                stoch_buy=STOCH_BUY_THRESHOLD,
+                stoch_sell=STOCH_SELL_THRESHOLD,
+                regime_thresh=args.regime_thresh,
+                regime_forward=args.regime_forward,
+            )
+            results_2m = (trades_2m, daily_2m)
+        except FileNotFoundError:
+            print(f"  ❌ File not found: {args.file_2m}")
 
-    print(f"  Date range: {df_1m['Time'].iloc[0].strftime('%Y-%m-%d')} → "
-          f"{df_1m['Time'].iloc[-1].strftime('%Y-%m-%d')}")
+    # ── 3-MINUTE MODEL ──
+    if not args.only_2m:
+        print(f"\n📊 Loading 3-min data: {args.file_3m}")
+        try:
+            df_3m = pd.read_csv(args.file_3m)
+            df_3m['Time'] = pd.to_datetime(df_3m['Time'])
+            df_3m = df_3m.sort_values('Time').reset_index(drop=True)
+            print(f"  {len(df_3m):,} candles | {df_3m['Time'].dt.date.nunique()} days")
+            print(f"  Range: {df_3m['Time'].iloc[0].strftime('%Y-%m-%d')} → "
+                  f"{df_3m['Time'].iloc[-1].strftime('%Y-%m-%d')}")
 
-    print(f"\n  Strategy Config:")
-    print(f"    Observation:  09:15 - {args.obs_end} (no trades)")
-    print(f"    Trading:      {args.obs_end} - {args.window_end}")
-    print(f"    Square off:   {args.square_off}")
-    print(f"    StochRSI BUY: K < {STOCH_BUY_THRESHOLD}")
-    print(f"    StochRSI SELL: K > {STOCH_SELL_THRESHOLD}")
-    print(f"    ATR: RMA({ATR_PERIOD}) × {ATR_KEY_VALUE} | Min: {MIN_ATR}")
-    print(f"    Test from:    {args.test_from}")
+            trades_3m, daily_3m, model_3m, feats_3m = run_single_timeframe(
+                df_3m, "3-MIN", test_from_date,
+                n_estimators=args.rf_trees,
+                stoch_buy=STOCH_BUY_THRESHOLD,
+                stoch_sell=STOCH_SELL_THRESHOLD,
+                regime_thresh=args.regime_thresh,
+                regime_forward=args.regime_forward,
+            )
+            results_3m = (trades_3m, daily_3m)
+        except FileNotFoundError:
+            print(f"  ❌ File not found: {args.file_3m}")
 
-    # ── Build features ──
-    print(f"\n📊 Building features...")
-    feat_1m = build_features_1min(df_1m)
-    print(f"  1-min features: {feat_1m.shape[1]} columns")
+    # ── COMPARISON ──
+    if not args.only_2m and not args.only_3m:
+        print_comparison(results_2m, results_3m)
 
-    if df_3m is not None:
-        feat_3m = build_features_3min(df_3m, df_1m)
-        print(f"  3-min features: {feat_3m.shape[1]} columns")
-    else:
-        feat_3m = None
-
-    feat_5m = build_features_5min(df_5m, df_1m)
-    print(f"  5-min features: {feat_5m.shape[1]} columns")
-
-    # Combine all features
-    feature_parts = [feat_1m]
-    if feat_3m is not None:
-        feature_parts.append(feat_3m)
-    feature_parts.append(feat_5m)
-    features = pd.concat(feature_parts, axis=1)
-
-    # Remove any duplicate columns
-    features = features.loc[:, ~features.columns.duplicated()]
-    print(f"  Total combined features: {features.shape[1]} columns")
-
-    # ── Generate regime labels from 5-min ──
-    print(f"\n🏷️  Generating regime labels (from 5-min data)...")
-    regime_labels_5m = generate_regime_labels(df_5m, REGIME_FORWARD_CANDLES_5M,
-                                              args.regime_thresh)
-    bull_5m = (regime_labels_5m == 1).sum()
-    bear_5m = (regime_labels_5m == -1).sum()
-    chop_5m = (regime_labels_5m == 0).sum()
-    print(f"  5-min labels: BULL={bull_5m} ({bull_5m/len(regime_labels_5m)*100:.1f}%) | "
-          f"BEAR={bear_5m} ({bear_5m/len(regime_labels_5m)*100:.1f}%) | "
-          f"CHOP={chop_5m} ({chop_5m/len(regime_labels_5m)*100:.1f}%)")
-
-    # Map to 1-min
-    labels = map_5m_labels_to_1m(df_5m, regime_labels_5m, df_1m)
-    bull_1m = (labels == 1).sum()
-    bear_1m = (labels == -1).sum()
-    chop_1m = (labels == 0).sum()
-    print(f"  1-min mapped:  BULL={bull_1m} ({bull_1m/len(labels)*100:.1f}%) | "
-          f"BEAR={bear_1m} ({bear_1m/len(labels)*100:.1f}%) | "
-          f"CHOP={chop_1m} ({chop_1m/len(labels)*100:.1f}%)")
-
-    # ── Filter to trading window ──
-    times = df_1m['Time'].dt.time
-    # For training, use all market hours to capture full patterns
-    window_mask = (times >= dt_time(9, 20)) & (times <= ENTRY_END)
-    print(f"\n  Window candles: {window_mask.sum()} (of {len(df_1m)})")
-
-    # ── Clean features ──
-    features = features.fillna(0)
-    features = features.replace([np.inf, -np.inf], 0)
-
-    # ── Train/Test split ──
-    dates = df_1m['Time'].dt.date
-
-    train_mask = (dates < test_from_date) & window_mask
-    test_mask = (dates >= test_from_date) & window_mask
-
-    train_dates_set = set(dates[dates < test_from_date].unique())
-    test_dates_set = set(dates[dates >= test_from_date].unique())
-
-    X_train = features[train_mask].values
-    y_train = labels[train_mask]
-    X_test = features[test_mask].values
-    y_test = labels[test_mask]
-
-    print(f"\n  Train: {len(X_train)} samples ({len(train_dates_set)} days) "
-          f"[up to {args.test_from}]")
-    print(f"  Test:  {len(X_test)} samples ({len(test_dates_set)} days) "
-          f"[{args.test_from} onwards]")
-
-    # ── Train Random Forest ──
-    rf_model = None
-    if not args.lstm_only:
-        print(f"\n🌳 Training Random Forest...")
-        rf_model = train_random_forest(X_train, y_train, X_test, y_test,
-                                        n_estimators=args.rf_trees)
-
-        # Feature importance
-        importance = rf_model.feature_importances_
-        feat_names = features.columns.tolist()
-        top_features = sorted(zip(feat_names, importance), key=lambda x: -x[1])[:15]
-        print(f"\n  📊 TOP 15 FEATURES (Random Forest):")
-        for name, imp in top_features:
-            print(f"    {name:>30}: {imp:.4f}")
-
-    # ── Train LSTM ──
-    lstm_model = None
-    scaler = StandardScaler()
-    scaler.fit(X_train)
-
-    if not args.no_lstm and HAS_TORCH:
-        print(f"\n🧠 Training LSTM model (seq_len={SEQ_LEN}, epochs={args.lstm_epochs})...")
-        lstm_model = train_lstm(X_train, y_train, X_test, y_test, scaler,
-                                seq_len=SEQ_LEN, epochs=args.lstm_epochs)
-
-    # ── Generate predictions for backtest ──
-    print(f"\n🔮 Generating predictions...")
-
-    full_features = features.values
-
-    # RF predictions
-    if rf_model is not None:
-        rf_full_pred = np.zeros(len(df_1m), dtype=int)
-        rf_test_pred = rf_model.predict(X_test) - 1  # unmap
-        rf_full_pred[test_mask] = rf_test_pred
-        print(f"  RF:     BULL={sum(rf_test_pred==1)} BEAR={sum(rf_test_pred==-1)} "
-              f"CHOP={sum(rf_test_pred==0)}")
-    else:
-        rf_full_pred = np.zeros(len(df_1m), dtype=int)
-
-    # LSTM predictions
-    if lstm_model is not None:
-        full_scaled = scaler.transform(full_features)
-        lstm_full_pred_raw = predict_lstm_full(lstm_model, full_scaled, SEQ_LEN)
-        lstm_full_pred = np.zeros(len(df_1m), dtype=int)
-        lstm_full_pred[test_mask] = lstm_full_pred_raw[test_mask]
-        lstm_test_pred = lstm_full_pred_raw[test_mask]
-        print(f"  LSTM:   BULL={sum(lstm_test_pred==1)} BEAR={sum(lstm_test_pred==-1)} "
-              f"CHOP={sum(lstm_test_pred==0)}")
-    else:
-        lstm_full_pred = np.zeros(len(df_1m), dtype=int)
-
-    # Ensemble
-    if rf_model is not None and lstm_model is not None:
-        final_predictions = ensemble_predict(rf_full_pred, lstm_full_pred)
-        ens_test = final_predictions[test_mask]
-        print(f"  Ensemble: BULL={sum(ens_test==1)} BEAR={sum(ens_test==-1)} "
-              f"CHOP={sum(ens_test==0)}")
-    elif rf_model is not None:
-        final_predictions = rf_full_pred
-        print("  Using Random Forest only")
-    elif lstm_model is not None:
-        final_predictions = lstm_full_pred
-        print("  Using LSTM only")
-    else:
-        print("❌ No models trained!")
-        return
-
-    # ── Prepare backtest indicators ──
-    atr_vals = calc_atr(df_1m, ATR_PERIOD).values
-    stoch_k_vals, stoch_d_vals = calc_stochastic_rsi(
-        df_1m['Close'].astype(float), STOCH_RSI_PERIOD, STOCH_RSI_PERIOD,
-        STOCH_K_SMOOTH, STOCH_D_SMOOTH
-    )
-    stoch_k_vals = stoch_k_vals.values
-    stoch_d_vals = stoch_d_vals.values
-    _, ut_dir_vals = calc_ut_bot_direction(
-        df_1m['Close'].astype(float), calc_atr(df_1m, ATR_PERIOD), ATR_KEY_VALUE
-    )
-
-    # ── Backtest on test set ──
-    print(f"\n🚀 Running backtest on TEST data ({args.test_from} onwards)...")
-    test_start = min(test_dates_set)
-    test_end = max(test_dates_set)
-    test_df_mask = dates >= test_from_date
-    df_test = df_1m[test_df_mask].reset_index(drop=True)
-    pred_test = final_predictions[test_df_mask]
-    atr_test = atr_vals[test_df_mask]
-    stoch_k_test = stoch_k_vals[test_df_mask]
-    stoch_d_test = stoch_d_vals[test_df_mask]
-    ut_dir_test = ut_dir_vals[test_df_mask]
-
-    all_trades, daily_results = backtest_strategy(
-        df_test, pred_test, stoch_k_test, stoch_d_test,
-        ut_dir_test, atr_test,
-        stoch_buy_thresh=STOCH_BUY_THRESHOLD,
-        stoch_sell_thresh=STOCH_SELL_THRESHOLD,
-    )
-
-    print_results(all_trades, daily_results, f"TEST ({test_start} → {test_end})")
-    print_detailed_daily_log(all_trades, daily_results)
-
-    # ── Save trades ──
-    if all_trades:
-        trades_df = pd.DataFrame(all_trades)
-        trades_path = os.path.join(SCRIPT_DIR, "rf_trades.csv")
-        trades_df.to_csv(trades_path, index=False)
-        print(f"\n💾 Trades saved: {trades_path}")
-
-    # ── Save models ──
-    if rf_model is not None:
-        rf_path = os.path.join(SCRIPT_DIR, "rf_regime_model.pkl")
-        with open(rf_path, 'wb') as f:
-            pickle.dump(rf_model, f)
-        print(f"💾 Random Forest saved: {rf_path}")
-
-    if lstm_model is not None and HAS_TORCH:
-        lstm_path = os.path.join(SCRIPT_DIR, "rf_lstm_model.pt")
-        torch.save({
-            'model_state_dict': lstm_model.state_dict(),
-            'input_size': lstm_model.lstm.input_size,
-            'hidden_size': lstm_model.lstm.hidden_size,
-            'num_layers': lstm_model.lstm.num_layers,
-            'seq_len': SEQ_LEN,
-        }, lstm_path)
-        print(f"💾 LSTM model saved: {lstm_path}")
-
-    # Save scaler
-    scaler_path = os.path.join(SCRIPT_DIR, "rf_feature_scaler.pkl")
-    with open(scaler_path, 'wb') as f:
-        pickle.dump(scaler, f)
-    print(f"💾 Feature scaler saved: {scaler_path}")
-
-    # Save feature columns
-    cols_path = os.path.join(SCRIPT_DIR, "rf_feature_columns.pkl")
-    with open(cols_path, 'wb') as f:
-        pickle.dump(features.columns.tolist(), f)
-    print(f"💾 Feature columns saved: {cols_path}")
-
-    # ── Save Training Metadata ──
+    # ── Save metadata ──
     metadata = {
-        "strategy": "Random Forest + StochRSI + UT Bot (Multi-TF)",
-        "train_samples": int(len(X_train)),
-        "train_days": int(len(train_dates_set)),
-        "train_up_to": args.test_from,
-        "test_samples": int(len(X_test)),
-        "test_days": int(len(test_dates_set)),
+        "strategy": "Random Forest + StochRSI + UT Bot (Separate 2m/3m)",
         "test_from": args.test_from,
-        "features": int(features.shape[1]),
-        "rf_trees": args.rf_trees,
-        "stoch_buy_threshold": STOCH_BUY_THRESHOLD,
-        "stoch_sell_threshold": STOCH_SELL_THRESHOLD,
+        "stoch_buy": STOCH_BUY_THRESHOLD,
+        "stoch_sell": STOCH_SELL_THRESHOLD,
         "observation_end": args.obs_end,
+        "rf_trees": args.rf_trees,
         "last_trained_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     meta_path = os.path.join(SCRIPT_DIR, "model_metadata.json")
     with open(meta_path, "w") as f:
         json.dump(metadata, f, indent=4)
-    print(f"💾 Training metadata saved: {meta_path}")
+    print(f"\n💾 Metadata saved: {meta_path}")
 
 
 if __name__ == "__main__":
