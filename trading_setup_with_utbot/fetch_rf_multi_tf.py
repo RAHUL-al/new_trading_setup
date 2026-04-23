@@ -1,15 +1,12 @@
 """
-fetch_rf_multi_tf.py — Fetch NIFTY 1-min and 3-min data from AngelOne SmartAPI.
-                        1-min is resampled to 2-min since AngelOne doesn't support 2-min natively.
+fetch_rf_multi_tf.py — Fetch NIFTY 2-min data from AngelOne SmartAPI.
+                        Fetches 1-min data and resamples to 2-min (AngelOne doesn't have native 2-min).
 
 Usage:
-    python fetch_rf_multi_tf.py                          # Fetches both timeframes
-    python fetch_rf_multi_tf.py --interval TWO_MINUTE    # Only 2-min (fetches 1-min, resamples)
-    python fetch_rf_multi_tf.py --interval THREE_MINUTE  # Only 3-min
+    python fetch_rf_multi_tf.py
 
-Output files:
-    nifty_2min_data.csv   (resampled from 1-min)
-    nifty_3min_data.csv   (native from API)
+Output:
+    nifty_2min_data.csv
 """
 
 from SmartApi import SmartConnect
@@ -19,7 +16,6 @@ import os
 import time
 from datetime import datetime, timedelta
 from logzero import logger
-
 
 # ─────────── Config ───────────
 TOTP_TOKEN = os.environ.get("ANGELONE_TOTP_SECRET", "33OUTDUE57WS3TUPHPLFUCGHFM")
@@ -31,193 +27,100 @@ NIFTY_TOKEN = "99926000"
 NIFTY_EXCHANGE = "NSE"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Interval configs
-INTERVAL_CONFIG = {
-    "TWO_MINUTE": {
-        "chunk_days": 5,
-        "from_date": "2024-04-01",
-        "output_file": os.path.join(SCRIPT_DIR, "nifty_2min_data.csv"),
-        "api_interval": "ONE_MINUTE",   # Fetch 1-min, then resample to 2-min
-        "resample_to": 2,
-    },
-    "THREE_MINUTE": {
-        "chunk_days": 15,
-        "from_date": "2024-04-01",
-        "output_file": os.path.join(SCRIPT_DIR, "nifty_3min_data.csv"),
-        "api_interval": "THREE_MINUTE",
-        "resample_to": None,
-    },
-}
+OUTPUT_FILE = os.path.join(SCRIPT_DIR, "nifty_2min_data.csv")
+FROM_DATE = "2024-04-01"
+CHUNK_DAYS = 5
 
 
 def connect_api():
-    """Login to AngelOne SmartAPI."""
     totp = pyotp.TOTP(TOTP_TOKEN).now()
     smart_api = SmartConnect(API_KEY)
     data = smart_api.generateSession(CLIENT_ID, PWD, totp)
-
     if not data or not data.get("data"):
         raise Exception(f"Login failed: {data}")
-
-    auth_token = data['data']['jwtToken']
-    feed_token = smart_api.getfeedToken()
     logger.info(f"AngelOne API connected. Client: {CLIENT_ID}")
     return smart_api
 
 
-def fetch_candles(smart_api, from_date, to_date, interval, max_retries=3):
-    """Fetch candles for NIFTY between two dates."""
+def fetch_candles(smart_api, from_date, to_date, max_retries=3):
     for attempt in range(max_retries):
         try:
             params = {
                 "exchange": NIFTY_EXCHANGE,
                 "symboltoken": NIFTY_TOKEN,
-                "interval": interval,
+                "interval": "ONE_MINUTE",
                 "fromdate": f"{from_date} 09:15",
                 "todate": f"{to_date} 15:30",
             }
             response = smart_api.getCandleData(params)
-
             if response and response.get("data"):
                 columns = ["Time", "Open", "High", "Low", "Close", "Volume"]
-                df = pd.DataFrame(response["data"], columns=columns)
-                return df
+                return pd.DataFrame(response["data"], columns=columns)
             else:
                 msg = response.get("message", "No data") if response else "No response"
                 if "TooManyRequests" in str(msg):
-                    wait = 5 * (attempt + 1)
-                    logger.warning(f"Rate limited. Waiting {wait}s...")
-                    time.sleep(wait)
+                    time.sleep(5 * (attempt + 1))
                     continue
-                logger.warning(f"No data for {from_date} to {to_date}: {msg}")
                 return pd.DataFrame()
-
         except Exception as e:
             if "TooManyRequests" in str(e):
-                wait = 5 * (attempt + 1)
-                logger.warning(f"Rate limited. Waiting {wait}s...")
-                time.sleep(wait)
+                time.sleep(5 * (attempt + 1))
                 continue
-            logger.error(f"API failed for {from_date} to {to_date}: {e}")
+            logger.error(f"API error {from_date}-{to_date}: {e}")
             return pd.DataFrame()
-
-    logger.error(f"Failed after {max_retries} retries: {from_date} to {to_date}")
     return pd.DataFrame()
 
 
-def get_date_chunks(start_date, end_date, chunk_days):
-    """Generate date chunks for pagination."""
+def main():
+    smart_api = connect_api()
+
+    start = datetime.strptime(FROM_DATE, "%Y-%m-%d")
+    end = datetime.now()
+
+    logger.info(f"Fetching 1-min data: {FROM_DATE} → {end.strftime('%Y-%m-%d')}")
+
     chunks = []
-    current = start_date
-    while current < end_date:
-        chunk_end = min(current + timedelta(days=chunk_days - 1), end_date)
-        chunks.append((current.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
-        current = chunk_end + timedelta(days=1)
-    return chunks
-
-
-def fetch_interval(smart_api, interval):
-    """Fetch all data for a specific interval."""
-    config = INTERVAL_CONFIG[interval]
-    from_override = os.environ.get("FETCH_FROM_DATE")
-    from_date = from_override if from_override else config["from_date"]
-    output_file = config["output_file"]
-    chunk_days = config["chunk_days"]
-
-    start_date = datetime.strptime(from_date, "%Y-%m-%d")
-    end_date = datetime.now()
-
-    logger.info(f"\n{'='*60}")
-    logger.info(f"FETCHING {interval} DATA")
-    logger.info(f"  Date range: {from_date} → {end_date.strftime('%Y-%m-%d')}")
-    logger.info(f"  Chunk size: {chunk_days} days")
-    logger.info(f"  Output: {output_file}")
-    logger.info(f"{'='*60}")
-
-    chunks = get_date_chunks(start_date, end_date, chunk_days)
-    logger.info(f"Total chunks: {len(chunks)}")
+    curr = start
+    while curr < end:
+        chunk_end = min(curr + timedelta(days=CHUNK_DAYS - 1), end)
+        chunks.append((curr.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
+        curr = chunk_end + timedelta(days=1)
 
     all_data = []
-    for i, (from_d, to_d) in enumerate(chunks):
-        logger.info(f"[{i+1}/{len(chunks)}] Fetching {from_d} → {to_d}...")
-        df = fetch_candles(smart_api, from_d, to_d, config["api_interval"])
-
+    for i, (f, t) in enumerate(chunks):
+        logger.info(f"[{i+1}/{len(chunks)}] {f} → {t}")
+        df = fetch_candles(smart_api, f, t)
         if not df.empty:
             all_data.append(df)
-            logger.info(f"  Got {len(df)} candles")
-        else:
-            logger.info(f"  No data (weekend/holiday?)")
-
         if i < len(chunks) - 1:
             time.sleep(2)
 
     if not all_data:
-        logger.error(f"No data fetched for {interval}!")
+        logger.error("No data fetched!")
         return
 
     combined = pd.concat(all_data, ignore_index=True)
     combined["Time"] = pd.to_datetime(combined["Time"])
     combined = combined.drop_duplicates(subset=["Time"]).sort_values("Time").reset_index(drop=True)
 
-    # Filter market hours
-    market_open = datetime.strptime("09:15", "%H:%M").time()
-    market_close = datetime.strptime("15:30", "%H:%M").time()
-    combined["time_only"] = combined["Time"].dt.time
-    combined = combined[
-        (combined["time_only"] >= market_open) &
-        (combined["time_only"] <= market_close)
-    ].drop(columns=["time_only"])
+    # Market hours
+    mkt_open = datetime.strptime("09:15", "%H:%M").time()
+    mkt_close = datetime.strptime("15:30", "%H:%M").time()
+    combined["_t"] = combined["Time"].dt.time
+    combined = combined[(combined["_t"] >= mkt_open) & (combined["_t"] <= mkt_close)].drop(columns=["_t"])
 
-    # Resample if needed (2-min = fetch 1-min then resample)
-    resample_to = config.get("resample_to")
-    if resample_to:
-        logger.info(f"Resampling to {resample_to}-minute candles...")
-        combined = combined.set_index('Time')
-        combined = combined.resample(f'{resample_to}min', label='left', closed='left').agg({
-            'Open': 'first',
-            'High': 'max',
-            'Low': 'min',
-            'Close': 'last',
-            'Volume': 'sum',
-        }).dropna().reset_index()
-        # Re-filter market hours after resampling
-        combined["time_only"] = combined["Time"].dt.time
-        combined = combined[
-            (combined["time_only"] >= market_open) &
-            (combined["time_only"] <= market_close)
-        ].drop(columns=["time_only"])
-        logger.info(f"  After resampling: {len(combined)} candles")
+    # Resample to 2-min
+    logger.info(f"Resampling {len(combined)} 1-min candles → 2-min...")
+    combined = combined.set_index('Time')
+    resampled = combined.resample('2min', label='left', closed='left').agg({
+        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum',
+    }).dropna().reset_index()
 
-    combined.to_csv(output_file, index=False)
+    resampled["_t"] = resampled["Time"].dt.time
+    resampled = resampled[(resampled["_t"] >= mkt_open) & (resampled["_t"] <= mkt_close)].drop(columns=["_t"])
 
-    total_days = combined["Time"].dt.date.nunique()
-    logger.info(f"\n✅ {interval} FETCH COMPLETE")
-    logger.info(f"  Total candles: {len(combined)}")
-    logger.info(f"  Trading days:  {total_days}")
-    logger.info(f"  Date range:    {combined['Time'].iloc[0]} → {combined['Time'].iloc[-1]}")
-    logger.info(f"  Saved to:      {output_file}")
-
-
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="Fetch NIFTY 2-min and 3-min data for RF strategy")
-    parser.add_argument("--interval", default="ALL",
-                        choices=["TWO_MINUTE", "THREE_MINUTE", "ALL"],
-                        help="Which interval to fetch (default: ALL)")
-    args = parser.parse_args()
-
-    smart_api = connect_api()
-
-    if args.interval == "ALL":
-        for interval in INTERVAL_CONFIG:
-            fetch_interval(smart_api, interval)
-    else:
-        fetch_interval(smart_api, args.interval)
-
-    logger.info(f"\n{'='*60}")
-    logger.info(f"ALL DONE!")
-    logger.info(f"{'='*60}")
+    resampled.to_csv(OUTPUT_FILE, index=False)
+    logger.info(f"✅ Done: {len(resampled)} candles | {resampled['Time'].dt.date.nunique()} days → {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":

@@ -1,38 +1,20 @@
 """
-rf_strategy.py — Random Forest + UT Bot + StochRSI Strategy (NIFTY)
+rf_strategy.py — Random Forest + UT Bot + StochRSI Strategy (NIFTY 2-MIN ONLY)
 
-ARCHITECTURE:
-  Two SEPARATE models trained and evaluated INDEPENDENTLY:
-    Model A: Trained on 2-minute candle data
-    Model B: Trained on 3-minute candle data
-
-  Each model gets its OWN:
-    - Feature set (UT Bot + StochRSI + ATR + momentum + patterns)
-    - Random Forest classifier
-    - Backtest results
-    - Trade categorization (HIGH / MID / LOW points)
-
-  Results are printed side-by-side for comparison.
-
-STRATEGY LOGIC (per timeframe):
-  Phase 1 (09:15-11:00): OBSERVATION — analyze market direction
-    → RF builds regime confidence from morning price action patterns
-    → Determine if market is BULLISH or BEARISH
-
-  Phase 2 (11:00-15:15): ACTIVE TRADING
-    LONG:  RF=BULL + StochRSI K < 10 (oversold) + UT Bot bullish
-    SHORT: RF=BEAR + StochRSI K > 90 (overbought) + UT Bot bearish
-
-  Regime Change: If RF flips direction → close + reverse
-
-ZERO LOOK-AHEAD:
-  Regime labels use forward EMА slope — only for training.
-  At inference: model uses current/past data only.
+STRATEGY:
+  - Timeframe: 2-minute candles ONLY
+  - ATR gate: >= 12 (configurable via --min-atr)
+  - Phase 1 (09:15-13:00): OBSERVATION — analyze market direction, no trades
+  - Phase 2 (13:00-15:12): ACTIVE TRADING
+      LONG:  RF=BULL + StochRSI K < 10 + UT Bot bullish + ATR >= 12
+      SHORT: RF=BEAR + StochRSI K > 90 + UT Bot bearish + ATR >= 12
+  - Test period: March + April 2026 (2 months)
 
 Usage:
-    python rf_strategy.py                                    # Both timeframes
-    python rf_strategy.py --test-from 2026-04-01             # April test
-    python rf_strategy.py --stoch-buy 15 --stoch-sell 85     # Adjust thresholds
+    python rf_strategy.py                                # Default: test Mar+Apr 2026
+    python rf_strategy.py --min-atr 15                   # Change ATR gate
+    python rf_strategy.py --stoch-buy 15 --stoch-sell 85 # Adjust StochRSI thresholds
+    python rf_strategy.py --test-from 2026-03-01         # Custom test start
 """
 
 import pandas as pd
@@ -53,12 +35,12 @@ from sklearn.metrics import classification_report, accuracy_score
 # ─────────── Config ───────────
 ATR_PERIOD = 14
 ATR_KEY_VALUE = 1.0
-MIN_ATR = 6.5
+MIN_ATR = 12.0                          # ATR gate (configurable)
 
-OBSERVATION_END = dt_time(11, 0)
-ENTRY_START = dt_time(11, 0)
-ENTRY_END = dt_time(15, 15)
-SQUARE_OFF = dt_time(15, 24)
+OBSERVATION_END = dt_time(13, 0)        # Analyze until 1:00 PM
+ENTRY_START = dt_time(13, 0)            # Trading starts 1:00 PM
+ENTRY_END = dt_time(15, 12)             # No new trades after 3:12 PM
+SQUARE_OFF = dt_time(15, 20)            # Square off 3:20 PM
 
 STOCH_BUY_THRESHOLD = 10
 STOCH_SELL_THRESHOLD = 90
@@ -72,10 +54,8 @@ REGIME_SLOPE_THRESHOLD = 0.02
 LOT_SIZE = 65
 BASE_LOTS = 2
 
-# Trade categorization thresholds (in points)
-HIGH_POINTS_THRESHOLD = 30   # > 30 pts = HIGH
-MID_POINTS_THRESHOLD = 10    # 10-30 pts = MID
-                              # < 10 pts = LOW
+HIGH_POINTS_THRESHOLD = 30
+MID_POINTS_THRESHOLD = 10
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -162,14 +142,11 @@ def calc_ema(series, period):
 
 
 # ═══════════════════════════════════════════
-#  FEATURE ENGINEERING (SINGLE TIMEFRAME)
+#  FEATURE ENGINEERING (2-MIN ONLY)
 # ═══════════════════════════════════════════
 
-def build_features(df, tf_label=""):
-    """Build features from a single timeframe dataframe.
-    tf_label: suffix like '2m' or '3m' for column naming.
-    """
-    sfx = f"_{tf_label}" if tf_label else ""
+def build_features(df):
+    """Build features from 2-min candle data."""
     close = df['Close'].astype(float)
     high = df['High'].astype(float)
     low = df['Low'].astype(float)
@@ -188,73 +165,71 @@ def build_features(df, tf_label=""):
 
     features = pd.DataFrame(index=df.index)
 
-    # ── Core Indicators ──
-    features[f'atr{sfx}'] = atr
-    features[f'rsi{sfx}'] = rsi
-    features[f'stoch_k{sfx}'] = stoch_k
-    features[f'stoch_d{sfx}'] = stoch_d
-    features[f'stoch_kd_diff{sfx}'] = stoch_k - stoch_d
-    features[f'ut_dir{sfx}'] = dirn
-    features[f'close_vs_trail{sfx}'] = close.values - trail
+    # Core indicators
+    features['atr'] = atr
+    features['rsi'] = rsi
+    features['stoch_k'] = stoch_k
+    features['stoch_d'] = stoch_d
+    features['stoch_kd_diff'] = stoch_k - stoch_d
+    features['ut_dir'] = dirn
+    features['close_vs_trail'] = close.values - trail
 
-    # ── UT Bot change detection ──
+    # UT Bot signals
     ut_change = np.diff(dirn, prepend=dirn[0])
-    features[f'ut_change{sfx}'] = ut_change
-    features[f'ut_buy_signal{sfx}'] = (ut_change > 0).astype(int)
-    features[f'ut_sell_signal{sfx}'] = (ut_change < 0).astype(int)
+    features['ut_change'] = ut_change
+    features['ut_buy_signal'] = (ut_change > 0).astype(int)
+    features['ut_sell_signal'] = (ut_change < 0).astype(int)
 
-    # ── StochRSI zone flags ──
-    features[f'stoch_oversold{sfx}'] = (stoch_k < STOCH_BUY_THRESHOLD).astype(int)
-    features[f'stoch_overbought{sfx}'] = (stoch_k > STOCH_SELL_THRESHOLD).astype(int)
-    features[f'stoch_k_cross_up_d{sfx}'] = ((stoch_k > stoch_d) & (stoch_k.shift(1) <= stoch_d.shift(1))).astype(int)
-    features[f'stoch_k_cross_dn_d{sfx}'] = ((stoch_k < stoch_d) & (stoch_k.shift(1) >= stoch_d.shift(1))).astype(int)
+    # StochRSI zones
+    features['stoch_oversold'] = (stoch_k < STOCH_BUY_THRESHOLD).astype(int)
+    features['stoch_overbought'] = (stoch_k > STOCH_SELL_THRESHOLD).astype(int)
+    features['stoch_k_cross_up'] = ((stoch_k > stoch_d) & (stoch_k.shift(1) <= stoch_d.shift(1))).astype(int)
+    features['stoch_k_cross_dn'] = ((stoch_k < stoch_d) & (stoch_k.shift(1) >= stoch_d.shift(1))).astype(int)
 
-    # ── Price Momentum ──
-    features[f'mom_3{sfx}'] = close.pct_change(3) * 100
-    features[f'mom_5{sfx}'] = close.pct_change(5) * 100
-    features[f'mom_10{sfx}'] = close.pct_change(10) * 100
-    features[f'mom_20{sfx}'] = close.pct_change(20) * 100
+    # Price momentum
+    features['mom_3'] = close.pct_change(3) * 100
+    features['mom_5'] = close.pct_change(5) * 100
+    features['mom_10'] = close.pct_change(10) * 100
+    features['mom_20'] = close.pct_change(20) * 100
 
-    # ── Candle Patterns ──
-    features[f'body{sfx}'] = close - opn
-    features[f'body_pct{sfx}'] = (close - opn) / opn * 100
-    features[f'upper_wick{sfx}'] = high - close.where(close > opn, opn)
-    features[f'lower_wick{sfx}'] = close.where(close < opn, opn) - low
-    features[f'range{sfx}'] = high - low
-    features[f'body_vs_range{sfx}'] = (close - opn).abs() / (high - low).replace(0, 1e-10)
+    # Candle patterns
+    features['body'] = close - opn
+    features['body_pct'] = (close - opn) / opn * 100
+    features['upper_wick'] = high - close.where(close > opn, opn)
+    features['lower_wick'] = close.where(close < opn, opn) - low
+    features['range'] = high - low
+    features['body_vs_range'] = (close - opn).abs() / (high - low).replace(0, 1e-10)
 
-    # ── Volatility ──
-    features[f'std_5{sfx}'] = close.rolling(5).std()
-    features[f'std_10{sfx}'] = close.rolling(10).std()
-    features[f'std_20{sfx}'] = close.rolling(20).std()
+    # Volatility
+    features['std_5'] = close.rolling(5).std()
+    features['std_10'] = close.rolling(10).std()
+    features['std_20'] = close.rolling(20).std()
 
-    # ── EMA relationships ──
-    features[f'close_vs_ema5{sfx}'] = close - ema_5
-    features[f'close_vs_ema10{sfx}'] = close - ema_10
-    features[f'close_vs_ema20{sfx}'] = close - ema_20
-    features[f'close_vs_ema50{sfx}'] = close - ema_50
-    features[f'ema5_vs_ema10{sfx}'] = ema_5 - ema_10
-    features[f'ema10_vs_ema20{sfx}'] = ema_10 - ema_20
-    features[f'ema20_vs_ema50{sfx}'] = ema_20 - ema_50
-    features[f'ema20_slope{sfx}'] = ema_20.diff(3) / 3
+    # EMA relationships
+    features['close_vs_ema5'] = close - ema_5
+    features['close_vs_ema10'] = close - ema_10
+    features['close_vs_ema20'] = close - ema_20
+    features['close_vs_ema50'] = close - ema_50
+    features['ema5_vs_ema10'] = ema_5 - ema_10
+    features['ema10_vs_ema20'] = ema_10 - ema_20
+    features['ema20_vs_ema50'] = ema_20 - ema_50
+    features['ema20_slope'] = ema_20.diff(3) / 3
 
-    # ── High/Low channels ──
-    features[f'close_vs_high5{sfx}'] = close - high.rolling(5).max()
-    features[f'close_vs_low5{sfx}'] = close - low.rolling(5).min()
-    features[f'close_vs_high10{sfx}'] = close - high.rolling(10).max()
-    features[f'close_vs_low10{sfx}'] = close - low.rolling(10).min()
+    # High/Low channels
+    features['close_vs_high5'] = close - high.rolling(5).max()
+    features['close_vs_low5'] = close - low.rolling(5).min()
+    features['close_vs_high10'] = close - high.rolling(10).max()
+    features['close_vs_low10'] = close - low.rolling(10).min()
 
-    # ── Morning session pattern (for regime detection before 11:00) ──
-    # Count of bullish/bearish candles in last N bars
+    # Morning session patterns
     bullish_candle = (close > opn).astype(int)
-    features[f'bullish_count_10{sfx}'] = bullish_candle.rolling(10).sum()
-    features[f'bullish_count_20{sfx}'] = bullish_candle.rolling(20).sum()
-    features[f'bullish_ratio_10{sfx}'] = features[f'bullish_count_10{sfx}'] / 10
-    features[f'bullish_ratio_20{sfx}'] = features[f'bullish_count_20{sfx}'] / 20
+    features['bullish_count_10'] = bullish_candle.rolling(10).sum()
+    features['bullish_count_20'] = bullish_candle.rolling(20).sum()
+    features['bullish_ratio_10'] = features['bullish_count_10'] / 10
+    features['bullish_ratio_20'] = features['bullish_count_20'] / 20
 
-    # ── Cumulative return from day start (intraday bias) ──
-    # This requires knowing the day's open — compute per day later in main
-    features[f'day_return{sfx}'] = 0.0  # placeholder, filled in main
+    # Day return (filled later)
+    features['day_return'] = 0.0
 
     return features
 
@@ -264,32 +239,21 @@ def build_features(df, tf_label=""):
 # ═══════════════════════════════════════════
 
 def generate_regime_labels(df, forward_candles=30, slope_threshold=0.02):
-    """
-    Regime labels based on forward EMA20 slope.
-    BULL (+1) / BEAR (-1) / CHOP (0)
-    Only used for training — no look-ahead at inference.
-    """
     close = df['Close'].astype(float)
     ema_20 = calc_ema(close, 20)
-
     n = len(df)
     labels = np.zeros(n, dtype=int)
 
     for i in range(n - forward_candles):
         current_ema = ema_20.iloc[i]
         future_ema = ema_20.iloc[i + forward_candles]
-
         if current_ema == 0:
             continue
-
         slope = (future_ema - current_ema) / current_ema * 100
-
         if slope > slope_threshold:
-            labels[i] = 1    # BULL
+            labels[i] = 1
         elif slope < -slope_threshold:
-            labels[i] = -1   # BEAR
-        else:
-            labels[i] = 0    # CHOP
+            labels[i] = -1
 
     return labels
 
@@ -298,9 +262,9 @@ def generate_regime_labels(df, forward_candles=30, slope_threshold=0.02):
 #  TRAINING
 # ═══════════════════════════════════════════
 
-def train_random_forest(X_train, y_train, X_test, y_test, n_estimators=500, label=""):
-    y_train_mapped = y_train + 1
-    y_test_mapped = y_test + 1
+def train_random_forest(X_train, y_train, X_test, y_test, n_estimators=500):
+    y_train_m = y_train + 1
+    y_test_m = y_test + 1
 
     model = RandomForestClassifier(
         n_estimators=n_estimators,
@@ -314,8 +278,8 @@ def train_random_forest(X_train, y_train, X_test, y_test, n_estimators=500, labe
         verbose=0,
     )
 
-    print(f"\n  Training Random Forest ({n_estimators} trees) [{label}]...")
-    model.fit(X_train, y_train_mapped)
+    print(f"\n  Training Random Forest ({n_estimators} trees)...")
+    model.fit(X_train, y_train_m)
 
     train_pred = model.predict(X_train) - 1
     test_pred = model.predict(X_test) - 1
@@ -323,11 +287,8 @@ def train_random_forest(X_train, y_train, X_test, y_test, n_estimators=500, labe
     train_acc = accuracy_score(y_train, train_pred) * 100
     test_acc = accuracy_score(y_test, test_pred) * 100
     print(f"  Train acc: {train_acc:.1f}% | Test acc: {test_acc:.1f}%")
-
-    target_names = ['BEAR', 'CHOP', 'BULL']
     print(classification_report(y_test + 1, test_pred + 1,
-                                target_names=target_names, zero_division=0))
-
+                                target_names=['BEAR', 'CHOP', 'BULL'], zero_division=0))
     return model
 
 
@@ -336,15 +297,7 @@ def train_random_forest(X_train, y_train, X_test, y_test, n_estimators=500, labe
 # ═══════════════════════════════════════════
 
 def backtest_strategy(df, regime_predictions, stoch_k_vals, ut_dir_vals, atr_vals,
-                      stoch_buy_thresh=10, stoch_sell_thresh=90):
-    """
-    Backtest with:
-      - No trades before ENTRY_START (11:00)
-      - LONG:  regime=BULL + StochRSI < buy_thresh + UT_Bot bullish
-      - SHORT: regime=BEAR + StochRSI > sell_thresh + UT_Bot bearish
-      - Regime flip → close position
-      - Trailing SL + Square off
-    """
+                      stoch_buy_thresh=10, stoch_sell_thresh=90, min_atr=12.0):
     close = df['Close'].astype(float)
     high_v = df['High'].astype(float)
     low_v = df['Low'].astype(float)
@@ -422,7 +375,7 @@ def backtest_strategy(df, regime_predictions, stoch_k_vals, ut_dir_vals, atr_val
                 _add_daily(daily_results, curr_date, trade)
                 pos = None
 
-        # Trail SL update
+        # Trailing SL update
         if pos:
             if pos['dir'] == "LONG":
                 new_sl = c - curr_atr * ATR_KEY_VALUE
@@ -433,12 +386,11 @@ def backtest_strategy(df, regime_predictions, stoch_k_vals, ut_dir_vals, atr_val
                 if new_sl < pos['sl']:
                     pos['sl'] = new_sl
 
-        # Current indicators
         regime = regime_predictions[i]
         sk = stoch_k_vals[i] if not np.isnan(stoch_k_vals[i]) else 50
         ut_d = ut_dir_vals[i]
 
-        # Regime change → close existing
+        # Regime flip → close
         if regime == 1 and pos and pos['dir'] == "SHORT":
             trade = _make_trade(pos, c, df.iloc[i]['Time'], "REGIME_FLIP",
                                 current_lots, pos.get('initial_sl'))
@@ -452,8 +404,8 @@ def backtest_strategy(df, regime_predictions, stoch_k_vals, ut_dir_vals, atr_val
             _add_daily(daily_results, curr_date, trade)
             pos = None
 
-        # New entry
-        if not pos and in_window and curr_atr >= MIN_ATR:
+        # New entry: ATR >= min_atr required
+        if not pos and in_window and curr_atr >= min_atr:
             if regime == 1 and sk < stoch_buy_thresh and ut_d == 1:
                 sl = c - curr_atr * ATR_KEY_VALUE
                 pos = {'dir': 'LONG', 'entry': c, 'sl': sl, 'initial_sl': sl,
@@ -467,10 +419,7 @@ def backtest_strategy(df, regime_predictions, stoch_k_vals, ut_dir_vals, atr_val
 
 
 def _pnl(pos, exit_price):
-    if pos['dir'] == "LONG":
-        return exit_price - pos['entry']
-    else:
-        return pos['entry'] - exit_price
+    return (exit_price - pos['entry']) if pos['dir'] == "LONG" else (pos['entry'] - exit_price)
 
 
 def _make_trade(pos, exit_price, exit_time, reason, lots=2, sl=None):
@@ -501,33 +450,15 @@ def _add_daily(daily_results, date, trade):
 # ═══════════════════════════════════════════
 
 def categorize_trades(trades):
-    """Categorize trades into HIGH / MID / LOW point buckets."""
     high_pts = [t for t in trades if abs(t['raw_pnl']) >= HIGH_POINTS_THRESHOLD]
     mid_pts = [t for t in trades if MID_POINTS_THRESHOLD <= abs(t['raw_pnl']) < HIGH_POINTS_THRESHOLD]
     low_pts = [t for t in trades if abs(t['raw_pnl']) < MID_POINTS_THRESHOLD]
     return high_pts, mid_pts, low_pts
 
 
-def print_category_stats(trades, category_name):
-    """Print stats for a trade category."""
-    if not trades:
-        print(f"    {category_name}: No trades")
-        return
-
-    n = len(trades)
-    wins = [t for t in trades if t['pnl'] > 0]
-    losses = [t for t in trades if t['pnl'] <= 0]
-    wr = len(wins) / n * 100
-    total_pnl = sum(t['pnl'] for t in trades)
-    avg_pnl = total_pnl / n
-
-    print(f"    {category_name}: {n} trades | Win: {wr:.0f}% | "
-          f"P&L: {total_pnl:+.2f} pts | Avg: {avg_pnl:+.2f} pts")
-
-
-def print_results(all_trades, daily_results, label="", tf_name=""):
+def print_results(all_trades, daily_results, label=""):
     if not all_trades:
-        print(f"\n❌ No trades [{tf_name}]")
+        print("❌ No trades")
         return
 
     n = len(all_trades)
@@ -553,7 +484,7 @@ def print_results(all_trades, daily_results, label="", tf_name=""):
     win_days = sum(1 for d in daily_results.values() if d['pnl'] > 0)
 
     print(f"\n{'='*70}")
-    print(f"  🌲 RANDOM FOREST [{tf_name}] — {label}")
+    print(f"  🌲 RANDOM FOREST [2-MIN] — {label}")
     print(f"{'='*70}")
     print(f"  Total trades:      {n}")
     print(f"  Win rate:          {wr:.1f}%")
@@ -563,29 +494,26 @@ def print_results(all_trades, daily_results, label="", tf_name=""):
     print(f"  Avg loss:          {avg_loss:+.2f} pts")
     print(f"  Max drawdown:      {max_dd:.2f} pts")
     print(f"  Trading days:      {trading_days}")
-    print(f"  Profitable days:   {win_days} ({win_days/max(trading_days,1)*100:.0f}%)")
+    print(f"  Win days:          {win_days} ({win_days/max(trading_days,1)*100:.0f}%)")
     print(f"  Avg P&L/day:       {total_pnl/max(trading_days,1):+.2f} pts")
 
-    # ── Trade Categories ──
+    # Categories
     high_pts, mid_pts, low_pts = categorize_trades(all_trades)
-    print(f"\n  📊 TRADE CATEGORIES (by absolute points):")
-    print(f"    HIGH (>={HIGH_POINTS_THRESHOLD} pts):")
-    print_category_stats(high_pts, "     HIGH")
-    print(f"    MID ({MID_POINTS_THRESHOLD}-{HIGH_POINTS_THRESHOLD} pts):")
-    print_category_stats(mid_pts, "      MID")
-    print(f"    LOW (<{MID_POINTS_THRESHOLD} pts):")
-    print_category_stats(low_pts, "      LOW")
+    print(f"\n  📊 TRADE CATEGORIES:")
+    for cat_name, cat_trades, thresh in [
+        (f"HIGH (>={HIGH_POINTS_THRESHOLD}pts)", high_pts, None),
+        (f"MID ({MID_POINTS_THRESHOLD}-{HIGH_POINTS_THRESHOLD}pts)", mid_pts, None),
+        (f"LOW (<{MID_POINTS_THRESHOLD}pts)", low_pts, None),
+    ]:
+        if not cat_trades:
+            print(f"    {cat_name}: 0 trades")
+            continue
+        cn = len(cat_trades)
+        cw = sum(1 for t in cat_trades if t['pnl'] > 0)
+        cp = sum(t['pnl'] for t in cat_trades)
+        print(f"    {cat_name}: {cn} trades | Win: {cw}/{cn} ({cw/cn*100:.0f}%) | P&L: {cp:+.2f}")
 
-    # ── Winning trades by category ──
-    high_wins = [t for t in high_pts if t['pnl'] > 0]
-    mid_wins = [t for t in mid_pts if t['pnl'] > 0]
-    low_wins = [t for t in low_pts if t['pnl'] > 0]
-    print(f"\n  ✅ WINNING TRADES by category:")
-    print(f"    HIGH wins: {len(high_wins)} | P&L: {sum(t['pnl'] for t in high_wins):+.2f} pts")
-    print(f"    MID wins:  {len(mid_wins)} | P&L: {sum(t['pnl'] for t in mid_wins):+.2f} pts")
-    print(f"    LOW wins:  {len(low_wins)} | P&L: {sum(t['pnl'] for t in low_wins):+.2f} pts")
-
-    # ── Daily results ──
+    # Daily
     sorted_days = sorted(daily_results.keys())
     print(f"\n  {'Date':>12} {'Lots':>5} {'Trades':>7} {'P&L':>10} {'Status':>8}")
     print(f"  {'-'*45}")
@@ -594,7 +522,7 @@ def print_results(all_trades, daily_results, label="", tf_name=""):
         trades = daily_results[day]['trades']
         day_pnl = daily_results[day]['pnl']
         lots = daily_results[day].get('lots', BASE_LOTS)
-        if len(trades) == 0:
+        if not trades:
             continue
         cum += day_pnl
         icon = "✅" if day_pnl > 0 else "❌" if day_pnl < 0 else "➖"
@@ -615,7 +543,7 @@ def print_results(all_trades, daily_results, label="", tf_name=""):
     print(f"\n{'='*70}")
 
 
-def print_detailed_daily_log(all_trades, daily_results, tf_name="", log_file=None):
+def print_detailed_log(all_trades, daily_results, log_file="rf_detailed_log.txt"):
     sorted_days = sorted(daily_results.keys())
     lines = []
 
@@ -624,7 +552,7 @@ def print_detailed_daily_log(all_trades, daily_results, tf_name="", log_file=Non
         lines.append(s)
 
     out(f"\n{'='*110}")
-    out(f"  📋 DETAILED TRADE LOG — [{tf_name}]")
+    out(f"  📋 DETAILED TRADE LOG — 2-MIN RANDOM FOREST")
     out(f"{'='*110}")
 
     day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
@@ -634,141 +562,218 @@ def print_detailed_daily_log(all_trades, daily_results, tf_name="", log_file=Non
         trades = daily_results[day]['trades']
         day_pnl = daily_results[day]['pnl']
         lots = daily_results[day].get('lots', BASE_LOTS)
-
-        if len(trades) == 0:
+        if not trades:
             continue
 
         cum_pnl += day_pnl
-        day_name = day_names[day.weekday()]
-        wins = sum(1 for t in trades if t['pnl'] > 0)
-        losses_count = len(trades) - wins
-        wr = wins / len(trades) * 100
+        dn = day_names[day.weekday()]
+        w = sum(1 for t in trades if t['pnl'] > 0)
+        l = len(trades) - w
+        wr = w / len(trades) * 100
         icon = "✅" if day_pnl > 0 else "❌" if day_pnl < 0 else "➖"
 
-        out(f"\n  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐")
-        out(f"  │ 📅 {day} ({day_name}) | Lots: {lots} | Trades: {len(trades)} (W:{wins} L:{losses_count} {wr:.0f}%) | Day P&L: {day_pnl:+.2f} {icon} | Cum: {cum_pnl:+.2f}")
-        out(f"  ├───┬──────┬───────────┬───────────┬───────────┬───────────┬────────────┬──────────┬─────────────┤")
-        out(f"  │ # │ Dir  │ Entry Time│ Exit Time │ Entry Pr  │ Exit Pr   │ SL         │ P&L      │ Exit Reason │")
-        out(f"  ├───┼──────┼───────────┼───────────┼───────────┼───────────┼────────────┼──────────┼─────────────┤")
+        out(f"\n  ┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐")
+        out(f"  │ 📅 {day} ({dn}) | Lots: {lots} | Trades: {len(trades)} (W:{w} L:{l} {wr:.0f}%) | P&L: {day_pnl:+.2f} {icon} | Cum: {cum_pnl:+.2f}")
+        out(f"  ├───┬──────┬───────────┬───────────┬───────────┬───────────┬──────────┬─────────────┤")
+        out(f"  │ # │ Dir  │ Entry     │ Exit      │ Entry Pr  │ Exit Pr   │ P&L      │ Reason      │")
+        out(f"  ├───┼──────┼───────────┼───────────┼───────────┼───────────┼──────────┼─────────────┤")
 
         for j, t in enumerate(trades, 1):
-            entry_t = t['entry_time'].strftime('%H:%M') if hasattr(t['entry_time'], 'strftime') else str(t['entry_time'])[-8:-3]
-            exit_t = t['exit_time'].strftime('%H:%M') if hasattr(t['exit_time'], 'strftime') else str(t['exit_time'])[-8:-3]
-            sl_str = f"{t['sl']:.2f}" if 'sl' in t else "---"
-            dir_icon = "🟢" if t['dir'] == 'LONG' else "🔴"
-            pnl_icon = "✅" if t['pnl'] > 0 else "❌" if t['pnl'] < 0 else "➖"
-            out(f"  │{j:>2} │ {dir_icon}{t['dir']:>4} │ {entry_t:>9} │ {exit_t:>9} │ {t['entry']:>9.2f} │ {t['exit']:>9.2f} │ {sl_str:>10} │ {t['pnl']:>+7.2f}{pnl_icon}│ {t['reason']:<12}│")
+            et = t['entry_time'].strftime('%H:%M') if hasattr(t['entry_time'], 'strftime') else str(t['entry_time'])[-8:-3]
+            xt = t['exit_time'].strftime('%H:%M') if hasattr(t['exit_time'], 'strftime') else str(t['exit_time'])[-8:-3]
+            di = "🟢" if t['dir'] == 'LONG' else "🔴"
+            pi = "✅" if t['pnl'] > 0 else "❌" if t['pnl'] < 0 else "➖"
+            out(f"  │{j:>2} │ {di}{t['dir']:>4} │ {et:>9} │ {xt:>9} │ {t['entry']:>9.2f} │ {t['exit']:>9.2f} │ {t['pnl']:>+7.2f}{pi}│ {t['reason']:<12}│")
 
-        out(f"  └───┴──────┴───────────┴───────────┴───────────┴───────────┴────────────┴──────────┴─────────────┘")
+        out(f"  └───┴──────┴───────────┴───────────┴───────────┴───────────┴──────────┴─────────────┘")
 
     out(f"\n{'='*110}")
-    out(f"  GRAND TOTAL [{tf_name}]: {cum_pnl:+.2f} pts")
+    out(f"  GRAND TOTAL: {cum_pnl:+.2f} pts")
     out(f"{'='*110}")
 
-    if log_file:
-        log_path = os.path.join(SCRIPT_DIR, log_file)
-        with open(log_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(lines))
-        print(f"\n💾 Detailed log saved: {log_path}")
-
-
-def print_comparison(results_2m, results_3m):
-    """Print side-by-side comparison of 2-min vs 3-min results."""
-    print(f"\n{'='*70}")
-    print(f"  📊 COMPARISON: 2-MINUTE vs 3-MINUTE")
-    print(f"{'='*70}")
-
-    def _stats(trades, daily):
-        if not trades:
-            return {'n': 0, 'wr': 0, 'pnl': 0, 'pf': 0, 'dd': 0, 'days': 0, 'win_days': 0}
-        n = len(trades)
-        wins = [t for t in trades if t['pnl'] > 0]
-        losses = [t for t in trades if t['pnl'] <= 0]
-        wr = len(wins) / n * 100
-        pnl = sum(t['pnl'] for t in trades)
-        gp = sum(t['pnl'] for t in wins) if wins else 0
-        gl = abs(sum(t['pnl'] for t in losses)) if losses else 1
-        pf = gp / gl if gl > 0 else 0
-        pnl_list = [t['pnl'] for t in trades]
-        cumulative = np.cumsum(pnl_list)
-        peak = np.maximum.accumulate(cumulative)
-        dd = (peak - cumulative).max()
-        trading_days = sum(1 for d in daily.values() if len(d['trades']) > 0)
-        win_days = sum(1 for d in daily.values() if d['pnl'] > 0)
-        high, mid, low = categorize_trades(trades)
-        return {'n': n, 'wr': wr, 'pnl': pnl, 'pf': pf, 'dd': dd,
-                'days': trading_days, 'win_days': win_days,
-                'high': len(high), 'mid': len(mid), 'low': len(low)}
-
-    s2 = _stats(*results_2m) if results_2m[0] else _stats([], {})
-    s3 = _stats(*results_3m) if results_3m[0] else _stats([], {})
-
-    print(f"\n  {'Metric':<22} {'2-MIN':>12} {'3-MIN':>12} {'BETTER':>10}")
-    print(f"  {'-'*58}")
-
-    def _row(label, v2, v3, fmt="+.2f", higher_better=True):
-        s2_str = f"{v2:{fmt}}"
-        s3_str = f"{v3:{fmt}}"
-        if v2 == v3:
-            better = "TIE"
-        elif (v2 > v3) == higher_better:
-            better = "← 2-MIN"
-        else:
-            better = "3-MIN →"
-        print(f"  {label:<22} {s2_str:>12} {s3_str:>12} {better:>10}")
-
-    _row("Total Trades", s2['n'], s3['n'], "d", False)
-    _row("Win Rate %", s2['wr'], s3['wr'], ".1f")
-    _row("Total P&L", s2['pnl'], s3['pnl'])
-    _row("Profit Factor", s2['pf'], s3['pf'], ".2f")
-    _row("Max Drawdown", s2['dd'], s3['dd'], ".2f", False)
-    _row("Trading Days", s2['days'], s3['days'], "d")
-    _row("Win Days", s2['win_days'], s3['win_days'], "d")
-    _row("HIGH pt trades", s2.get('high',0), s3.get('high',0), "d")
-    _row("MID pt trades", s2.get('mid',0), s3.get('mid',0), "d")
-    _row("LOW pt trades", s2.get('low',0), s3.get('low',0), "d")
-
-    print(f"  {'-'*58}")
-    winner = "2-MINUTE" if s2['pnl'] > s3['pnl'] else "3-MINUTE" if s3['pnl'] > s2['pnl'] else "TIE"
-    print(f"\n  🏆 OVERALL WINNER: {winner}")
-    print(f"{'='*70}")
+    log_path = os.path.join(SCRIPT_DIR, log_file)
+    with open(log_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+    print(f"\n💾 Log saved: {log_path}")
 
 
 # ═══════════════════════════════════════════
-#  RUN PIPELINE FOR ONE TIMEFRAME
+#  EXPORT FOR FRONTEND
 # ═══════════════════════════════════════════
 
-def run_single_timeframe(df, tf_name, test_from_date, n_estimators=500,
-                          stoch_buy=10, stoch_sell=90, regime_thresh=0.02,
-                          regime_forward=30):
-    """Run the full pipeline for a single timeframe. Returns (trades, daily_results, model)."""
-    print(f"\n{'#'*70}")
-    print(f"  RUNNING PIPELINE: {tf_name}")
-    print(f"{'#'*70}")
+def export_frontend_data(df_test, all_trades, stoch_k_vals, stoch_d_vals,
+                          atr_vals, ut_dir_vals, regime_preds):
+    """Export candle data + trade markers as JSON for frontend chart."""
+
+    # Candle data
+    candles = []
+    for i, row in df_test.iterrows():
+        candles.append({
+            'time': int(row['Time'].timestamp()),
+            'open': round(float(row['Open']), 2),
+            'high': round(float(row['High']), 2),
+            'low': round(float(row['Low']), 2),
+            'close': round(float(row['Close']), 2),
+        })
+
+    # Trade markers
+    markers = []
+    for t in all_trades:
+        entry_ts = int(t['entry_time'].timestamp()) if hasattr(t['entry_time'], 'timestamp') else 0
+        exit_ts = int(t['exit_time'].timestamp()) if hasattr(t['exit_time'], 'timestamp') else 0
+
+        markers.append({
+            'type': 'entry',
+            'time': entry_ts,
+            'price': t['entry'],
+            'dir': t['dir'],
+            'pnl': t['pnl'],
+            'reason': t['reason'],
+        })
+        markers.append({
+            'type': 'exit',
+            'time': exit_ts,
+            'price': t['exit'],
+            'dir': t['dir'],
+            'pnl': t['pnl'],
+            'reason': t['reason'],
+        })
+
+    # Indicator lines (sampled to reduce JSON size)
+    stoch_data = []
+    atr_data = []
+    for i, row in df_test.iterrows():
+        ts = int(row['Time'].timestamp())
+        sk = float(stoch_k_vals[i]) if not np.isnan(stoch_k_vals[i]) else None
+        sd = float(stoch_d_vals[i]) if not np.isnan(stoch_d_vals[i]) else None
+        stoch_data.append({'time': ts, 'k': sk, 'd': sd})
+        atr_data.append({'time': ts, 'value': round(float(atr_vals[i]), 2)})
+
+    data = {
+        'candles': candles,
+        'markers': markers,
+        'stochRSI': stoch_data,
+        'atr': atr_data,
+        'config': {
+            'stochBuy': STOCH_BUY_THRESHOLD,
+            'stochSell': STOCH_SELL_THRESHOLD,
+            'minATR': MIN_ATR,
+            'entryStart': str(ENTRY_START),
+            'entryEnd': str(ENTRY_END),
+            'squareOff': str(SQUARE_OFF),
+        },
+        'summary': {
+            'total_trades': len(all_trades),
+            'wins': sum(1 for t in all_trades if t['pnl'] > 0),
+            'losses': sum(1 for t in all_trades if t['pnl'] <= 0),
+            'total_pnl': round(sum(t['pnl'] for t in all_trades), 2),
+            'win_rate': round(sum(1 for t in all_trades if t['pnl'] > 0) / max(len(all_trades), 1) * 100, 1),
+        },
+        'trades': [{
+            'dir': t['dir'],
+            'entry': t['entry'],
+            'exit': t['exit'],
+            'entry_time': t['entry_time'].isoformat() if hasattr(t['entry_time'], 'isoformat') else str(t['entry_time']),
+            'exit_time': t['exit_time'].isoformat() if hasattr(t['exit_time'], 'isoformat') else str(t['exit_time']),
+            'pnl': t['pnl'],
+            'raw_pnl': t['raw_pnl'],
+            'reason': t['reason'],
+        } for t in all_trades],
+    }
+
+    out_path = os.path.join(SCRIPT_DIR, "frontend_data.json")
+    with open(out_path, 'w') as f:
+        json.dump(data, f)
+    print(f"💾 Frontend data exported: {out_path} ({len(candles)} candles, {len(markers)} markers)")
+    return out_path
+
+
+# ═══════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════
+
+def main():
+    global ATR_KEY_VALUE, MIN_ATR, ENTRY_START, ENTRY_END, SQUARE_OFF
+    global STOCH_BUY_THRESHOLD, STOCH_SELL_THRESHOLD, OBSERVATION_END
+
+    parser = argparse.ArgumentParser(description="RF + StochRSI + UT Bot (2-MIN ONLY)")
+    parser.add_argument("--file", default=os.path.join(SCRIPT_DIR, "nifty_2min_data.csv"))
+    parser.add_argument("--atr-key", type=float, default=ATR_KEY_VALUE)
+    parser.add_argument("--min-atr", type=float, default=MIN_ATR, help="Min ATR to enter (default: 12)")
+    parser.add_argument("--stoch-buy", type=float, default=STOCH_BUY_THRESHOLD)
+    parser.add_argument("--stoch-sell", type=float, default=STOCH_SELL_THRESHOLD)
+    parser.add_argument("--regime-thresh", type=float, default=REGIME_SLOPE_THRESHOLD)
+    parser.add_argument("--regime-forward", type=int, default=REGIME_FORWARD_CANDLES)
+    parser.add_argument("--rf-trees", type=int, default=500)
+    parser.add_argument("--obs-end", type=str, default="13:00", help="Observation end (default: 13:00)")
+    parser.add_argument("--window-end", type=str, default="15:12", help="Entry window end (default: 15:12)")
+    parser.add_argument("--square-off", type=str, default="15:20", help="Square off (default: 15:20)")
+    parser.add_argument("--test-from", type=str, default="2026-03-01", help="Test start (default: 2026-03-01)")
+    args = parser.parse_args()
+
+    ATR_KEY_VALUE = args.atr_key
+    MIN_ATR = args.min_atr
+    STOCH_BUY_THRESHOLD = args.stoch_buy
+    STOCH_SELL_THRESHOLD = args.stoch_sell
+
+    def parse_time(s):
+        h, m = map(int, s.split(':'))
+        return dt_time(h, m)
+
+    OBSERVATION_END = parse_time(args.obs_end)
+    ENTRY_START = OBSERVATION_END
+    ENTRY_END = parse_time(args.window_end)
+    SQUARE_OFF = parse_time(args.square_off)
+
+    test_from_date = datetime.strptime(args.test_from, "%Y-%m-%d").date()
+
+    print(f"{'='*70}")
+    print(f"  🌲 RANDOM FOREST + STOCHRSI + UT BOT [2-MIN ONLY]")
+    print(f"{'='*70}")
+    print(f"  Observation: 09:15 - {args.obs_end}")
+    print(f"  Trading:     {args.obs_end} - {args.window_end}")
+    print(f"  Square off:  {args.square_off}")
+    print(f"  ATR gate:    >= {MIN_ATR}")
+    print(f"  StochRSI:    BUY < {STOCH_BUY_THRESHOLD} | SELL > {STOCH_SELL_THRESHOLD}")
+    print(f"  Test from:   {args.test_from} (March + April 2026)")
+
+    # Load data
+    print(f"\n📊 Loading: {args.file}")
+    try:
+        df = pd.read_csv(args.file)
+    except FileNotFoundError:
+        print(f"❌ File not found: {args.file}")
+        return
+
+    df['Time'] = pd.to_datetime(df['Time'])
+    df = df.sort_values('Time').reset_index(drop=True)
+    total_candles = len(df)
+    total_days = df['Time'].dt.date.nunique()
+    print(f"  {total_candles:,} candles | {total_days} days")
+    print(f"  Range: {df['Time'].iloc[0].strftime('%Y-%m-%d')} → {df['Time'].iloc[-1].strftime('%Y-%m-%d')}")
 
     # Build features
-    print(f"\n  📊 Building features [{tf_name}]...")
-    features = build_features(df, tf_name.replace('-', '').replace(' ', ''))
-    print(f"    Features: {features.shape[1]} columns")
+    print(f"\n📊 Building features...")
+    features = build_features(df)
+    print(f"  Features: {features.shape[1]} columns")
 
     # Fill day_return
     close = df['Close'].astype(float)
-    suffix = f"_{tf_name.replace('-', '').replace(' ', '')}"
     day_groups = df.groupby(df['Time'].dt.date)
     day_returns = pd.Series(0.0, index=df.index)
     for day, group in day_groups:
         day_open = float(group.iloc[0]['Open'])
         if day_open > 0:
             day_returns.loc[group.index] = (close.loc[group.index] - day_open) / day_open * 100
-    features[f'day_return{suffix}'] = day_returns.values
+    features['day_return'] = day_returns.values
 
-    # Generate regime labels
-    print(f"  🏷️  Generating regime labels [{tf_name}]...")
-    labels = generate_regime_labels(df, regime_forward, regime_thresh)
+    # Labels
+    print(f"  Generating regime labels...")
+    labels = generate_regime_labels(df, args.regime_forward, args.regime_thresh)
     bull = (labels == 1).sum()
     bear = (labels == -1).sum()
     chop = (labels == 0).sum()
-    print(f"    BULL={bull} ({bull/len(labels)*100:.1f}%) | "
+    print(f"  BULL={bull} ({bull/len(labels)*100:.1f}%) | "
           f"BEAR={bear} ({bear/len(labels)*100:.1f}%) | "
           f"CHOP={chop} ({chop/len(labels)*100:.1f}%)")
 
@@ -790,197 +795,96 @@ def run_single_timeframe(df, tf_name, test_from_date, n_estimators=500,
     train_days = dates[dates < test_from_date].nunique()
     test_days = dates[dates >= test_from_date].nunique()
 
-    print(f"    Train: {len(X_train)} samples ({train_days} days)")
-    print(f"    Test:  {len(X_test)} samples ({test_days} days)")
+    print(f"\n  Train: {len(X_train)} samples ({train_days} days) [up to {args.test_from}]")
+    print(f"  Test:  {len(X_test)} samples ({test_days} days) [{args.test_from} onwards]")
 
     if len(X_train) == 0 or len(X_test) == 0:
-        print(f"  ❌ Insufficient data for [{tf_name}]. Skipping.")
-        return [], {}, None, features
+        print("❌ Insufficient data!")
+        return
 
-    # Train RF
-    rf_model = train_random_forest(X_train, y_train, X_test, y_test,
-                                    n_estimators, label=tf_name)
+    # Train
+    rf_model = train_random_forest(X_train, y_train, X_test, y_test, args.rf_trees)
 
     # Feature importance
     importance = rf_model.feature_importances_
     feat_names = features.columns.tolist()
     top_features = sorted(zip(feat_names, importance), key=lambda x: -x[1])[:10]
-    print(f"\n  📊 TOP 10 FEATURES [{tf_name}]:")
+    print(f"\n  📊 TOP 10 FEATURES:")
     for name, imp in top_features:
-        print(f"    {name:>35}: {imp:.4f}")
+        print(f"    {name:>25}: {imp:.4f}")
 
-    # Generate predictions
-    print(f"\n  🔮 Generating predictions [{tf_name}]...")
+    # Predictions
+    print(f"\n  🔮 Generating predictions...")
     rf_full_pred = np.zeros(len(df), dtype=int)
     rf_test_pred = rf_model.predict(X_test) - 1
     rf_full_pred[test_mask] = rf_test_pred
-    print(f"    BULL={sum(rf_test_pred==1)} BEAR={sum(rf_test_pred==-1)} CHOP={sum(rf_test_pred==0)}")
 
-    # Prepare indicators for backtest
+    # Indicators
     atr_vals = calc_atr(df, ATR_PERIOD).values
     stoch_k_vals, stoch_d_vals = calc_stochastic_rsi(
         close, STOCH_RSI_PERIOD, STOCH_RSI_PERIOD, STOCH_K_SMOOTH, STOCH_D_SMOOTH
     )
     stoch_k_vals = stoch_k_vals.values
+    stoch_d_vals = stoch_d_vals.values
     _, ut_dir_vals = calc_ut_bot_direction(close, calc_atr(df, ATR_PERIOD), ATR_KEY_VALUE)
 
-    # Backtest on test set
-    print(f"\n  🚀 Running backtest [{tf_name}]...")
+    # Backtest
+    print(f"\n  🚀 Running backtest (test period)...")
     test_df_mask = dates >= test_from_date
     df_test = df[test_df_mask].reset_index(drop=True)
     pred_test = rf_full_pred[test_df_mask]
     atr_test = atr_vals[test_df_mask]
     stoch_k_test = stoch_k_vals[test_df_mask]
+    stoch_d_test = stoch_d_vals[test_df_mask]
     ut_dir_test = ut_dir_vals[test_df_mask]
 
     all_trades, daily_results = backtest_strategy(
         df_test, pred_test, stoch_k_test, ut_dir_test, atr_test,
-        stoch_buy_thresh=stoch_buy, stoch_sell_thresh=stoch_sell,
+        stoch_buy_thresh=STOCH_BUY_THRESHOLD,
+        stoch_sell_thresh=STOCH_SELL_THRESHOLD,
+        min_atr=MIN_ATR,
     )
 
     test_start = df_test['Time'].dt.date.min()
     test_end = df_test['Time'].dt.date.max()
-    print_results(all_trades, daily_results,
-                  f"TEST ({test_start} → {test_end})", tf_name)
-    print_detailed_daily_log(all_trades, daily_results,
-                             tf_name, f"rf_detailed_log_{tf_name.lower().replace('-','').replace(' ','')}.txt")
+    print_results(all_trades, daily_results, f"TEST ({test_start} → {test_end})")
+    print_detailed_log(all_trades, daily_results)
 
-    # Save trades
-    if all_trades:
-        trades_df = pd.DataFrame(all_trades)
-        trades_path = os.path.join(SCRIPT_DIR, f"rf_trades_{tf_name.lower().replace('-','').replace(' ','')}.csv")
-        trades_df.to_csv(trades_path, index=False)
-        print(f"  💾 Trades saved: {trades_path}")
+    # Export for frontend
+    export_frontend_data(df_test, all_trades, stoch_k_test, stoch_d_test,
+                          atr_test, ut_dir_test, pred_test)
 
     # Save model
-    model_path = os.path.join(SCRIPT_DIR, f"rf_model_{tf_name.lower().replace('-','').replace(' ','')}.pkl")
+    model_path = os.path.join(SCRIPT_DIR, "rf_model.pkl")
     with open(model_path, 'wb') as f:
         pickle.dump(rf_model, f)
-    print(f"  💾 Model saved: {model_path}")
+    print(f"💾 Model saved: {model_path}")
 
-    return all_trades, daily_results, rf_model, features
+    # Save trades CSV
+    if all_trades:
+        trades_df = pd.DataFrame(all_trades)
+        tp = os.path.join(SCRIPT_DIR, "rf_trades.csv")
+        trades_df.to_csv(tp, index=False)
+        print(f"💾 Trades CSV: {tp}")
 
-
-# ═══════════════════════════════════════════
-#  MAIN
-# ═══════════════════════════════════════════
-
-def main():
-    global ATR_KEY_VALUE, MIN_ATR, ENTRY_START, ENTRY_END, SQUARE_OFF
-    global STOCH_BUY_THRESHOLD, STOCH_SELL_THRESHOLD, OBSERVATION_END
-
-    parser = argparse.ArgumentParser(description="RF + StochRSI + UT Bot (2-min & 3-min SEPARATE)")
-    parser.add_argument("--file-2m", default=os.path.join(SCRIPT_DIR, "nifty_2min_data.csv"), help="2-min data")
-    parser.add_argument("--file-3m", default=os.path.join(SCRIPT_DIR, "nifty_3min_data.csv"), help="3-min data")
-    parser.add_argument("--atr-key", type=float, default=ATR_KEY_VALUE)
-    parser.add_argument("--min-atr", type=float, default=MIN_ATR)
-    parser.add_argument("--stoch-buy", type=float, default=STOCH_BUY_THRESHOLD)
-    parser.add_argument("--stoch-sell", type=float, default=STOCH_SELL_THRESHOLD)
-    parser.add_argument("--regime-thresh", type=float, default=REGIME_SLOPE_THRESHOLD)
-    parser.add_argument("--regime-forward", type=int, default=REGIME_FORWARD_CANDLES,
-                        help="Forward candles for regime label (default: 30)")
-    parser.add_argument("--rf-trees", type=int, default=500)
-    parser.add_argument("--obs-end", type=str, default="11:00")
-    parser.add_argument("--window-end", type=str, default="15:15")
-    parser.add_argument("--square-off", type=str, default="15:24")
-    parser.add_argument("--test-from", type=str, default="2026-04-01")
-    parser.add_argument("--only-2m", action="store_true", help="Run only 2-min")
-    parser.add_argument("--only-3m", action="store_true", help="Run only 3-min")
-    args = parser.parse_args()
-
-    ATR_KEY_VALUE = args.atr_key
-    MIN_ATR = args.min_atr
-    STOCH_BUY_THRESHOLD = args.stoch_buy
-    STOCH_SELL_THRESHOLD = args.stoch_sell
-
-    def parse_time(s):
-        h, m = map(int, s.split(':'))
-        return dt_time(h, m)
-
-    OBSERVATION_END = parse_time(args.obs_end)
-    ENTRY_START = OBSERVATION_END
-    ENTRY_END = parse_time(args.window_end)
-    SQUARE_OFF = parse_time(args.square_off)
-
-    test_from_date = datetime.strptime(args.test_from, "%Y-%m-%d").date()
-
-    print(f"{'='*70}")
-    print(f"  🌲 RANDOM FOREST + STOCHRSI + UT BOT")
-    print(f"  SEPARATE 2-MIN & 3-MIN MODELS")
-    print(f"{'='*70}")
-    print(f"  Observation: 09:15 - {args.obs_end}")
-    print(f"  Trading:     {args.obs_end} - {args.window_end}")
-    print(f"  Square off:  {args.square_off}")
-    print(f"  StochRSI BUY: K < {STOCH_BUY_THRESHOLD} | SELL: K > {STOCH_SELL_THRESHOLD}")
-    print(f"  Test from:   {args.test_from}")
-
-    results_2m = ([], {})
-    results_3m = ([], {})
-
-    # ── 2-MINUTE MODEL ──
-    if not args.only_3m:
-        print(f"\n📊 Loading 2-min data: {args.file_2m}")
-        try:
-            df_2m = pd.read_csv(args.file_2m)
-            df_2m['Time'] = pd.to_datetime(df_2m['Time'])
-            df_2m = df_2m.sort_values('Time').reset_index(drop=True)
-            print(f"  {len(df_2m):,} candles | {df_2m['Time'].dt.date.nunique()} days")
-            print(f"  Range: {df_2m['Time'].iloc[0].strftime('%Y-%m-%d')} → "
-                  f"{df_2m['Time'].iloc[-1].strftime('%Y-%m-%d')}")
-
-            trades_2m, daily_2m, model_2m, feats_2m = run_single_timeframe(
-                df_2m, "2-MIN", test_from_date,
-                n_estimators=args.rf_trees,
-                stoch_buy=STOCH_BUY_THRESHOLD,
-                stoch_sell=STOCH_SELL_THRESHOLD,
-                regime_thresh=args.regime_thresh,
-                regime_forward=args.regime_forward,
-            )
-            results_2m = (trades_2m, daily_2m)
-        except FileNotFoundError:
-            print(f"  ❌ File not found: {args.file_2m}")
-
-    # ── 3-MINUTE MODEL ──
-    if not args.only_2m:
-        print(f"\n📊 Loading 3-min data: {args.file_3m}")
-        try:
-            df_3m = pd.read_csv(args.file_3m)
-            df_3m['Time'] = pd.to_datetime(df_3m['Time'])
-            df_3m = df_3m.sort_values('Time').reset_index(drop=True)
-            print(f"  {len(df_3m):,} candles | {df_3m['Time'].dt.date.nunique()} days")
-            print(f"  Range: {df_3m['Time'].iloc[0].strftime('%Y-%m-%d')} → "
-                  f"{df_3m['Time'].iloc[-1].strftime('%Y-%m-%d')}")
-
-            trades_3m, daily_3m, model_3m, feats_3m = run_single_timeframe(
-                df_3m, "3-MIN", test_from_date,
-                n_estimators=args.rf_trees,
-                stoch_buy=STOCH_BUY_THRESHOLD,
-                stoch_sell=STOCH_SELL_THRESHOLD,
-                regime_thresh=args.regime_thresh,
-                regime_forward=args.regime_forward,
-            )
-            results_3m = (trades_3m, daily_3m)
-        except FileNotFoundError:
-            print(f"  ❌ File not found: {args.file_3m}")
-
-    # ── COMPARISON ──
-    if not args.only_2m and not args.only_3m:
-        print_comparison(results_2m, results_3m)
-
-    # ── Save metadata ──
+    # Metadata
     metadata = {
-        "strategy": "Random Forest + StochRSI + UT Bot (Separate 2m/3m)",
-        "test_from": args.test_from,
+        "strategy": "Random Forest + StochRSI + UT Bot (2-MIN)",
+        "min_atr": MIN_ATR,
         "stoch_buy": STOCH_BUY_THRESHOLD,
         "stoch_sell": STOCH_SELL_THRESHOLD,
         "observation_end": args.obs_end,
+        "entry_end": args.window_end,
+        "test_from": args.test_from,
         "rf_trees": args.rf_trees,
+        "total_trades": len(all_trades),
+        "total_pnl": round(sum(t['pnl'] for t in all_trades), 2) if all_trades else 0,
         "last_trained_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-    meta_path = os.path.join(SCRIPT_DIR, "model_metadata.json")
-    with open(meta_path, "w") as f:
+    mp = os.path.join(SCRIPT_DIR, "model_metadata.json")
+    with open(mp, "w") as f:
         json.dump(metadata, f, indent=4)
-    print(f"\n💾 Metadata saved: {meta_path}")
+    print(f"💾 Metadata: {mp}")
 
 
 if __name__ == "__main__":

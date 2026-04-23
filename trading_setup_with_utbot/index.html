@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RF Strategy — 2-Min Backtest Results</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        :root {
+            --bg-primary: #0a0e17;
+            --bg-secondary: #111827;
+            --bg-card: #1a1f2e;
+            --bg-card-hover: #222838;
+            --border: #2a3040;
+            --text-primary: #e8ecf4;
+            --text-secondary: #8b95a8;
+            --text-muted: #5a6478;
+            --accent-green: #00e676;
+            --accent-green-dim: rgba(0,230,118,0.15);
+            --accent-red: #ff5252;
+            --accent-red-dim: rgba(255,82,82,0.15);
+            --accent-blue: #448aff;
+            --accent-blue-dim: rgba(68,138,255,0.15);
+            --accent-yellow: #ffd740;
+            --accent-purple: #b388ff;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #0d1321 0%, #1a1f33 100%);
+            border-bottom: 1px solid var(--border);
+            padding: 16px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .header h1 {
+            font-size: 18px;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .header .subtitle {
+            font-size: 12px;
+            color: var(--text-muted);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        /* Summary Cards */
+        .summary-bar {
+            display: flex;
+            gap: 12px;
+            padding: 16px 24px;
+            overflow-x: auto;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-secondary);
+        }
+
+        .stat-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 12px 18px;
+            min-width: 130px;
+            transition: all 0.2s ease;
+        }
+
+        .stat-card:hover {
+            background: var(--bg-card-hover);
+            border-color: var(--accent-blue);
+            transform: translateY(-1px);
+        }
+
+        .stat-card .label {
+            font-size: 10px;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            letter-spacing: 0.5px;
+            margin-bottom: 4px;
+        }
+
+        .stat-card .value {
+            font-size: 20px;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .stat-card .value.green { color: var(--accent-green); }
+        .stat-card .value.red { color: var(--accent-red); }
+        .stat-card .value.blue { color: var(--accent-blue); }
+        .stat-card .value.yellow { color: var(--accent-yellow); }
+
+        /* Layout */
+        .main-layout {
+            display: flex;
+            height: calc(100vh - 145px);
+        }
+
+        /* Chart */
+        .chart-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            border-right: 1px solid var(--border);
+        }
+
+        .chart-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 16px;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .chart-toolbar .day-btn {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            padding: 5px 12px;
+            border-radius: 6px;
+            font-size: 11px;
+            font-family: 'JetBrains Mono', monospace;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+
+        .chart-toolbar .day-btn:hover, .chart-toolbar .day-btn.active {
+            background: var(--accent-blue-dim);
+            border-color: var(--accent-blue);
+            color: var(--accent-blue);
+        }
+
+        .chart-toolbar .day-btn.has-trades {
+            border-color: var(--accent-green);
+            color: var(--accent-green);
+        }
+
+        #chartContainer {
+            flex: 1;
+            position: relative;
+        }
+
+        .chart-legend {
+            position: absolute;
+            top: 8px;
+            left: 16px;
+            z-index: 10;
+            display: flex;
+            gap: 16px;
+            font-size: 10px;
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--text-muted);
+        }
+
+        .chart-legend span {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .chart-legend .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        /* Side Panel */
+        .side-panel {
+            width: 380px;
+            display: flex;
+            flex-direction: column;
+            background: var(--bg-secondary);
+            overflow: hidden;
+        }
+
+        .panel-tabs {
+            display: flex;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .panel-tabs button {
+            flex: 1;
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            padding: 10px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+        }
+
+        .panel-tabs button.active {
+            color: var(--accent-blue);
+            border-bottom-color: var(--accent-blue);
+        }
+
+        .panel-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 12px;
+        }
+
+        .panel-content::-webkit-scrollbar { width: 4px; }
+        .panel-content::-webkit-scrollbar-track { background: var(--bg-secondary); }
+        .panel-content::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+        /* Trade Row */
+        .trade-row {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 10px 12px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            transition: all 0.15s;
+            font-size: 12px;
+        }
+
+        .trade-row:hover {
+            border-color: var(--accent-blue);
+            transform: translateX(2px);
+        }
+
+        .trade-row.win { border-left: 3px solid var(--accent-green); }
+        .trade-row.loss { border-left: 3px solid var(--accent-red); }
+
+        .trade-row .trade-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 4px;
+        }
+
+        .trade-row .trade-dir {
+            font-weight: 700;
+            font-size: 13px;
+        }
+
+        .trade-row .trade-dir.long { color: var(--accent-green); }
+        .trade-row .trade-dir.short { color: var(--accent-red); }
+
+        .trade-row .trade-pnl {
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .trade-row .trade-pnl.pos { color: var(--accent-green); }
+        .trade-row .trade-pnl.neg { color: var(--accent-red); }
+
+        .trade-row .trade-details {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 10px;
+            color: var(--text-muted);
+            line-height: 1.5;
+        }
+
+        .trade-row .trade-reason {
+            display: inline-block;
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 9px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .trade-reason.TRAIL_SL { background: var(--accent-red-dim); color: var(--accent-red); }
+        .trade-reason.REGIME_FLIP { background: var(--accent-blue-dim); color: var(--accent-blue); }
+        .trade-reason.SQUARE_OFF { background: rgba(255,215,64,0.15); color: var(--accent-yellow); }
+        .trade-reason.DAY_END { background: rgba(179,136,255,0.15); color: var(--accent-purple); }
+
+        /* Config Panel */
+        .config-section {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 8px;
+        }
+
+        .config-section h3 {
+            font-size: 11px;
+            text-transform: uppercase;
+            color: var(--accent-blue);
+            margin-bottom: 8px;
+            letter-spacing: 0.5px;
+        }
+
+        .config-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 11px;
+            padding: 3px 0;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .config-row .key { color: var(--text-muted); }
+        .config-row .val { color: var(--text-primary); font-weight: 500; }
+
+        /* Category badges */
+        .cat-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 9px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+
+        .cat-badge.high { background: rgba(0,230,118,0.2); color: var(--accent-green); }
+        .cat-badge.mid { background: rgba(68,138,255,0.2); color: var(--accent-blue); }
+        .cat-badge.low { background: rgba(255,215,64,0.2); color: var(--accent-yellow); }
+
+        /* Loading */
+        .loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            font-size: 14px;
+            color: var(--text-muted);
+        }
+
+        @keyframes pulse { 0%,100%{opacity:0.4} 50%{opacity:1} }
+        .loading span { animation: pulse 1.5s ease-in-out infinite; }
+    </style>
+</head>
+<body>
+
+<div class="header">
+    <div>
+        <h1>🌲 Random Forest — 2-Min Backtest</h1>
+        <div class="subtitle" id="headerSubtitle">Loading data...</div>
+    </div>
+    <div style="text-align:right;">
+        <div class="subtitle" id="headerConfig"></div>
+    </div>
+</div>
+
+<div class="summary-bar" id="summaryBar">
+    <div class="stat-card"><div class="label">Total P&L</div><div class="value" id="sPnl">—</div></div>
+    <div class="stat-card"><div class="label">Win Rate</div><div class="value" id="sWR">—</div></div>
+    <div class="stat-card"><div class="label">Trades</div><div class="value blue" id="sTrades">—</div></div>
+    <div class="stat-card"><div class="label">Wins</div><div class="value green" id="sWins">—</div></div>
+    <div class="stat-card"><div class="label">Losses</div><div class="value red" id="sLosses">—</div></div>
+    <div class="stat-card"><div class="label">Profit Factor</div><div class="value" id="sPF">—</div></div>
+    <div class="stat-card"><div class="label">Max DD</div><div class="value red" id="sDD">—</div></div>
+</div>
+
+<div class="main-layout">
+    <div class="chart-panel">
+        <div class="chart-toolbar" id="dayBar"></div>
+        <div id="chartContainer">
+            <div class="chart-legend">
+                <span><span class="dot" style="background:var(--accent-green)"></span> BUY Entry</span>
+                <span><span class="dot" style="background:var(--accent-red)"></span> SELL Entry</span>
+                <span><span class="dot" style="background:var(--accent-yellow)"></span> Exit</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="side-panel">
+        <div class="panel-tabs">
+            <button class="active" onclick="showTab('trades')">📋 Trades</button>
+            <button onclick="showTab('config')">⚙️ Config</button>
+        </div>
+        <div class="panel-content" id="panelContent">
+            <div class="loading"><span>Loading...</span></div>
+        </div>
+    </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════
+//  DATA & STATE
+// ═══════════════════════════════════════════
+let DATA = null;
+let chart = null;
+let candleSeries = null;
+let markerSeries = [];
+let currentTab = 'trades';
+let selectedDay = null;
+
+// ═══════════════════════════════════════════
+//  LOAD DATA
+// ═══════════════════════════════════════════
+async function loadData() {
+    try {
+        const res = await fetch('frontend_data.json');
+        DATA = await res.json();
+        initApp();
+    } catch(e) {
+        document.getElementById('panelContent').innerHTML =
+            `<div class="loading"><span>❌ Cannot load frontend_data.json<br>Run rf_strategy.py first!</span></div>`;
+    }
+}
+
+// ═══════════════════════════════════════════
+//  INIT
+// ═══════════════════════════════════════════
+function initApp() {
+    const s = DATA.summary;
+
+    // Header
+    document.getElementById('headerSubtitle').textContent =
+        `${DATA.candles.length} candles | ${DATA.trades.length} trades`;
+    document.getElementById('headerConfig').textContent =
+        `ATR ≥ ${DATA.config.minATR} | StochRSI: Buy<${DATA.config.stochBuy} Sell>${DATA.config.stochSell} | ${DATA.config.entryStart}–${DATA.config.entryEnd}`;
+
+    // Summary
+    const pnl = s.total_pnl;
+    document.getElementById('sPnl').textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(2);
+    document.getElementById('sPnl').className = 'value ' + (pnl >= 0 ? 'green' : 'red');
+    document.getElementById('sWR').textContent = s.win_rate + '%';
+    document.getElementById('sWR').className = 'value ' + (s.win_rate >= 50 ? 'green' : 'red');
+    document.getElementById('sTrades').textContent = s.total_trades;
+    document.getElementById('sWins').textContent = s.wins;
+    document.getElementById('sLosses').textContent = s.losses;
+
+    const gp = DATA.trades.filter(t => t.pnl > 0).reduce((a, t) => a + t.pnl, 0);
+    const gl = Math.abs(DATA.trades.filter(t => t.pnl <= 0).reduce((a, t) => a + t.pnl, 0)) || 1;
+    document.getElementById('sPF').textContent = (gp / gl).toFixed(2);
+    document.getElementById('sPF').className = 'value ' + (gp/gl >= 1 ? 'green' : 'red');
+
+    const pnls = DATA.trades.map(t => t.pnl);
+    let cum = 0, peak = 0, maxDD = 0;
+    pnls.forEach(p => { cum += p; if (cum > peak) peak = cum; if (peak - cum > maxDD) maxDD = peak - cum; });
+    document.getElementById('sDD').textContent = maxDD.toFixed(2);
+
+    // Day buttons
+    const days = [...new Set(DATA.candles.map(c => {
+        const d = new Date(c.time * 1000);
+        return d.toISOString().split('T')[0];
+    }))];
+
+    const tradeDays = new Set(DATA.trades.map(t => t.entry_time.split('T')[0]));
+
+    const dayBar = document.getElementById('dayBar');
+    dayBar.innerHTML = '<button class="day-btn active" onclick="showAllDays()">ALL</button>';
+    days.forEach(d => {
+        const short = d.slice(5);
+        const hasTrades = tradeDays.has(d);
+        const btn = document.createElement('button');
+        btn.className = 'day-btn' + (hasTrades ? ' has-trades' : '');
+        btn.textContent = short;
+        btn.onclick = () => showDay(d);
+        dayBar.appendChild(btn);
+    });
+
+    // Chart
+    initChart();
+    showAllDays();
+    showTab('trades');
+}
+
+// ═══════════════════════════════════════════
+//  CHART
+// ═══════════════════════════════════════════
+function initChart() {
+    const container = document.getElementById('chartContainer');
+    chart = LightweightCharts.createChart(container, {
+        width: container.clientWidth,
+        height: container.clientHeight,
+        layout: {
+            background: { type: 'solid', color: '#0a0e17' },
+            textColor: '#8b95a8',
+            fontFamily: "'JetBrains Mono', monospace",
+            fontSize: 10,
+        },
+        grid: {
+            vertLines: { color: 'rgba(42,48,64,0.5)' },
+            horzLines: { color: 'rgba(42,48,64,0.5)' },
+        },
+        crosshair: { mode: 0 },
+        timeScale: {
+            timeVisible: true,
+            secondsVisible: false,
+            borderColor: '#2a3040',
+        },
+        rightPriceScale: { borderColor: '#2a3040' },
+    });
+
+    candleSeries = chart.addCandlestickSeries({
+        upColor: '#00e676',
+        downColor: '#ff5252',
+        borderUpColor: '#00e676',
+        borderDownColor: '#ff5252',
+        wickUpColor: '#00e676',
+        wickDownColor: '#ff5252',
+    });
+
+    new ResizeObserver(() => {
+        chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
+    }).observe(container);
+}
+
+function showAllDays() {
+    selectedDay = null;
+    updateChart(DATA.candles, DATA.markers);
+    updateDayButtons(null);
+    if (currentTab === 'trades') renderTrades(DATA.trades);
+}
+
+function showDay(day) {
+    selectedDay = day;
+    const dayStart = new Date(day + 'T00:00:00').getTime() / 1000;
+    const dayEnd = dayStart + 86400;
+
+    const candles = DATA.candles.filter(c => c.time >= dayStart && c.time < dayEnd);
+    const markers = DATA.markers.filter(m => m.time >= dayStart && m.time < dayEnd);
+    const trades = DATA.trades.filter(t => t.entry_time.startsWith(day));
+
+    updateChart(candles, markers);
+    updateDayButtons(day);
+    if (currentTab === 'trades') renderTrades(trades);
+}
+
+function updateChart(candles, markers) {
+    candleSeries.setData(candles);
+
+    // Convert trade markers to lightweight-charts markers
+    const chartMarkers = markers.map(m => {
+        if (m.type === 'entry') {
+            return {
+                time: m.time,
+                position: m.dir === 'LONG' ? 'belowBar' : 'aboveBar',
+                color: m.dir === 'LONG' ? '#00e676' : '#ff5252',
+                shape: m.dir === 'LONG' ? 'arrowUp' : 'arrowDown',
+                text: m.dir === 'LONG' ? 'BUY' : 'SELL',
+            };
+        } else {
+            return {
+                time: m.time,
+                position: m.pnl > 0 ? 'aboveBar' : 'belowBar',
+                color: '#ffd740',
+                shape: 'circle',
+                text: (m.pnl >= 0 ? '+' : '') + m.pnl.toFixed(1),
+            };
+        }
+    }).sort((a, b) => a.time - b.time);
+
+    candleSeries.setMarkers(chartMarkers);
+    chart.timeScale().fitContent();
+}
+
+function updateDayButtons(activeDay) {
+    document.querySelectorAll('.day-btn').forEach(btn => {
+        btn.classList.remove('active');
+        if (!activeDay && btn.textContent === 'ALL') btn.classList.add('active');
+        if (activeDay && btn.textContent === activeDay.slice(5)) btn.classList.add('active');
+    });
+}
+
+// ═══════════════════════════════════════════
+//  TABS
+// ═══════════════════════════════════════════
+function showTab(tab) {
+    currentTab = tab;
+    document.querySelectorAll('.panel-tabs button').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.panel-tabs button').forEach(b => {
+        if ((tab === 'trades' && b.textContent.includes('Trades')) ||
+            (tab === 'config' && b.textContent.includes('Config')))
+            b.classList.add('active');
+    });
+
+    if (tab === 'trades') {
+        const trades = selectedDay
+            ? DATA.trades.filter(t => t.entry_time.startsWith(selectedDay))
+            : DATA.trades;
+        renderTrades(trades);
+    } else {
+        renderConfig();
+    }
+}
+
+function renderTrades(trades) {
+    const panel = document.getElementById('panelContent');
+    if (!trades.length) {
+        panel.innerHTML = '<div class="loading"><span>No trades for this day</span></div>';
+        return;
+    }
+
+    let html = '';
+    trades.forEach((t, i) => {
+        const isWin = t.pnl > 0;
+        const absRaw = Math.abs(t.raw_pnl);
+        let cat = 'low', catLabel = 'LOW';
+        if (absRaw >= 30) { cat = 'high'; catLabel = 'HIGH'; }
+        else if (absRaw >= 10) { cat = 'mid'; catLabel = 'MID'; }
+
+        const entryTime = t.entry_time.includes('T') ? t.entry_time.split('T')[1].slice(0,5) : t.entry_time.slice(11,16);
+        const exitTime = t.exit_time.includes('T') ? t.exit_time.split('T')[1].slice(0,5) : t.exit_time.slice(11,16);
+        const entryDate = t.entry_time.split('T')[0];
+
+        html += `
+        <div class="trade-row ${isWin ? 'win' : 'loss'}" onclick="jumpToTrade('${entryDate}', ${t.entry})">
+            <div class="trade-header">
+                <span>
+                    <span class="trade-dir ${t.dir.toLowerCase()}">${t.dir === 'LONG' ? '🟢' : '🔴'} ${t.dir}</span>
+                    <span class="cat-badge ${cat}">${catLabel}</span>
+                </span>
+                <span class="trade-pnl ${isWin ? 'pos' : 'neg'}">${t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(2)}</span>
+            </div>
+            <div class="trade-details">
+                ${entryDate} | ${entryTime} → ${exitTime}<br>
+                Entry: ${t.entry.toFixed(2)} → Exit: ${t.exit.toFixed(2)}
+                <span class="trade-reason ${t.reason}">${t.reason}</span>
+            </div>
+        </div>`;
+    });
+
+    panel.innerHTML = html;
+}
+
+function renderConfig() {
+    const c = DATA.config;
+    const panel = document.getElementById('panelContent');
+    panel.innerHTML = `
+    <div class="config-section">
+        <h3>Trading Window</h3>
+        <div class="config-row"><span class="key">Observation</span><span class="val">09:15 → ${c.entryStart}</span></div>
+        <div class="config-row"><span class="key">Active Trading</span><span class="val">${c.entryStart} → ${c.entryEnd}</span></div>
+        <div class="config-row"><span class="key">Square Off</span><span class="val">${c.squareOff}</span></div>
+    </div>
+    <div class="config-section">
+        <h3>Entry Conditions</h3>
+        <div class="config-row"><span class="key">Min ATR</span><span class="val">≥ ${c.minATR}</span></div>
+        <div class="config-row"><span class="key">StochRSI BUY</span><span class="val">K &lt; ${c.stochBuy}</span></div>
+        <div class="config-row"><span class="key">StochRSI SELL</span><span class="val">K &gt; ${c.stochSell}</span></div>
+        <div class="config-row"><span class="key">RF Regime</span><span class="val">BULL for BUY, BEAR for SELL</span></div>
+        <div class="config-row"><span class="key">UT Bot</span><span class="val">Must confirm direction</span></div>
+    </div>
+    <div class="config-section">
+        <h3>Trade Categories</h3>
+        <div class="config-row"><span class="key"><span class="cat-badge high">HIGH</span></span><span class="val">≥ 30 pts</span></div>
+        <div class="config-row"><span class="key"><span class="cat-badge mid">MID</span></span><span class="val">10-30 pts</span></div>
+        <div class="config-row"><span class="key"><span class="cat-badge low">LOW</span></span><span class="val">&lt; 10 pts</span></div>
+    </div>
+    <div class="config-section">
+        <h3>Summary Stats</h3>
+        <div class="config-row"><span class="key">Total Candles</span><span class="val">${DATA.candles.length.toLocaleString()}</span></div>
+        <div class="config-row"><span class="key">Total Trades</span><span class="val">${DATA.trades.length}</span></div>
+        <div class="config-row"><span class="key">Total P&L</span><span class="val">${DATA.summary.total_pnl >= 0 ? '+' : ''}${DATA.summary.total_pnl.toFixed(2)} pts</span></div>
+    </div>`;
+}
+
+function jumpToTrade(day, price) {
+    showDay(day);
+    // Scroll to approximate candle
+    const dayStart = new Date(day + 'T00:00:00').getTime() / 1000;
+    const dayEnd = dayStart + 86400;
+    chart.timeScale().setVisibleRange({ from: dayStart, to: dayEnd });
+}
+
+// ═══════════════════════════════════════════
+//  INIT
+// ═══════════════════════════════════════════
+loadData();
+</script>
+
+</body>
+</html>
