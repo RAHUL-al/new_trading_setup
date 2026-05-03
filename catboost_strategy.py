@@ -50,8 +50,8 @@ LOOKAHEAD = 5                     # N candles ahead for labeling
 THRESHOLD = 8.0                   # Min pts for buy/sell label
 
 # Fixed train/test split by year
-TRAIN_END_YEAR = 2024             # Train: 2022-2024
-TEST_START_YEAR = 2025            # Test: 2025-2026
+TRAIN_END_YEAR = 2025             # Train: 2019-2025 (Dec)
+TEST_START_YEAR = 2026            # Test: 2026 onwards
 
 
 # ─────────── Indicators ───────────
@@ -550,7 +550,7 @@ def main():
     parser.add_argument("--window-start", type=str, default="09:20", help="Entry window start (HH:MM, default: 09:20)")
     parser.add_argument("--window-end", type=str, default="15:15", help="Entry window end (HH:MM, default: 15:15)")
     parser.add_argument("--square-off", type=str, default="15:24", help="Square off time (HH:MM, default: 15:24)")
-    parser.add_argument("--test-from", type=str, default="2025-01-01", help="Test data start date (YYYY-MM-DD, default: 2025-01-01)")
+    parser.add_argument("--test-from", type=str, default="2026-01-01", help="Test data start date (YYYY-MM-DD, default: 2026-01-01)")
     args = parser.parse_args()
 
     ATR_KEY_VALUE = args.atr_key
