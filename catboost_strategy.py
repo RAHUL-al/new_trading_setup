@@ -50,7 +50,7 @@ LOOKAHEAD = 5                     # N candles ahead for labeling
 THRESHOLD = 8.0                   # Min pts for buy/sell label
 
 # Fixed train/test split by year
-TRAIN_END_YEAR = 2024             # Train: 2019-2024
+TRAIN_END_YEAR = 2024             # Train: 2022-2024
 TEST_START_YEAR = 2025            # Test: 2025-2026
 
 
