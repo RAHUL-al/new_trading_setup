@@ -657,18 +657,24 @@ def main():
     print(f"\n  Train: {len(X_train)} samples ({len(train_dates_set)} days) [up to {args.test_from}]")
     print(f"  Test:  {len(X_test)} samples ({len(test_dates_set)} days) [{args.test_from} onwards]")
 
-    # ── Train CatBoost ──
-    print(f"\n🧠 Training CatBoost model...")
+    # ── Train CatBoost (Anti-Overfitting) ──
+    print(f"\n🧠 Training CatBoost model (anti-overfitting)...")
     model = CatBoostClassifier(
-        iterations=500,
-        depth=6,
-        learning_rate=0.05,
+        iterations=1000,
+        depth=4,                    # 6→4: Shallow tree = less memorization
+        learning_rate=0.03,         # 0.05→0.03: Slower learning = better generalization
         loss_function='MultiClass',
         eval_metric='Accuracy',
         random_seed=42,
         verbose=100,
-        early_stopping_rounds=50,
+        early_stopping_rounds=80,   # 50→80: More patience before stopping
         use_best_model=True,
+        l2_leaf_reg=7,              # L2 regularization (default=3, now 7)
+        random_strength=2,          # Add randomness to splits
+        bagging_temperature=1,      # Row subsampling randomness
+        subsample=0.8,              # Use 80% rows per tree (not all)
+        colsample_bylevel=0.8,      # Use 80% features per split
+        min_data_in_leaf=20,        # Min 20 samples per leaf (avoids tiny groups)
     )
 
     model.fit(
