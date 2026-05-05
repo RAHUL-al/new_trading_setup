@@ -672,6 +672,7 @@ def main():
         l2_leaf_reg=7,              # L2 regularization (default=3, now 7)
         random_strength=2,          # Add randomness to splits
         bagging_temperature=1,      # Row subsampling randomness
+        bootstrap_type='Bernoulli',  # Required for 'subsample'
         subsample=0.8,              # Use 80% rows per tree (not all)
         colsample_bylevel=0.8,      # Use 80% features per split
         min_data_in_leaf=20,        # Min 20 samples per leaf (avoids tiny groups)
