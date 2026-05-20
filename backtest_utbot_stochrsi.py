@@ -1,22 +1,21 @@
 """
-backtest_utbot_stochrsi.py — Backtest: UT Bot Alerts + Stochastic RSI + ATR Gating
+backtest_utbot_atr.py — Backtest: UT Bot Alerts + ATR Gating
 
 Strategy Rules:
   ENTRY:
     - UT Bot fires BUY/SELL signal
-    - Stochastic RSI confirms (K crosses above D = buy, K crosses below D = sell)
     - ATR(14) must be >= 13 to enter new trade
-    - Time must be between 12:50 PM and 3:10 PM
+    - Time must be between 9:15 AM and 3:15 PM
 
   EXIT:
     - Trailing stop loss (ATR-based)
-    - Opposite signal (UT Bot fires reverse + StochRSI confirms)
+    - Opposite signal (UT Bot fires reverse)
     - Square off at 3:24 PM
     - If ATR drops below 13 while in trade → keep position, let SL/opposite handle it
 
 Usage:
     python backtest_utbot_stochrsi.py
-    python backtest_utbot_stochrsi.py --file nifty_3min_data.csv
+    python backtest_utbot_stochrsi.py --file nifty_2min_data.csv
     python backtest_utbot_stochrsi.py --file nifty_1min_data.csv --atr-gate 15
 """
 
@@ -32,22 +31,16 @@ warnings.filterwarnings('ignore')
 
 
 # ─────────── Config ───────────
-TRADING_START = dt_time(9, 15)     # Signal checking starts
+TRADING_START = dt_time(9, 30)     # Signal checking starts
 TRADING_END = dt_time(15, 15)      # No new trades after 3:15 PM
 SQUARE_OFF_TIME = dt_time(15, 24)  # Force close all at 3:24 PM
 MARKET_OPEN = dt_time(9, 15)
 MARKET_CLOSE = dt_time(15, 25)
-ATR_GATE = 13.0              # Minimum ATR to enter new trade
+ATR_GATE = 9            # Minimum ATR to enter new trade
 ATR_PERIOD = 14               # ATR calculation period
 SL_ATR_MULT = 2.0             # Stop loss = entry ± (ATR × multiplier)
 TRAIL_ATR_MULT = 1.5          # Trailing SL distance = ATR × multiplier
 MIN_HOLD_CANDLES = 3          # Min candles before opposite signal can close
-
-# Stochastic RSI params
-STOCH_RSI_PERIOD = 14
-STOCH_K_PERIOD = 3
-STOCH_D_PERIOD = 3
-
 
 # ─────────── Data Models ───────────
 @dataclass
@@ -118,38 +111,6 @@ def calculate_ut_bot(data, a=2, c=100):
     return buy_signal, sell_signal, pos
 
 
-# ─────────── Indicator: Stochastic RSI ───────────
-
-def calculate_stochastic_rsi(data, rsi_period=14, stoch_period=14, k_smooth=3, d_smooth=3):
-    """
-    Stochastic RSI = Stochastic oscillator applied to RSI values.
-    Returns: stoch_k, stoch_d, k_cross_above_d (buy), k_cross_below_d (sell)
-    """
-    close = data['Close']
-
-    # Step 1: Calculate RSI
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0).ewm(alpha=1/rsi_period, adjust=False).mean()
-    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/rsi_period, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-
-    # Step 2: Apply Stochastic to RSI
-    rsi_low = rsi.rolling(stoch_period).min()
-    rsi_high = rsi.rolling(stoch_period).max()
-    stoch_rsi = (rsi - rsi_low) / (rsi_high - rsi_low).replace(0, np.nan) * 100
-
-    # Step 3: Smooth K and D
-    stoch_k = stoch_rsi.rolling(k_smooth).mean()
-    stoch_d = stoch_k.rolling(d_smooth).mean()
-
-    # Step 4: Crossover signals
-    k_cross_up = (stoch_k > stoch_d) & (stoch_k.shift(1) <= stoch_d.shift(1))    # K crosses above D = bullish
-    k_cross_down = (stoch_k < stoch_d) & (stoch_k.shift(1) >= stoch_d.shift(1))  # K crosses below D = bearish
-
-    return stoch_k.values, stoch_d.values, k_cross_up.values, k_cross_down.values
-
-
 # ─────────── Indicator: ATR (RMA) ───────────
 
 def calculate_atr(data, period=14):
@@ -170,17 +131,16 @@ def calculate_atr(data, period=14):
 
 # ─────────── Backtest Engine ───────────
 
-def run_backtest(df, ut_buy, ut_sell, stoch_buy, stoch_sell, stoch_k, stoch_d, atr,
+def run_backtest(df, ut_buy, ut_sell, atr,
                  atr_gate=13.0, sl_mult=2.0, trail_mult=1.5, min_hold=3):
     """
     Combined strategy backtest.
 
     ENTRY requires ALL of:
       1. UT Bot signal (buy or sell)
-      2. Stochastic RSI confirmation (K cross D in same direction)
-      3. ATR >= atr_gate
-      4. Time between TRADING_START and TRADING_END
-      5. No existing position
+      2. ATR >= atr_gate
+      3. Time between TRADING_START and TRADING_END
+      4. No existing position
 
     OPEN POSITION management:
       - If ATR drops below atr_gate → keep position, don't close
@@ -264,28 +224,9 @@ def run_backtest(df, ut_buy, ut_sell, stoch_buy, stoch_sell, stoch_k, stoch_d, a
                 if new_sl < open_pos.stop_loss:
                     open_pos.stop_loss = new_sl
 
-        # ── Check for combined signals ──
-        is_ut_buy = bool(ut_buy[i])
-        is_ut_sell = bool(ut_sell[i])
-        is_stoch_buy = bool(stoch_buy[i])
-        is_stoch_sell = bool(stoch_sell[i])
-
-        # Combined signal: UT Bot + StochRSI must agree
-        combined_buy = is_ut_buy and is_stoch_buy
-        combined_sell = is_ut_sell and is_stoch_sell
-
-        # Also allow: UT Bot signal + StochRSI already in favorable zone
-        # (K > D for buy, K < D for sell — within last 2 candles)
-        if is_ut_buy and not combined_buy:
-            # Check if StochRSI K is above D (bullish zone)
-            if i >= 1 and not np.isnan(stoch_k[i]) and not np.isnan(stoch_d[i]):
-                if stoch_k[i] > stoch_d[i] and stoch_k[i] < 80:  # Not overbought
-                    combined_buy = True
-
-        if is_ut_sell and not combined_sell:
-            if i >= 1 and not np.isnan(stoch_k[i]) and not np.isnan(stoch_d[i]):
-                if stoch_k[i] < stoch_d[i] and stoch_k[i] > 20:  # Not oversold
-                    combined_sell = True
+        # ── Check for signals ──
+        combined_buy = bool(ut_buy[i])
+        combined_sell = bool(ut_sell[i])
 
         # ── Opposite signal close (with min hold time) ──
         if combined_buy and open_pos and open_pos.direction == "PE":
@@ -455,7 +396,7 @@ def print_report(trades, strategy_name, data_info=""):
         'entry_atr': round(t.entry_atr, 2),
         'exit_atr': round(t.exit_atr, 2),
     } for t in trades])
-    output = "backtest_utbot_stochrsi_trades.csv"
+    output = "backtest_utbot_trades.csv"
     trades_df.to_csv(output, index=False)
     print(f"  💾 Trade log saved to: {output}")
 
@@ -463,8 +404,8 @@ def print_report(trades, strategy_name, data_info=""):
 # ─────────── Main ───────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Backtest UT Bot + Stochastic RSI + ATR")
-    parser.add_argument("--file", default="nifty_3min_data.csv", help="Data file (CSV)")
+    parser = argparse.ArgumentParser(description="Backtest UT Bot + ATR")
+    parser.add_argument("--file", default="nifty_2min_data.csv", help="Data file (CSV)")
     parser.add_argument("--atr-gate", type=float, default=ATR_GATE, help=f"ATR gate for new entries (default: {ATR_GATE})")
     parser.add_argument("--sl-mult", type=float, default=SL_ATR_MULT, help=f"SL = ATR × multiplier (default: {SL_ATR_MULT})")
     parser.add_argument("--trail-mult", type=float, default=TRAIL_ATR_MULT, help=f"Trail SL = ATR × multiplier (default: {TRAIL_ATR_MULT})")
@@ -476,7 +417,7 @@ def main():
     # Find data file
     data_file = args.file
     if not os.path.exists(data_file):
-        for alt in ["nifty_3min_data.csv", "nifty_5min_data.csv", "nifty_1min_data.csv"]:
+        for alt in ["nifty_2min_data.csv", "nifty_3min_data.csv", "nifty_5min_data.csv", "nifty_1min_data.csv"]:
             if os.path.exists(alt):
                 data_file = alt
                 break
@@ -502,13 +443,6 @@ def main():
     ut_buy, ut_sell, ut_pos = calculate_ut_bot(df, a=args.ut_a, c=args.ut_c)
     print(f"  UT Bot (a={args.ut_a}, c={args.ut_c}): {ut_buy.sum()} buy signals, {ut_sell.sum()} sell signals")
 
-    # Stochastic RSI
-    stoch_k, stoch_d, stoch_buy, stoch_sell = calculate_stochastic_rsi(
-        df, rsi_period=STOCH_RSI_PERIOD, stoch_period=STOCH_RSI_PERIOD,
-        k_smooth=STOCH_K_PERIOD, d_smooth=STOCH_D_PERIOD
-    )
-    print(f"  Stochastic RSI (14,3,3): {stoch_buy.sum()} K↑D signals, {stoch_sell.sum()} K↓D signals")
-
     # ATR
     atr = calculate_atr(df, period=ATR_PERIOD)
     atr_above_gate = (atr >= args.atr_gate).sum()
@@ -522,12 +456,12 @@ def main():
     print(f"  Min hold: {args.min_hold} candles")
 
     trades = run_backtest(
-        df, ut_buy, ut_sell, stoch_buy, stoch_sell, stoch_k, stoch_d, atr,
+        df, ut_buy, ut_sell, atr,
         atr_gate=args.atr_gate, sl_mult=args.sl_mult,
         trail_mult=args.trail_mult, min_hold=args.min_hold,
     )
 
-    strategy_name = f"UT Bot (a={args.ut_a},c={args.ut_c}) + StochRSI(14,3,3) + ATR({ATR_PERIOD})>={args.atr_gate}"
+    strategy_name = f"UT Bot (a={args.ut_a},c={args.ut_c}) + ATR({ATR_PERIOD})>={args.atr_gate}"
     data_info = f"Data: {date_range} | {total_days} days | {len(df)} candles"
     print_report(trades, strategy_name, data_info)
 
