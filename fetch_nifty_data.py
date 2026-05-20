@@ -85,7 +85,8 @@ def fetch_candles(smart_api, from_date, to_date, interval, max_retries=3):
                 return df
             else:
                 msg = response.get("message", "No data") if response else "No response"
-                if "TooManyRequests" in str(msg):
+                msg_lower = str(msg).lower()
+                if "toomanyrequests" in msg_lower or "exceeding access rate" in msg_lower:
                     wait = 5 * (attempt + 1)  # 5s, 10s, 15s backoff
                     logger.warning(f"Rate limited. Waiting {wait}s... (attempt {attempt+1}/{max_retries})")
                     time.sleep(wait)
@@ -94,7 +95,8 @@ def fetch_candles(smart_api, from_date, to_date, interval, max_retries=3):
                 return pd.DataFrame()
 
         except Exception as e:
-            if "TooManyRequests" in str(e):
+            e_lower = str(e).lower()
+            if "toomanyrequests" in e_lower or "exceeding access rate" in e_lower:
                 wait = 5 * (attempt + 1)
                 logger.warning(f"Rate limited. Waiting {wait}s... (attempt {attempt+1}/{max_retries})")
                 time.sleep(wait)
@@ -153,9 +155,9 @@ def fetch_interval(smart_api, interval):
         else:
             logger.info(f"  No data (weekend/holiday?)")
 
-        # Rate limit — 2 seconds between API calls to avoid TooManyRequests
+        # Rate limit — 4 seconds between API calls to avoid TooManyRequests
         if i < len(chunks) - 1:
-            time.sleep(2)
+            time.sleep(4)
 
     if not all_data:
         logger.error(f"No data fetched for {interval}!")
