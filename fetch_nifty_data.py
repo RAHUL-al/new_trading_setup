@@ -39,11 +39,18 @@ NIFTY_EXCHANGE = "NSE"
 #       FIFTEEN_MINUTE, THIRTY_MINUTE, ONE_HOUR, ONE_DAY
 # TWO_MINUTE is NOT natively supported — we fetch 1-min and resample.
 INTERVAL_CONFIG = {
+    "ONE_MINUTE": {
+        "chunk_days": 5,
+        "from_date": "2025-01-01",
+        "output_file": "nifty_1min_data.csv",
+        "api_interval": "ONE_MINUTE", 
+        "resample_to": 1,
+    },
     "TWO_MINUTE": {
         "chunk_days": 5,
         "from_date": "2025-01-01",
         "output_file": "nifty_2min_data.csv",
-        "api_interval": "ONE_MINUTE",   # Fetch 1-min, then resample to 2-min
+        "api_interval": "TWO_MINUTE",   
         "resample_to": 2,
     },
 }
