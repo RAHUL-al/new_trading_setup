@@ -9,12 +9,18 @@ STRATEGY: UT Bot Alert (Pure ATR + Trailing Stop) on 2-MINUTE timeframe
 
 NO ML, NO LOOK-AHEAD — pure indicator signals only.
 
+RECOVERY LOT MANAGEMENT:
+  - Start with qty = 1
+  - After 2 consecutive losses → qty += 1
+  - Recovery target = average of consecutive loss points
+  - Extra lot P&L tracked; once recovery_target met → qty resets to 1
+  - Every additional 2 consecutive losses → qty += 1 again
+
 RULES:
   - Entry windows configurable (default: 09:20 - 15:15)
   - Square off all positions at 15:24
   - Trailing SL: ATR-based, only moves in favorable direction
   - Close on: opposite signal OR trailing SL hit OR square-off
-  - Lot management: +2 lots after loss day, reset on recovery
 
 DATA: NIFTY 2-minute OHLCV CSV
 
@@ -133,7 +139,12 @@ def compute_ut_bot_signals(df, atr_period=14, key_value=1.0, min_atr=6.5):
 def run_backtest(df, buy_sig, sell_sig, atr_vals,
                  entry_start, entry_end, square_off):
     """
-    Backtest purely based on 1 lot without any Martingale logic.
+    Backtest with Recovery Lot Management:
+    - Start qty=1
+    - 2 consecutive losses → qty += 1
+    - Recovery target = average of consecutive loss points
+    - Extra lots' P&L tracked until recovery target met → qty=1
+    - Additional consecutive losses → qty += 1 again
     """
     close = df['Close'].astype(float)
     high_v = df['High'].astype(float)
@@ -143,6 +154,81 @@ def run_backtest(df, buy_sig, sell_sig, atr_vals,
     all_trades = []
     daily_results = {}
     prev_date = None
+
+    # ── Recovery Lot Management State ──
+    qty = 1                      # current lot count
+    consecutive_losses = 0       # back-to-back loss counter
+    loss_streak_pts = []         # raw pts of each loss in current streak
+    recovering = False           # are we in recovery mode?
+    recovery_target = 0.0       # avg loss pts to recover
+    recovered_pts = 0.0         # how much recovered by extra lots so far
+
+    def _close_trade(pos, exit_price, exit_time, reason, curr_date):
+        """Close a position and update recovery state."""
+        nonlocal qty, consecutive_losses, loss_streak_pts
+        nonlocal recovering, recovery_target, recovered_pts
+
+        raw_pnl = _pnl(pos, exit_price)
+
+        # Build status BEFORE updating state (shows WHY this trade matters)
+        status = ""
+
+        # ── Update recovery state based on this trade's result ──
+        if raw_pnl < 0:
+            consecutive_losses += 1
+            loss_streak_pts.append(abs(raw_pnl))
+
+            # Every 2 consecutive losses → qty increases
+            if consecutive_losses >= 2 and consecutive_losses % 2 == 0:
+                qty += 1
+                recovery_target = np.mean(loss_streak_pts)
+                recovering = True
+                recovered_pts = 0.0
+                status = f"L{consecutive_losses}→QTY↑{qty} avg:{recovery_target:.1f}"
+            else:
+                if recovering:
+                    status = f"L{consecutive_losses} (REC {recovered_pts:.1f}/{recovery_target:.1f})"
+                else:
+                    status = f"L{consecutive_losses}"
+
+        else:  # win or breakeven
+            if recovering:
+                extra_lot_recovery = raw_pnl * (qty - 1)
+                recovered_pts += extra_lot_recovery
+
+                if recovered_pts >= recovery_target:
+                    status = f"RECOVERED ✅ ({recovered_pts:.1f}/{recovery_target:.1f})"
+                    qty = 1
+                    recovering = False
+                    recovery_target = 0.0
+                    recovered_pts = 0.0
+                else:
+                    status = f"REC {recovered_pts:.1f}/{recovery_target:.1f}"
+
+            consecutive_losses = 0
+            loss_streak_pts = []
+
+        # Build trade dict
+        trade_qty = pos.get('qty', 1)  # qty THIS trade was entered with
+        total_pnl = raw_pnl * trade_qty
+
+        trade = {
+            'dir': pos['dir'],
+            'entry': pos['entry'],
+            'exit': round(exit_price, 2),
+            'entry_time': pos['entry_time'],
+            'exit_time': exit_time,
+            'raw_pnl': round(raw_pnl, 2),
+            'qty': trade_qty,
+            'pnl': round(total_pnl, 2),
+            'pnl_pct': round(raw_pnl / pos['entry'] * 100, 4),
+            'reason': reason,
+            'status': status,
+        }
+
+        all_trades.append(trade)
+        _add_daily(daily_results, curr_date, trade)
+        return trade
 
     for i in range(len(df)):
         t = df.iloc[i]['Time'].time()
@@ -154,12 +240,10 @@ def run_backtest(df, buy_sig, sell_sig, atr_vals,
 
         # ── Day boundary ──
         if prev_date and curr_date != prev_date:
-            # Force close any open position at day end
             if pos:
                 prev_close = float(close.iloc[i-1])
-                trade = _make_trade(pos, prev_close, df.iloc[i-1]['Time'], "DAY_END")
-                all_trades.append(trade)
-                _add_daily(daily_results, prev_date, trade)
+                _close_trade(pos, prev_close, df.iloc[i-1]['Time'],
+                             "DAY_END", prev_date)
                 pos = None
 
             if curr_date not in daily_results:
@@ -172,9 +256,8 @@ def run_backtest(df, buy_sig, sell_sig, atr_vals,
 
         # ── Square off ──
         if pos and t >= square_off:
-            trade = _make_trade(pos, c, df.iloc[i]['Time'], "SQUARE_OFF")
-            all_trades.append(trade)
-            _add_daily(daily_results, curr_date, trade)
+            _close_trade(pos, c, df.iloc[i]['Time'],
+                         "SQUARE_OFF", curr_date)
             pos = None
             continue
 
@@ -191,9 +274,8 @@ def run_backtest(df, buy_sig, sell_sig, atr_vals,
                 exit_price = pos['sl']
 
             if sl_hit:
-                trade = _make_trade(pos, exit_price, df.iloc[i]['Time'], "TRAIL_SL")
-                all_trades.append(trade)
-                _add_daily(daily_results, curr_date, trade)
+                _close_trade(pos, exit_price, df.iloc[i]['Time'],
+                             "TRAIL_SL", curr_date)
                 pos = None
 
         # ── Trailing SL update ──
@@ -213,29 +295,29 @@ def run_backtest(df, buy_sig, sell_sig, atr_vals,
 
         # Opposite signal → close position
         if is_buy and pos and pos['dir'] == "SHORT":
-            trade = _make_trade(pos, c, df.iloc[i]['Time'], "OPPOSITE")
-            all_trades.append(trade)
-            _add_daily(daily_results, curr_date, trade)
+            _close_trade(pos, c, df.iloc[i]['Time'],
+                         "OPPOSITE", curr_date)
             pos = None
         elif is_sell and pos and pos['dir'] == "LONG":
-            trade = _make_trade(pos, c, df.iloc[i]['Time'], "OPPOSITE")
-            all_trades.append(trade)
-            _add_daily(daily_results, curr_date, trade)
+            _close_trade(pos, c, df.iloc[i]['Time'],
+                         "OPPOSITE", curr_date)
             pos = None
 
-        # ── New entry ──
+        # ── New entry (with current qty) ──
         if not pos and in_window:
             if is_buy and curr_atr >= MIN_ATR:
                 sl = c - curr_atr * ATR_KEY_VALUE
                 pos = {
                     'dir': 'LONG', 'entry': c, 'sl': sl,
-                    'entry_time': df.iloc[i]['Time'], 'entry_idx': i
+                    'entry_time': df.iloc[i]['Time'], 'entry_idx': i,
+                    'qty': qty,  # ← enters with current qty
                 }
             elif is_sell and curr_atr >= MIN_ATR:
                 sl = c + curr_atr * ATR_KEY_VALUE
                 pos = {
                     'dir': 'SHORT', 'entry': c, 'sl': sl,
-                    'entry_time': df.iloc[i]['Time'], 'entry_idx': i
+                    'entry_time': df.iloc[i]['Time'], 'entry_idx': i,
+                    'qty': qty,  # ← enters with current qty
                 }
 
     return all_trades, daily_results
@@ -246,21 +328,6 @@ def _pnl(pos, exit_price):
         return exit_price - pos['entry']
     else:
         return pos['entry'] - exit_price
-
-
-def _make_trade(pos, exit_price, exit_time, reason):
-    raw_pnl = _pnl(pos, exit_price)
-    return {
-        'dir': pos['dir'],
-        'entry': pos['entry'],
-        'exit': round(exit_price, 2),
-        'entry_time': pos['entry_time'],
-        'exit_time': exit_time,
-        'pnl': round(raw_pnl, 2),
-        'qty': LOT_SIZE,
-        'pnl_pct': round(raw_pnl / pos['entry'] * 100, 4),
-        'reason': reason,
-    }
 
 
 def _add_daily(daily_results, date, trade):
@@ -276,9 +343,9 @@ def print_daily_results(daily_results):
     """Print each day's result."""
     sorted_days = sorted(daily_results.keys())
 
-    print(f"\n{'='*105}")
+    print(f"\n{'='*110}")
     print(f"  📅 DAILY RESULTS")
-    print(f"{'='*95}")
+    print(f"{'='*110}")
     print(f"  {'Date':<12} {'Day':<4} {'Trades':>7} "
           f"{'Wins':>5} {'Loss':>5} {'Win%':>6} {'P&L (Pts)':>11} {'Cum P&L':>11} {'':>4}")
     print(f"  {'-'*90}")
@@ -319,12 +386,12 @@ def print_daily_results(daily_results):
     if total_days > 0:
         print(f"  Win days: {win_days} | Loss days: {loss_days} | "
               f"Day Win%: {win_days/total_days*100:.1f}%")
-    print(f"{'='*105}")
+    print(f"{'='*110}")
 
 
 def print_detailed_trades(all_trades, daily_results,
                           log_file="utbot_2min_detailed_log.txt"):
-    """Print AND save detailed per-trade log for each day."""
+    """Print AND save detailed per-trade log with qty & recovery columns."""
     sorted_days = sorted(daily_results.keys())
     lines = []
 
@@ -332,9 +399,9 @@ def print_detailed_trades(all_trades, daily_results,
         print(s)
         lines.append(s)
 
-    out(f"\n{'='*115}")
-    out(f"  📋 DETAILED TRADE LOG — EACH TRADE ON EACH DAY")
-    out(f"{'='*115}")
+    out(f"\n{'='*130}")
+    out(f"  📋 DETAILED TRADE LOG — WITH RECOVERY LOT MANAGEMENT")
+    out(f"{'='*130}")
 
     day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
     cum_pnl = 0
@@ -353,17 +420,16 @@ def print_detailed_trades(all_trades, daily_results,
         wr = wins / len(trades) * 100
         icon = "✅" if day_pnl > 0 else "❌" if day_pnl < 0 else "➖"
 
-        out(f"\n  ┌──────────────────────────────────────────────"
-            f"──────────────────────────────────────────────┐")
+        out(f"\n  ┌{'─'*128}┐")
         out(f"  │ 📅 {day} ({day_name}) | Trades: {len(trades)} "
             f"(W:{wins} L:{losses} {wr:.0f}%) | Day P&L: "
             f"{day_pnl:+.2f} {icon} | Cum: {cum_pnl:+.2f}")
-        out(f"  ├───┬──────┬───────────┬───────────┬───────────"
-            f"┬───────────┬───────────┬─────────────┤")
-        out(f"  │ # │ Dir  │ Entry Time│ Exit Time │ Entry Pr  "
-            f"│ Exit Pr   │ P&L (Pts) │ Exit Reason │")
-        out(f"  ├───┼──────┼───────────┼───────────┼───────────"
-            f"┼───────────┼───────────┼─────────────┤")
+        out(f"  ├───┬──────┬─────────┬─────────┬───────────"
+            f"┬───────────┬────────┬─────┬──────────┬────────────┬──────────────────────────────┤")
+        out(f"  │ # │ Dir  │ Entry T │ Exit T  │ Entry Pr  "
+            f"│ Exit Pr   │ Pts    │ Qty │ Total P&L│ Reason     │ Recovery Status               │")
+        out(f"  ├───┼──────┼─────────┼─────────┼───────────"
+            f"┼───────────┼────────┼─────┼──────────┼────────────┼──────────────────────────────┤")
 
         for j, t in enumerate(trades, 1):
             entry_t = (t['entry_time'].strftime('%H:%M')
@@ -376,17 +442,22 @@ def print_detailed_trades(all_trades, daily_results,
             dir_icon = "🟢" if t['dir'] == 'LONG' else "🔴"
             pnl_icon = "✅" if t['pnl'] > 0 else "❌" if t['pnl'] < 0 else "➖"
 
-            out(f"  │{j:>2} │ {dir_icon}{t['dir']:>4} │ {entry_t:>9} │ "
-                f"{exit_t:>9} │ {t['entry']:>9.2f} │ {t['exit']:>9.2f} │ "
+            status = t.get('status', '')
+            if len(status) > 30:
+                status = status[:28] + ".."
+
+            out(f"  │{j:>2} │ {dir_icon}{t['dir']:>4} │ {entry_t:>7} │ "
+                f"{exit_t:>7} │ {t['entry']:>9.2f} │ {t['exit']:>9.2f} │ "
+                f"{t['raw_pnl']:>+6.2f} │ {t['qty']:>3} │ "
                 f"{t['pnl']:>+8.2f}{pnl_icon}│ "
-                f"{t['reason']:<12}│")
+                f"{t['reason']:<10} │ {status:<30}│")
 
-        out(f"  └───┴──────┴───────────┴───────────┴───────────"
-            f"┴───────────┴───────────┴─────────────┘")
+        out(f"  └───┴──────┴─────────┴─────────┴───────────"
+            f"┴───────────┴────────┴─────┴──────────┴────────────┴──────────────────────────────┘")
 
-    out(f"\n{'='*95}")
+    out(f"\n{'='*130}")
     out(f"  GRAND TOTAL: {cum_pnl:+.2f} pts")
-    out(f"{'='*95}")
+    out(f"{'='*130}")
 
     # Save to file
     with open(log_file, 'w', encoding='utf-8') as f:
@@ -466,6 +537,20 @@ def print_summary(all_trades, daily_results):
             if t['pnl'] > 0:
                 dow_stats[dow]['wins'] += 1
 
+    # Qty usage stats
+    qty_stats = {}
+    for t in all_trades:
+        q = t['qty']
+        if q not in qty_stats:
+            qty_stats[q] = {'count': 0, 'pnl': 0, 'wins': 0}
+        qty_stats[q]['count'] += 1
+        qty_stats[q]['pnl'] += t['pnl']
+        if t['pnl'] > 0:
+            qty_stats[q]['wins'] += 1
+
+    max_qty = max(t['qty'] for t in all_trades)
+    recovery_trades = sum(1 for t in all_trades if t['qty'] > 1)
+
     # ── Print ──
     print(f"\n{'='*70}")
     print(f"  🤖 UT BOT ALERT (2-MIN) — OVERALL RESULTS")
@@ -482,7 +567,7 @@ def print_summary(all_trades, daily_results):
 
     print(f"\n  💰 P&L")
     print(f"  Total P&L:         {total_pnl:+.2f} pts")
-    print(f"  Total ₹ P&L:       ₹{total_pnl * LOT_SIZE:+,.0f} (with qty {LOT_SIZE})")
+    print(f"  Total ₹ P&L:       ₹{total_pnl * LOT_SIZE:+,.0f} (with qty {LOT_SIZE}/lot)")
     print(f"  Best trade:        {max(pnl_list):+.2f} pts")
     print(f"  Worst trade:       {min(pnl_list):+.2f} pts")
     print(f"  Max drawdown:      {max_dd:.2f} pts")
@@ -497,6 +582,16 @@ def print_summary(all_trades, daily_results):
     print(f"\n  🔄 STREAKS")
     print(f"  Max win streak:    {max_win_streak}")
     print(f"  Max loss streak:   {max_loss_streak}")
+
+    print(f"\n  📦 QTY / RECOVERY STATS")
+    print(f"  Max qty used:      {max_qty}")
+    print(f"  Recovery trades:   {recovery_trades} ({recovery_trades/n*100:.1f}% of all)")
+    print(f"  {'Qty':>5} {'Trades':>8} {'Win%':>6} {'P&L':>11}")
+    print(f"  {'-'*35}")
+    for q in sorted(qty_stats.keys()):
+        d = qty_stats[q]
+        q_wr = d['wins'] / d['count'] * 100 if d['count'] > 0 else 0
+        print(f"  {q:>5} {d['count']:>8} {q_wr:>5.0f}% {d['pnl']:>+10.2f}")
 
     print(f"\n  🔍 CLOSE REASONS")
     for r, c in sorted(reasons.items(), key=lambda x: -x[1]):
@@ -541,7 +636,7 @@ def main():
     global ATR_KEY_VALUE, MIN_ATR, ATR_PERIOD, LOT_SIZE
 
     parser = argparse.ArgumentParser(
-        description="UT Bot Alert Backtest (NIFTY 2-min)"
+        description="UT Bot Alert Backtest (NIFTY 2-min) with Recovery Lot Management"
     )
     parser.add_argument("--file", default="nifty_2min_data.csv",
                         help="2-min data CSV file (default: nifty_2min_data.csv)")
@@ -597,12 +692,15 @@ def main():
 
     print(f"\n{'='*70}")
     print(f"  🤖 UT BOT ALERT BACKTEST — 2-MINUTE TIMEFRAME")
+    print(f"  📦 Recovery Lot Management: ON")
     print(f"{'='*70}")
     print(f"  ATR: RMA({ATR_PERIOD}) × {ATR_KEY_VALUE} | Min ATR: {MIN_ATR}")
     print(f"  Window: {entry_start.strftime('%H:%M')} - "
           f"{entry_end.strftime('%H:%M')} | "
           f"Square off: {square_off.strftime('%H:%M')}")
-    print(f"  Qty per trade: {LOT_SIZE}")
+    print(f"  Qty per lot: {LOT_SIZE} | Start qty: 1")
+    print(f"  Rule: 2 consecutive losses → qty += 1")
+    print(f"  Recovery: avg loss pts → extra lot P&L covers it → qty = 1")
     print(f"{'='*70}")
 
     # ── Compute UT Bot signals ──
@@ -621,7 +719,7 @@ def main():
     print(f"  ATR mean:            {valid_atr.mean():.2f}")
 
     # ── Run backtest ──
-    print(f"\n🚀 Running backtest...")
+    print(f"\n🚀 Running backtest with Recovery Lot Management...")
     all_trades, daily_results = run_backtest(
         df, buy_sig, sell_sig, atr_vals,
         entry_start, entry_end, square_off
@@ -631,7 +729,7 @@ def main():
 
     if not all_trades:
         print("\n❌ No trades generated. Try adjusting parameters:")
-        print("  - Lower --min-atr (current: {MIN_ATR})")
+        print(f"  - Lower --min-atr (current: {MIN_ATR})")
         print("  - Wider window (--window-start / --window-end)")
         return
 
