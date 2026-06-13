@@ -139,78 +139,59 @@ def compute_ut_bot_signals(df, atr_period=14, key_value=1.0, min_atr=6.5):
 def run_backtest(df, buy_sig, sell_sig, atr_vals,
                  entry_start, entry_end, square_off):
     """
-    Backtest with Recovery Lot Management:
-    - Start qty=1
-    - 2 consecutive losses → qty += 1
-    - Recovery target = average of consecutive loss points
-    - Extra lots' P&L tracked until recovery target met → qty=1
-    - Additional consecutive losses → qty += 1 again
+    Backtest with Live Recovery Target check (Partial Exit):
+    - Track Total Deficit. Target points = Deficit / Qty.
+    - If candle high/low hits target, sell (Qty-1) lots immediately to cover loss.
+    - Remaining 1 lot continues normally.
+    - Qty increases only on 2, 4, 6 back-to-back losses.
+    - Any loss with higher Qty adds directly to Total Deficit.
     """
-    close = df['Close'].astype(float)
-    high_v = df['High'].astype(float)
-    low_v = df['Low'].astype(float)
+    close = df['Close'].astype(float).values
+    high_v = df['High'].astype(float).values
+    low_v = df['Low'].astype(float).values
+    times = df['Time'].values
 
     pos = None
     all_trades = []
     daily_results = {}
     prev_date = None
 
-    # ── Recovery Lot Management State ──
-    qty = 1                      # current lot count
-    consecutive_losses = 0       # back-to-back loss counter
-    loss_streak_pts = []         # raw pts of each loss in current streak
-    recovering = False           # are we in recovery mode?
-    recovery_target = 0.0       # avg loss pts to recover
-    recovered_pts = 0.0         # how much recovered by extra lots so far
+    current_qty = 1
+    consecutive_losses = 0
+    deficit = 0.0
+    recovering = False
 
     def _close_trade(pos, exit_price, exit_time, reason, curr_date):
-        """Close a position and update recovery state."""
-        nonlocal qty, consecutive_losses, loss_streak_pts
-        nonlocal recovering, recovery_target, recovered_pts
+        nonlocal current_qty, consecutive_losses, deficit, recovering
 
-        raw_pnl = _pnl(pos, exit_price)
+        raw_pnl = exit_price - pos['entry'] if pos['dir'] == 'LONG' else pos['entry'] - exit_price
+        total_pnl = raw_pnl * pos['qty']
 
-        # Build status BEFORE updating state (shows WHY this trade matters)
         status = ""
 
-        # ── Update recovery state based on this trade's result ──
-        if raw_pnl < 0:
+        if total_pnl < 0:
+            deficit += abs(total_pnl)
             consecutive_losses += 1
-            loss_streak_pts.append(abs(raw_pnl))
+            recovering = True
 
-            # Every 2 consecutive losses → qty increases
             if consecutive_losses >= 2 and consecutive_losses % 2 == 0:
-                qty += 1
-                recovery_target = np.mean(loss_streak_pts)
-                recovering = True
-                recovered_pts = 0.0
-                status = f"L{consecutive_losses}→QTY↑{qty} avg:{recovery_target:.1f}"
+                current_qty += 1
+                status = f"L{consecutive_losses}→QTY↑{current_qty} (Deficit: {deficit:.1f})"
             else:
-                if recovering:
-                    status = f"L{consecutive_losses} (REC {recovered_pts:.1f}/{recovery_target:.1f})"
-                else:
-                    status = f"L{consecutive_losses}"
-
-        else:  # win or breakeven
-            if recovering:
-                extra_lot_recovery = raw_pnl * (qty - 1)
-                recovered_pts += extra_lot_recovery
-
-                if recovered_pts >= recovery_target:
-                    status = f"RECOVERED ✅ ({recovered_pts:.1f}/{recovery_target:.1f})"
-                    qty = 1
-                    recovering = False
-                    recovery_target = 0.0
-                    recovered_pts = 0.0
-                else:
-                    status = f"REC {recovered_pts:.1f}/{recovery_target:.1f}"
-
+                status = f"L{consecutive_losses} (Deficit: {deficit:.1f})"
+        else:
             consecutive_losses = 0
-            loss_streak_pts = []
-
-        # Build trade dict
-        trade_qty = pos.get('qty', 1)  # qty THIS trade was entered with
-        total_pnl = raw_pnl * trade_qty
+            if recovering:
+                deficit -= total_pnl
+                if deficit <= 0.001:
+                    status = "RECOVERED ✅"
+                    deficit = 0.0
+                    recovering = False
+                    current_qty = 1
+                else:
+                    status = f"Partial REC (Left: {deficit:.1f})"
+            else:
+                status = "Win ✅"
 
         trade = {
             'dir': pos['dir'],
@@ -219,53 +200,93 @@ def run_backtest(df, buy_sig, sell_sig, atr_vals,
             'entry_time': pos['entry_time'],
             'exit_time': exit_time,
             'raw_pnl': round(raw_pnl, 2),
-            'qty': trade_qty,
+            'qty': pos['qty'],
             'pnl': round(total_pnl, 2),
-            'pnl_pct': round(raw_pnl / pos['entry'] * 100, 4),
             'reason': reason,
-            'status': status,
+            'status': status
         }
-
         all_trades.append(trade)
-        _add_daily(daily_results, curr_date, trade)
-        return trade
+        
+        # Add to daily
+        if curr_date not in daily_results:
+            daily_results[curr_date] = {'trades': [], 'pnl': 0}
+        daily_results[curr_date]['trades'].append(trade)
+        daily_results[curr_date]['pnl'] += trade['pnl']
 
     for i in range(len(df)):
-        t = df.iloc[i]['Time'].time()
-        curr_date = df.iloc[i]['Time'].date()
-        c = float(close.iloc[i])
-        h = float(high_v.iloc[i])
-        l = float(low_v.iloc[i])
-        curr_atr = float(atr_vals[i])
+        t = pd.to_datetime(times[i]).time()
+        curr_date = pd.to_datetime(times[i]).date()
+        c = close[i]
+        h = high_v[i]
+        l = low_v[i]
+        curr_atr = atr_vals[i]
 
-        # ── Day boundary ──
         if prev_date and curr_date != prev_date:
             if pos:
-                prev_close = float(close.iloc[i-1])
-                _close_trade(pos, prev_close, df.iloc[i-1]['Time'],
-                             "DAY_END", prev_date)
+                _close_trade(pos, close[i-1], pd.to_datetime(times[i-1]), "DAY_END", prev_date)
                 pos = None
-
             if curr_date not in daily_results:
                 daily_results[curr_date] = {'trades': [], 'pnl': 0}
 
         prev_date = curr_date
-
         if curr_date not in daily_results:
             daily_results[curr_date] = {'trades': [], 'pnl': 0}
 
-        # ── Square off ──
         if pos and t >= square_off:
-            _close_trade(pos, c, df.iloc[i]['Time'],
-                         "SQUARE_OFF", curr_date)
+            _close_trade(pos, c, pd.to_datetime(times[i]), "SQUARE_OFF", curr_date)
             pos = None
             continue
 
         in_window = entry_start <= t <= entry_end
 
+        # ── Intra-candle Recovery Target Check (Partial Exit) ──
+        if pos and recovering and pos['qty'] > 1:
+            target_pts = deficit / pos['qty']
+            target_hit = False
+            target_price = 0.0
+
+            if pos['dir'] == 'LONG':
+                target_price = pos['entry'] + target_pts
+                if h >= target_price:
+                    target_hit = True
+            elif pos['dir'] == 'SHORT':
+                target_price = pos['entry'] - target_pts
+                if l <= target_price:
+                    target_hit = True
+
+            if target_hit:
+                exit_qty = pos['qty'] - 1
+                raw_pnl = target_pts
+                total_pnl = raw_pnl * exit_qty
+
+                status = f"REC HIT ✅ (Covered)"
+                trade = {
+                    'dir': pos['dir'],
+                    'entry': pos['entry'],
+                    'exit': round(target_price, 2),
+                    'entry_time': pos['entry_time'],
+                    'exit_time': pd.to_datetime(times[i]),
+                    'raw_pnl': round(raw_pnl, 2),
+                    'qty': exit_qty,
+                    'pnl': round(total_pnl, 2),
+                    'reason': "REC_HIT",
+                    'status': status
+                }
+                all_trades.append(trade)
+                daily_results[curr_date]['trades'].append(trade)
+                daily_results[curr_date]['pnl'] += trade['pnl']
+
+                # Reset state, keep 1 lot running
+                pos['qty'] = 1
+                deficit = 0.0
+                recovering = False
+                current_qty = 1
+                consecutive_losses = 0
+
         # ── SL check (trailing stop hit) ──
         if pos:
             sl_hit = False
+            exit_price = 0.0
             if pos['dir'] == "LONG" and l <= pos['sl']:
                 sl_hit = True
                 exit_price = pos['sl']
@@ -274,8 +295,7 @@ def run_backtest(df, buy_sig, sell_sig, atr_vals,
                 exit_price = pos['sl']
 
             if sl_hit:
-                _close_trade(pos, exit_price, df.iloc[i]['Time'],
-                             "TRAIL_SL", curr_date)
+                _close_trade(pos, exit_price, pd.to_datetime(times[i]), "TRAIL_SL", curr_date)
                 pos = None
 
         # ── Trailing SL update ──
@@ -290,34 +310,31 @@ def run_backtest(df, buy_sig, sell_sig, atr_vals,
                     pos['sl'] = new_sl
 
         # ── Signal handling ──
-        is_buy = bool(buy_sig[i])
-        is_sell = bool(sell_sig[i])
+        is_buy = buy_sig[i]
+        is_sell = sell_sig[i]
 
-        # Opposite signal → close position
         if is_buy and pos and pos['dir'] == "SHORT":
-            _close_trade(pos, c, df.iloc[i]['Time'],
-                         "OPPOSITE", curr_date)
+            _close_trade(pos, c, pd.to_datetime(times[i]), "OPPOSITE", curr_date)
             pos = None
         elif is_sell and pos and pos['dir'] == "LONG":
-            _close_trade(pos, c, df.iloc[i]['Time'],
-                         "OPPOSITE", curr_date)
+            _close_trade(pos, c, pd.to_datetime(times[i]), "OPPOSITE", curr_date)
             pos = None
 
-        # ── New entry (with current qty) ──
+        # ── New entry ──
         if not pos and in_window:
             if is_buy and curr_atr >= MIN_ATR:
                 sl = c - curr_atr * ATR_KEY_VALUE
                 pos = {
                     'dir': 'LONG', 'entry': c, 'sl': sl,
-                    'entry_time': df.iloc[i]['Time'], 'entry_idx': i,
-                    'qty': qty,  # ← enters with current qty
+                    'entry_time': pd.to_datetime(times[i]), 'entry_idx': i,
+                    'qty': current_qty
                 }
             elif is_sell and curr_atr >= MIN_ATR:
                 sl = c + curr_atr * ATR_KEY_VALUE
                 pos = {
                     'dir': 'SHORT', 'entry': c, 'sl': sl,
-                    'entry_time': df.iloc[i]['Time'], 'entry_idx': i,
-                    'qty': qty,  # ← enters with current qty
+                    'entry_time': pd.to_datetime(times[i]), 'entry_idx': i,
+                    'qty': current_qty
                 }
 
     return all_trades, daily_results
