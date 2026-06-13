@@ -44,8 +44,6 @@ ENTRY_END = dt_time(15, 15)
 SQUARE_OFF = dt_time(15, 24)
 
 LOT_SIZE = 75
-BASE_LOTS = 2
-LOT_INCREMENT = 2
 
 
 # ─────────── UT Bot Indicators ───────────
@@ -135,10 +133,7 @@ def compute_ut_bot_signals(df, atr_period=14, key_value=1.0, min_atr=6.5):
 def run_backtest(df, buy_sig, sell_sig, atr_vals,
                  entry_start, entry_end, square_off):
     """
-    Backtest with lot management:
-    - Start at BASE_LOTS
-    - Loss day → +LOT_INCREMENT lots for next day
-    - Recovery complete → reset to BASE_LOTS
+    Backtest purely based on 1 lot without any Martingale logic.
     """
     close = df['Close'].astype(float)
     high_v = df['High'].astype(float)
@@ -148,11 +143,6 @@ def run_backtest(df, buy_sig, sell_sig, atr_vals,
     all_trades = []
     daily_results = {}
     prev_date = None
-
-    # Lot management state
-    current_lots = BASE_LOTS
-    accumulated_loss = 0.0
-    recovering = False
 
     for i in range(len(df)):
         t = df.iloc[i]['Time'].time()
@@ -167,46 +157,22 @@ def run_backtest(df, buy_sig, sell_sig, atr_vals,
             # Force close any open position at day end
             if pos:
                 prev_close = float(close.iloc[i-1])
-                trade = _make_trade(pos, prev_close, df.iloc[i-1]['Time'],
-                                    "DAY_END", current_lots)
+                trade = _make_trade(pos, prev_close, df.iloc[i-1]['Time'], "DAY_END")
                 all_trades.append(trade)
                 _add_daily(daily_results, prev_date, trade)
                 pos = None
 
             if curr_date not in daily_results:
-                daily_results[curr_date] = {
-                    'trades': [], 'pnl': 0, 'lots': current_lots
-                }
-
-            # Lot adjustment based on previous day
-            if prev_date in daily_results:
-                prev_day_pnl = daily_results[prev_date]['pnl']
-
-                if prev_day_pnl < 0:
-                    accumulated_loss += prev_day_pnl
-                    recovering = True
-                    current_lots += LOT_INCREMENT
-                elif prev_day_pnl > 0 and recovering:
-                    accumulated_loss += prev_day_pnl
-                    if accumulated_loss >= 0:
-                        current_lots = BASE_LOTS
-                        accumulated_loss = 0.0
-                        recovering = False
-
-            if curr_date in daily_results:
-                daily_results[curr_date]['lots'] = current_lots
+                daily_results[curr_date] = {'trades': [], 'pnl': 0}
 
         prev_date = curr_date
 
         if curr_date not in daily_results:
-            daily_results[curr_date] = {
-                'trades': [], 'pnl': 0, 'lots': current_lots
-            }
+            daily_results[curr_date] = {'trades': [], 'pnl': 0}
 
         # ── Square off ──
         if pos and t >= square_off:
-            trade = _make_trade(pos, c, df.iloc[i]['Time'],
-                                "SQUARE_OFF", current_lots)
+            trade = _make_trade(pos, c, df.iloc[i]['Time'], "SQUARE_OFF")
             all_trades.append(trade)
             _add_daily(daily_results, curr_date, trade)
             pos = None
@@ -225,8 +191,7 @@ def run_backtest(df, buy_sig, sell_sig, atr_vals,
                 exit_price = pos['sl']
 
             if sl_hit:
-                trade = _make_trade(pos, exit_price, df.iloc[i]['Time'],
-                                    "TRAIL_SL", current_lots)
+                trade = _make_trade(pos, exit_price, df.iloc[i]['Time'], "TRAIL_SL")
                 all_trades.append(trade)
                 _add_daily(daily_results, curr_date, trade)
                 pos = None
@@ -248,14 +213,12 @@ def run_backtest(df, buy_sig, sell_sig, atr_vals,
 
         # Opposite signal → close position
         if is_buy and pos and pos['dir'] == "SHORT":
-            trade = _make_trade(pos, c, df.iloc[i]['Time'],
-                                "OPPOSITE", current_lots)
+            trade = _make_trade(pos, c, df.iloc[i]['Time'], "OPPOSITE")
             all_trades.append(trade)
             _add_daily(daily_results, curr_date, trade)
             pos = None
         elif is_sell and pos and pos['dir'] == "LONG":
-            trade = _make_trade(pos, c, df.iloc[i]['Time'],
-                                "OPPOSITE", current_lots)
+            trade = _make_trade(pos, c, df.iloc[i]['Time'], "OPPOSITE")
             all_trades.append(trade)
             _add_daily(daily_results, curr_date, trade)
             pos = None
@@ -285,21 +248,16 @@ def _pnl(pos, exit_price):
         return pos['entry'] - exit_price
 
 
-def _make_trade(pos, exit_price, exit_time, reason, lots=2):
+def _make_trade(pos, exit_price, exit_time, reason):
     raw_pnl = _pnl(pos, exit_price)
-    lot_multiplier = lots // BASE_LOTS
-    adj_pnl = raw_pnl * lot_multiplier
     return {
         'dir': pos['dir'],
         'entry': pos['entry'],
         'exit': round(exit_price, 2),
         'entry_time': pos['entry_time'],
         'exit_time': exit_time,
-        'pnl': round(adj_pnl, 2),
-        'raw_pnl': round(raw_pnl, 2),
-        'lots': lots,
-        'multiplier': lot_multiplier,
-        'qty': lots * LOT_SIZE,
+        'pnl': round(raw_pnl, 2),
+        'qty': LOT_SIZE,
         'pnl_pct': round(raw_pnl / pos['entry'] * 100, 4),
         'reason': reason,
     }
@@ -307,10 +265,7 @@ def _make_trade(pos, exit_price, exit_time, reason, lots=2):
 
 def _add_daily(daily_results, date, trade):
     if date not in daily_results:
-        daily_results[date] = {
-            'trades': [], 'pnl': 0,
-            'lots': trade.get('lots', BASE_LOTS)
-        }
+        daily_results[date] = {'trades': [], 'pnl': 0}
     daily_results[date]['trades'].append(trade)
     daily_results[date]['pnl'] += trade['pnl']
 
@@ -323,10 +278,10 @@ def print_daily_results(daily_results):
 
     print(f"\n{'='*105}")
     print(f"  📅 DAILY RESULTS")
-    print(f"{'='*105}")
-    print(f"  {'Date':<12} {'Day':<4} {'Lots':>5} {'Trades':>7} "
-          f"{'Wins':>5} {'Loss':>5} {'Win%':>6} {'P&L':>11} {'Cum P&L':>11} {'':>4}")
-    print(f"  {'-'*100}")
+    print(f"{'='*95}")
+    print(f"  {'Date':<12} {'Day':<4} {'Trades':>7} "
+          f"{'Wins':>5} {'Loss':>5} {'Win%':>6} {'P&L (Pts)':>11} {'Cum P&L':>11} {'':>4}")
+    print(f"  {'-'*90}")
 
     cumulative_pnl = 0
     win_days = 0
@@ -335,7 +290,6 @@ def print_daily_results(daily_results):
     for day in sorted_days:
         trades = daily_results[day]['trades']
         day_pnl = daily_results[day]['pnl']
-        day_lots = daily_results[day].get('lots', BASE_LOTS)
 
         if len(trades) == 0:
             continue
@@ -354,12 +308,12 @@ def print_daily_results(daily_results):
         elif day_pnl < 0:
             loss_days += 1
 
-        print(f"  {str(day):<12} {day_name:<4} {day_lots:>5} {len(trades):>7} "
+        print(f"  {str(day):<12} {day_name:<4} {len(trades):>7} "
               f"{wins:>5} {losses:>5} {wr:>5.0f}% {day_pnl:>+11.2f} "
               f"{cumulative_pnl:>+11.2f} {icon:>4}")
 
-    print(f"  {'-'*100}")
-    print(f"  {'TOTAL':<12} {'':<4} {'':<5} {'':<7} "
+    print(f"  {'-'*90}")
+    print(f"  {'TOTAL':<12} {'':<4} {'':<7} "
           f"{'':<5} {'':<5} {'':<6} {cumulative_pnl:>+11.2f}")
     total_days = win_days + loss_days
     if total_days > 0:
@@ -388,7 +342,6 @@ def print_detailed_trades(all_trades, daily_results,
     for day in sorted_days:
         trades = daily_results[day]['trades']
         day_pnl = daily_results[day]['pnl']
-        lots = daily_results[day].get('lots', BASE_LOTS)
 
         if len(trades) == 0:
             continue
@@ -401,17 +354,16 @@ def print_detailed_trades(all_trades, daily_results,
         icon = "✅" if day_pnl > 0 else "❌" if day_pnl < 0 else "➖"
 
         out(f"\n  ┌──────────────────────────────────────────────"
-            f"──────────────────────────────────────────────────────────┐")
-        out(f"  │ 📅 {day} ({day_name}) | Lots: {lots} "
-            f"(qty={lots*LOT_SIZE}) | Trades: {len(trades)} "
+            f"──────────────────────────────────────────────┐")
+        out(f"  │ 📅 {day} ({day_name}) | Trades: {len(trades)} "
             f"(W:{wins} L:{losses} {wr:.0f}%) | Day P&L: "
             f"{day_pnl:+.2f} {icon} | Cum: {cum_pnl:+.2f}")
         out(f"  ├───┬──────┬───────────┬───────────┬───────────"
-            f"┬───────────┬────────────┬──────────┬─────────────┤")
+            f"┬───────────┬───────────┬─────────────┤")
         out(f"  │ # │ Dir  │ Entry Time│ Exit Time │ Entry Pr  "
-            f"│ Exit Pr   │ SL         │ P&L      │ Exit Reason │")
+            f"│ Exit Pr   │ P&L (Pts) │ Exit Reason │")
         out(f"  ├───┼──────┼───────────┼───────────┼───────────"
-            f"┼───────────┼────────────┼──────────┼─────────────┤")
+            f"┼───────────┼───────────┼─────────────┤")
 
         for j, t in enumerate(trades, 1):
             entry_t = (t['entry_time'].strftime('%H:%M')
@@ -426,15 +378,15 @@ def print_detailed_trades(all_trades, daily_results,
 
             out(f"  │{j:>2} │ {dir_icon}{t['dir']:>4} │ {entry_t:>9} │ "
                 f"{exit_t:>9} │ {t['entry']:>9.2f} │ {t['exit']:>9.2f} │ "
-                f"{'---':>10} │ {t['pnl']:>+7.2f}{pnl_icon}│ "
+                f"{t['pnl']:>+8.2f}{pnl_icon}│ "
                 f"{t['reason']:<12}│")
 
         out(f"  └───┴──────┴───────────┴───────────┴───────────"
-            f"┴───────────┴────────────┴──────────┴─────────────┘")
+            f"┴───────────┴───────────┴─────────────┘")
 
-    out(f"\n{'='*115}")
+    out(f"\n{'='*95}")
     out(f"  GRAND TOTAL: {cum_pnl:+.2f} pts")
-    out(f"{'='*115}")
+    out(f"{'='*95}")
 
     # Save to file
     with open(log_file, 'w', encoding='utf-8') as f:
@@ -530,7 +482,7 @@ def print_summary(all_trades, daily_results):
 
     print(f"\n  💰 P&L")
     print(f"  Total P&L:         {total_pnl:+.2f} pts")
-    print(f"  Total ₹ P&L:       ₹{total_pnl * LOT_SIZE:+,.0f} (per lot)")
+    print(f"  Total ₹ P&L:       ₹{total_pnl * LOT_SIZE:+,.0f} (with qty {LOT_SIZE})")
     print(f"  Best trade:        {max(pnl_list):+.2f} pts")
     print(f"  Worst trade:       {min(pnl_list):+.2f} pts")
     print(f"  Max drawdown:      {max_dd:.2f} pts")
@@ -586,7 +538,7 @@ def print_summary(all_trades, daily_results):
 # ─────────── Main ───────────
 
 def main():
-    global ATR_KEY_VALUE, MIN_ATR, ATR_PERIOD, LOT_SIZE, BASE_LOTS, LOT_INCREMENT
+    global ATR_KEY_VALUE, MIN_ATR, ATR_PERIOD, LOT_SIZE
 
     parser = argparse.ArgumentParser(
         description="UT Bot Alert Backtest (NIFTY 2-min)"
@@ -607,15 +559,12 @@ def main():
                         help="Square off time HH:MM (default: 15:24)")
     parser.add_argument("--lot-size", type=int, default=LOT_SIZE,
                         help="Qty per lot (default: 75)")
-    parser.add_argument("--base-lots", type=int, default=BASE_LOTS,
-                        help="Starting lot count (default: 2)")
     args = parser.parse_args()
 
     ATR_PERIOD = args.atr_period
     ATR_KEY_VALUE = args.atr_key
     MIN_ATR = args.min_atr
     LOT_SIZE = args.lot_size
-    BASE_LOTS = args.base_lots
 
     # Parse time windows
     def parse_time(s):
@@ -653,8 +602,7 @@ def main():
     print(f"  Window: {entry_start.strftime('%H:%M')} - "
           f"{entry_end.strftime('%H:%M')} | "
           f"Square off: {square_off.strftime('%H:%M')}")
-    print(f"  Lots: Start={BASE_LOTS} (qty={BASE_LOTS*LOT_SIZE}) | "
-          f"+{LOT_INCREMENT} lots on loss day | Lot size={LOT_SIZE}")
+    print(f"  Qty per trade: {LOT_SIZE}")
     print(f"{'='*70}")
 
     # ── Compute UT Bot signals ──
