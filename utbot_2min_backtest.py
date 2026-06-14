@@ -141,9 +141,9 @@ def run_backtest(df, buy_sig, sell_sig, atr_vals,
     """
     Backtest with Recovery Lot Management:
     - Start qty=1
-    - 2 consecutive losses → qty += 1
-    - Recovery target = average of consecutive loss points
-    - Extra lots' P&L tracked until recovery target met → qty=1
+    - 2 consecutive losses → qty += 1 (losses use total P&L: qty × raw_pnl)
+    - Cumulative total losses tracked until fully recovered → qty=1
+    - Wins during recovery subtract total P&L from unrecovered losses
     - Additional consecutive losses → qty += 1 again
     """
     close = df['Close'].astype(float)
@@ -158,59 +158,57 @@ def run_backtest(df, buy_sig, sell_sig, atr_vals,
     # ── Recovery Lot Management State ──
     qty = 1                      # current lot count
     consecutive_losses = 0       # back-to-back loss counter
-    loss_streak_pts = []         # raw pts of each loss in current streak
+    loss_streak_pts = []         # total P&L (qty×raw) of each loss in current streak
     recovering = False           # are we in recovery mode?
-    recovery_target = 0.0       # avg loss pts to recover
-    recovered_pts = 0.0         # how much recovered by extra lots so far
+    total_unrecovered_loss = 0.0 # cumulative unrecovered loss (total P&L)
 
     def _close_trade(pos, exit_price, exit_time, reason, curr_date):
         """Close a position and update recovery state."""
         nonlocal qty, consecutive_losses, loss_streak_pts
-        nonlocal recovering, recovery_target, recovered_pts
+        nonlocal recovering, total_unrecovered_loss
 
         raw_pnl = _pnl(pos, exit_price)
+        trade_qty = pos.get('qty', 1)  # qty THIS trade was entered with
+        actual_pnl = raw_pnl * trade_qty  # Total P&L for this trade
 
-        # Build status BEFORE updating state (shows WHY this trade matters)
         status = ""
 
         # ── Update recovery state based on this trade's result ──
         if raw_pnl < 0:
+            actual_loss = abs(actual_pnl)  # Total loss (qty × raw loss)
             consecutive_losses += 1
-            loss_streak_pts.append(abs(raw_pnl))
+            loss_streak_pts.append(actual_loss)
+            total_unrecovered_loss += actual_loss
 
             # Every 2 consecutive losses → qty increases
             if consecutive_losses >= 2 and consecutive_losses % 2 == 0:
                 qty += 1
-                recovery_target = np.mean(loss_streak_pts)
                 recovering = True
-                recovered_pts = 0.0
-                status = f"L{consecutive_losses}→QTY↑{qty} avg:{recovery_target:.1f}"
+                avg_loss = np.mean(loss_streak_pts)
+                status = (f"L{consecutive_losses}→QTY↑{qty} "
+                          f"avg:{avg_loss:.1f} rec:{total_unrecovered_loss:.1f}")
             else:
                 if recovering:
-                    status = f"L{consecutive_losses} (REC {recovered_pts:.1f}/{recovery_target:.1f})"
+                    status = (f"L{consecutive_losses} "
+                              f"(rec:{total_unrecovered_loss:.1f})")
                 else:
                     status = f"L{consecutive_losses}"
 
         else:  # win or breakeven
             if recovering:
-                extra_lot_recovery = raw_pnl * (qty - 1)
-                recovered_pts += extra_lot_recovery
+                total_unrecovered_loss -= actual_pnl
 
-                if recovered_pts >= recovery_target:
-                    status = f"RECOVERED ✅ ({recovered_pts:.1f}/{recovery_target:.1f})"
+                if total_unrecovered_loss <= 0:
+                    status = f"RECOVERED ✅"
                     qty = 1
                     recovering = False
-                    recovery_target = 0.0
-                    recovered_pts = 0.0
+                    total_unrecovered_loss = 0.0
                 else:
-                    status = f"REC {recovered_pts:.1f}/{recovery_target:.1f}"
+                    status = (f"REC +{actual_pnl:.1f} "
+                              f"left:{total_unrecovered_loss:.1f}")
 
             consecutive_losses = 0
             loss_streak_pts = []
-
-        # Build trade dict
-        trade_qty = pos.get('qty', 1)  # qty THIS trade was entered with
-        total_pnl = raw_pnl * trade_qty
 
         trade = {
             'dir': pos['dir'],
@@ -220,7 +218,7 @@ def run_backtest(df, buy_sig, sell_sig, atr_vals,
             'exit_time': exit_time,
             'raw_pnl': round(raw_pnl, 2),
             'qty': trade_qty,
-            'pnl': round(total_pnl, 2),
+            'pnl': round(actual_pnl, 2),
             'pnl_pct': round(raw_pnl / pos['entry'] * 100, 4),
             'reason': reason,
             'status': status,
@@ -700,7 +698,7 @@ def main():
           f"Square off: {square_off.strftime('%H:%M')}")
     print(f"  Qty per lot: {LOT_SIZE} | Start qty: 1")
     print(f"  Rule: 2 consecutive losses → qty += 1")
-    print(f"  Recovery: avg loss pts → extra lot P&L covers it → qty = 1")
+    print(f"  Recovery: cumulative total losses tracked → fully covered → qty = 1")
     print(f"{'='*70}")
 
     # ── Compute UT Bot signals ──
