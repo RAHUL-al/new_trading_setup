@@ -244,6 +244,13 @@ def run_backtest(df, buy_sig, sell_sig, atr_vals,
                              "DAY_END", prev_date)
                 pos = None
 
+            # ── Reset recovery state for new day ──
+            qty = 1
+            consecutive_losses = 0
+            loss_streak_pts = []
+            recovering = False
+            total_unrecovered_loss = 0.0
+
             if curr_date not in daily_results:
                 daily_results[curr_date] = {'trades': [], 'pnl': 0}
 
