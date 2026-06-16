@@ -170,7 +170,8 @@ def build_features_1min(df):
 def build_features_2min(df_2m, df_1m):
     """
     Build features from 2-min data and align to 1-min index.
-    Uses forward-fill to map 2-min features to the 1-min timeframe.
+    Uses backward merge to map 2-min features to the 1-min timeframe.
+    Cross-day matches are nullified to prevent stale data leakage.
     """
     close_2m = df_2m['Close'].astype(float)
     high_2m = df_2m['High'].astype(float)
@@ -181,7 +182,7 @@ def build_features_2min(df_2m, df_1m):
     trail_2m, dir_2m = calc_ut_bot_direction(close_2m.values, atr_2m.values, ATR_KEY_VALUE)
 
     feat_2m = pd.DataFrame(index=df_2m.index)
-    feat_2m['Time'] = df_2m['Time']
+    feat_2m['Time'] = pd.to_datetime(df_2m['Time'])
     feat_2m['atr_2m'] = atr_2m.values
     feat_2m['rsi_2m'] = rsi_2m.values
     feat_2m['ut_dir_2m'] = dir_2m
@@ -191,9 +192,13 @@ def build_features_2min(df_2m, df_1m):
     feat_2m['range_2m'] = (high_2m - low_2m).values
     feat_2m['body_2m'] = (close_2m - df_2m['Open'].astype(float)).values
 
-    # Merge to 1-min by time (forward fill)
-    feat_2m['Time'] = pd.to_datetime(feat_2m['Time'])
-    df_1m_time = pd.DataFrame({'Time': pd.to_datetime(df_1m['Time'])})
+    # Add date column for cross-day detection
+    feat_2m['_date_2m'] = feat_2m['Time'].dt.date
+
+    df_1m_time = pd.DataFrame({
+        'Time': pd.to_datetime(df_1m['Time']),
+        '_date_1m': pd.to_datetime(df_1m['Time']).dt.date
+    })
 
     merged = pd.merge_asof(
         df_1m_time.sort_values('Time'),
@@ -202,7 +207,17 @@ def build_features_2min(df_2m, df_1m):
         direction='backward'
     )
 
-    return merged.drop('Time', axis=1).reset_index(drop=True)
+    # ── Cross-day fix: nullify stale previous-day matches ──
+    feat_cols = [c for c in merged.columns
+                 if c.endswith('_2m') and not c.startswith('_')]
+    cross_day_mask = merged['_date_1m'] != merged['_date_2m']
+    merged.loc[cross_day_mask, feat_cols] = np.nan
+
+    stale_count = cross_day_mask.sum()
+    if stale_count > 0:
+        print(f"  ⚠️  Cross-day fix: {stale_count} rows had stale 2-min data → set to NaN")
+
+    return merged.drop(['Time', '_date_1m', '_date_2m'], axis=1).reset_index(drop=True)
 
 
 # ─────────── Label Generation ───────────
@@ -691,6 +706,55 @@ def main():
     test_acc = (test_pred == y_test).mean() * 100
     print(f"\n  Train accuracy: {train_acc:.1f}%")
     print(f"  Test accuracy:  {test_acc:.1f}%")
+
+    # ── Row-wise prediction log (candle by candle) ──
+    print(f"\n📋 Row-wise prediction log (1 candle = 1 prediction)...")
+
+    signal_map = {1: 'BUY', -1: 'SELL', 0: 'HOLD'}
+    test_times = df_1m.loc[test_mask, 'Time'].values
+    test_closes = df_1m.loc[test_mask, 'Close'].astype(float).values
+    y_test_arr = np.array(y_test)
+
+    rowwise_df = pd.DataFrame({
+        'Time': test_times,
+        'Close': np.round(test_closes, 2),
+        'Predicted': pd.Series(test_pred).map(signal_map).values,
+        'Actual': pd.Series(y_test_arr).map(signal_map).values,
+        'Pred_Raw': test_pred,
+        'Actual_Raw': y_test_arr,
+        'Correct': (test_pred == y_test_arr),
+    })
+
+    rowwise_df.to_csv("catboost_rowwise_predictions.csv", index=False)
+
+    # Per-signal precision/recall breakdown
+    print(f"\n  📊 Per-Signal Accuracy (Test Set):")
+    print(f"  {'Signal':>6} {'Predicted':>10} {'Actual':>8} {'TP':>5} "
+          f"{'Precision':>10} {'Recall':>8}")
+    print(f"  {'-'*55}")
+    for sig_name, sig_val in [('BUY', 1), ('SELL', -1), ('HOLD', 0)]:
+        predicted_as = (test_pred == sig_val).sum()
+        actually_is = (y_test_arr == sig_val).sum()
+        tp = ((test_pred == sig_val) & (y_test_arr == sig_val)).sum()
+        prec = tp / predicted_as * 100 if predicted_as > 0 else 0
+        rec = tp / actually_is * 100 if actually_is > 0 else 0
+        print(f"  {sig_name:>6} {predicted_as:>10} {actually_is:>8} {tp:>5} "
+              f"{prec:>9.1f}% {rec:>7.1f}%")
+
+    # Show sample rows (first 15 candles)
+    print(f"\n  📝 Sample predictions (first 15 candles):")
+    print(f"  {'Time':>19} {'Close':>9} {'Predicted':>10} {'Actual':>8} {'':>3}")
+    print(f"  {'-'*53}")
+    for _, row in rowwise_df.head(15).iterrows():
+        icon = "✅" if row['Correct'] else "❌"
+        t_str = str(row['Time'])[:16]
+        print(f"  {t_str:>19} {row['Close']:>9.2f} {row['Predicted']:>10} "
+              f"{row['Actual']:>8} {icon:>3}")
+
+    print(f"\n  Total: {len(rowwise_df)} candles | "
+          f"Correct: {rowwise_df['Correct'].sum()} "
+          f"({rowwise_df['Correct'].mean()*100:.1f}%)")
+    print(f"  💾 Row-wise log saved: catboost_rowwise_predictions.csv")
 
     # ── Feature importance ──
     importance = model.get_feature_importance()
