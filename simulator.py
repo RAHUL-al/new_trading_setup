@@ -452,8 +452,8 @@ class MarketSimulator:
 
         self.state.total_candles = len(df_sim)
 
-        # ── PRE-COMPUTE all features and predictions (backtester parity) ──
-        self._precompute_predictions(df_warmup, df_sim, df_2m_warmup)
+        # (Vectorized pre-computation disabled to allow dynamic row-wise calculations with real-time latency measurements)
+        # self._precompute_predictions(df_warmup, df_sim, df_2m_warmup)
 
         # Broadcast warm-up candles to the dashboard
         warmup_payload = [
@@ -536,15 +536,79 @@ class MarketSimulator:
             self.state.current_date = str(curr_date)
             prev_date = curr_date
 
-            # ── Look up PRE-COMPUTED values (no per-candle feature rebuild!) ──
-            current_atr = float(self._sim_atr[i])
-            current_rsi = float(self._sim_rsi[i])
-            ut_dir = float(self._sim_ut_dir[i])
-
-            # Prediction from pre-computed ensemble
-            pred = int(self._sim_predictions[i])
-            xgb_pred = int(self._sim_xgb_preds[i])
-            lstm_pred = int(self._sim_lstm_preds[i])
+            # ── Dynamic Slicing & Feature Extraction ──
+            t_feat_start = time.perf_counter()
+            
+            # Combine warmup and simulation candles up to current index
+            df_1m_curr = pd.concat([df_warmup, df_sim.iloc[:i+1]], ignore_index=True)
+            
+            # Filter 2-min data up to current time
+            if self.df_2m_full is not None:
+                warmup_start_time = df_warmup['Time'].iloc[0] if len(df_warmup) > 0 else df_sim['Time'].iloc[0]
+                df_2m_curr = self.df_2m_full[
+                    (self.df_2m_full['Time'] >= warmup_start_time) &
+                    (self.df_2m_full['Time'] <= candle_time)
+                ].reset_index(drop=True)
+                
+                if len(df_2m_curr) > 0:
+                    feat_2m_curr = xgl_build_features_2min(df_2m_curr, df_1m_curr)
+                else:
+                    # Fallback resampling from 1-min
+                    df_2m_resampled = df_1m_curr.set_index('Time').resample(
+                        '2min', label='left', closed='left'
+                    ).agg({
+                        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
+                    }).dropna().reset_index()
+                    feat_2m_curr = xgl_build_features_2min(df_2m_resampled, df_1m_curr)
+            else:
+                df_2m_resampled = df_1m_curr.set_index('Time').resample(
+                    '2min', label='left', closed='left'
+                ).agg({
+                    'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
+                }).dropna().reset_index()
+                feat_2m_curr = xgl_build_features_2min(df_2m_resampled, df_1m_curr)
+                
+            feat_1m_curr = xgl_build_features_1min(df_1m_curr)
+            features_curr = pd.concat([feat_1m_curr, feat_2m_curr], axis=1)
+            features_curr = features_curr.fillna(0)
+            features_curr = features_curr.replace([np.inf, -np.inf], 0)
+            
+            t_feat_elapsed = (time.perf_counter() - t_feat_start) * 1000
+            
+            # ── Dynamic Model Inference ──
+            t_pred_start = time.perf_counter()
+            
+            # Extract last row features for prediction
+            current_row = features_curr.iloc[-1:]
+            X_curr = current_row[self.feature_columns].values
+            
+            xgb_pred = 0
+            if self.xgb_model is not None:
+                xgb_raw = self.xgb_model.predict(X_curr)[0]
+                xgb_pred = int(xgb_raw - 1)  # unmap: 0→-1, 1→0, 2→1
+                
+            lstm_pred = 0
+            if self.lstm_model is not None and self.scaler is not None:
+                full_feature_values = features_curr[self.feature_columns].values
+                if len(full_feature_values) >= self.lstm_seq_len:
+                    seq = full_feature_values[-self.lstm_seq_len:]
+                    seq_scaled = self.scaler.transform(seq)
+                    
+                    device = next(self.lstm_model.parameters()).device
+                    with torch.no_grad():
+                        x_tensor = torch.FloatTensor(seq_scaled).unsqueeze(0).to(device)
+                        outputs = self.lstm_model(x_tensor)
+                        pred_class = outputs.argmax(dim=1).item()
+                        lstm_pred = int(pred_class - 1)  # unmap: 0→-1, 1→0, 2→1
+            
+            pred = int(xgl_ensemble_predict(np.array([xgb_pred]), np.array([lstm_pred]))[0])
+            
+            t_pred_elapsed = (time.perf_counter() - t_pred_start) * 1000
+            
+            # Get values for state and indicators
+            current_atr = float(features_curr['atr_1m'].iloc[-1])
+            current_rsi = float(features_curr['rsi_1m'].iloc[-1])
+            ut_dir = float(features_curr['ut_dir_1m'].iloc[-1])
 
             signal_map = {1: "BUY", -1: "SELL", 0: "HOLD"}
             signal_name = signal_map.get(pred, "HOLD")
@@ -626,13 +690,12 @@ class MarketSimulator:
 
             # ── Feature dict for dashboard ──
             feature_data = {}
-            if self._sim_features is not None and i < len(self._sim_features):
-                for col in ALL_FEATURE_COLS:
-                    if col in self._sim_features.columns:
-                        val = float(self._sim_features.iloc[i].get(col, 0))
-                        if val != val or abs(val) == float('inf'):
-                            val = 0
-                        feature_data[col] = round(val, 4)
+            for col in ALL_FEATURE_COLS:
+                if col in features_curr.columns:
+                    val = float(features_curr.iloc[-1].get(col, 0))
+                    if val != val or abs(val) == float('inf'):
+                        val = 0
+                    feature_data[col] = round(val, 4)
 
             # ── Emit candle event ──
             candle_event = {
@@ -664,8 +727,8 @@ class MarketSimulator:
                 "wins": self.state.wins,
                 "losses": self.state.losses,
                 "timing": {
-                    "features_ms": 0,  # pre-computed
-                    "predict_ms": 0,   # pre-computed
+                    "features_ms": round(t_feat_elapsed, 1),
+                    "predict_ms": round(t_pred_elapsed, 1),
                     "total_ms": round(t_candle_elapsed, 1),
                 },
                 "features": feature_data,
