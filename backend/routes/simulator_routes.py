@@ -35,7 +35,7 @@ if os.name == "nt":
 
 PROCESS_MAP = {
     "websocket": {"script": "angleone_websocket1.py", "pid_file": "/tmp/trading_websocket.pid"},
-    "xgboost_lstm": {"script": "xgboost_lstm_live_engine", "pid_file": None},
+    "catboost": {"script": "catboost_live_engine.py", "pid_file": None},
     "pos_handler": {"script": "pos_handle_wts.py", "pid_file": "/tmp/trading_pos.pid"},
     "symbol_finder": {"script": "symbol_found.py", "pid_file": "/tmp/trading_symbol.pid"},
 }
@@ -100,7 +100,7 @@ def _get_log_file(process_name: str) -> Optional[str]:
     """Find the latest log file for a process."""
     name_map = {
         "websocket": "websocket_",
-        "xgboost_lstm": "websocket_",  # live engine logs into websocket log
+        "catboost": "websocket_",  # live engine logs into websocket log
         "pos_handler": "pos_handler_",
         "symbol_finder": "symbol_found_",
     }

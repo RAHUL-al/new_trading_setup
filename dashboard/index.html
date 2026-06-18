@@ -86,6 +86,7 @@
         .status-idle { background: var(--bg-card); color: var(--text-muted); border: 1px solid var(--border); }
         .status-running { background: var(--green-bg); color: var(--green); border: 1px solid var(--green); animation: pulse 2s infinite; }
         .status-paused { background: rgba(234, 179, 8, 0.1); color: var(--yellow); border: 1px solid var(--yellow); }
+        .status-analyzing { background: rgba(59, 130, 246, 0.1); color: var(--blue); border: 1px solid var(--blue); animation: pulse 1s infinite; }
 
         @keyframes pulse {
             0%, 100% { opacity: 1; }
@@ -883,7 +884,9 @@ function connectWS() {
 // ═══════════════════════════════════════════
 function handleEvent(type, data) {
     switch (type) {
-        case 'candle': handleCandle(data); break;
+        case 'candle_received': handleCandleReceived(data); break;
+        case 'analysis_complete':
+        case 'candle': handleAnalysisComplete(data); break;
         case 'trade_open': handleTradeOpen(data); break;
         case 'trade_close': handleTradeClose(data); break;
         case 'sim_start': handleSimStart(data); break;
@@ -908,8 +911,8 @@ function handleWarmup(data) {
     addLog(`📦 Loaded ${formattedData.length} warm-up candles into chart cache`, 'info');
 }
 
-function handleCandle(d) {
-    // Force JS to parse the time as UTC so Lightweight Charts (which displays in UTC by default) shows exactly the NIFTY IST hours
+function handleCandleReceived(d) {
+    // Force JS to parse the time as UTC so Lightweight Charts shows exactly the NIFTY IST hours
     const ts = Math.floor(new Date(d.time.replace(' ', 'T') + 'Z').getTime() / 1000);
 
     candleSeries.update({
@@ -919,6 +922,24 @@ function handleCandle(d) {
         low: d.low,
         close: d.close,
     });
+
+    // Change status badge to ANALYZING...
+    const badge = document.getElementById('statusBadge');
+    badge.className = 'status-badge status-analyzing';
+    badge.textContent = 'ANALYZING...';
+
+    // Show calc... in the timing boxes
+    document.getElementById('timingFeat').textContent = 'calc...';
+    document.getElementById('timingPred').textContent = 'calc...';
+    document.getElementById('timingTotal').textContent = 'calc...';
+
+    // Update time display
+    document.getElementById('dateDisplay').textContent = d.date;
+    document.getElementById('timeDisplay').textContent = d.time_str;
+}
+
+function handleAnalysisComplete(d) {
+    const ts = Math.floor(new Date(d.time.replace(' ', 'T') + 'Z').getTime() / 1000);
 
     // Update SL line
     if (d.position) {
@@ -958,6 +979,9 @@ function handleCandle(d) {
     // Time display
     document.getElementById('dateDisplay').textContent = d.date;
     document.getElementById('timeDisplay').textContent = d.time_str;
+
+    // Reset status badge back to RUNNING or PAUSED
+    updateControls();
 
     // Timing
     if (d.timing) {

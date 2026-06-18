@@ -500,6 +500,20 @@ class MarketSimulator:
             low_price = float(row['Low'])
             time_str = candle_time.strftime('%H:%M')
 
+            # ── Emit candle_received event (split real-time protocol) ──
+            candle_received_event = {
+                "index": i,
+                "total": len(df_sim),
+                "time": candle_time.isoformat(),
+                "time_str": time_str,
+                "date": str(curr_date),
+                "open": float(row['Open']),
+                "high": high_price,
+                "low": low_price,
+                "close": close_price,
+            }
+            await self.emit("candle_received", candle_received_event)
+
             # ── Day boundary ──
             if prev_date and curr_date != prev_date:
                 if self.state.position:
@@ -736,11 +750,11 @@ class MarketSimulator:
                 "lstm_signal": lstm_signal,
             }
 
-            await self.emit("candle", candle_event)
+            await self.emit("analysis_complete", candle_event)
 
             # ── Sleep to control replay speed ──
-            if speed > 0:
-                delay = 1.0 / speed
+            if self.state.speed > 0:
+                delay = 1.0 / self.state.speed
                 await asyncio.sleep(delay)
 
         # ── Simulation complete ──
