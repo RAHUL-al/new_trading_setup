@@ -66,7 +66,7 @@ MODEL_PATH = os.environ.get("CATBOOST_MODEL", "catboost_nifty_model.cbm")
 # CSV paths for warm-up data (must match what backtest uses)
 CSV_1M = os.environ.get("CSV_1M", "nifty_1min_data.csv")
 CSV_2M = os.environ.get("CSV_2M", "nifty_2min_data.csv")
-WARMUP_CANDLES = 500  # Load last N candles from CSV for EWM convergence
+WARMUP_CANDLES = 2000  # Load last N candles from CSV for EWM convergence
 
 ATR_PERIOD = 14
 ATR_KEY_VALUE = 1.0
@@ -355,8 +355,8 @@ def pre_market_csv_sync():
         try:
             full_csv = pd.read_csv(output_file)
             full_csv["Time"] = pd.to_datetime(full_csv["Time"])
-            # Take last 100 candles for feature warm-up
-            tail = full_csv.tail(100).copy()
+            # Take last WARMUP_CANDLES candles for feature warm-up
+            tail = full_csv.tail(WARMUP_CANDLES).copy()
             cached_df = tail.rename(columns={"Time": "timestamp"})
             for col in ["Open", "High", "Low", "Close"]:
                 cached_df[col] = cached_df[col].astype(float)
